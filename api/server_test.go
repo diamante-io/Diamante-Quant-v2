@@ -1,0 +1,279 @@
+// File: api/server_test.go
+package api
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"testing"
+	"time"
+
+	"diamante/common"
+	"diamante/consensus/types"
+	"diamante/crypto"
+	"diamante/ledger"
+	"diamante/transaction"
+
+	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+//
+// Dummy Consensus Implementation
+//
+
+// dummyConsensus implements the types.Consensus interface (including HeightGetter).
+type dummyConsensus struct{}
+
+func (d *dummyConsensus) GetLastBlockHeight() uint64 {
+	return 42
+}
+func (d *dummyConsensus) GetNetworkLoad() float64 {
+	return 75.0
+}
+func (d *dummyConsensus) GetLachesis() types.Lachesis {
+	return nil
+}
+func (d *dummyConsensus) GetDPoS() types.DPoS {
+	return nil
+}
+func (d *dummyConsensus) GetPoH() types.PoH {
+	return nil
+}
+func (d *dummyConsensus) Start() error {
+	return nil
+}
+func (d *dummyConsensus) Stop() error {
+	return nil
+}
+func (d *dummyConsensus) ProcessBlock(blockNumber uint64) error {
+	return nil
+}
+func (d *dummyConsensus) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []byte) *types.Event {
+	return &types.Event{
+		ID:        [32]byte{1, 2, 3},
+		Creator:   creator,
+		ParentIDs: parentIDs,
+		Data:      data,
+		Timestamp: time.Now(),
+		Height:    1,
+		Finalized: false,
+	}
+}
+func (d *dummyConsensus) FinalizeEvent(event *types.Event) (bool, error) {
+	event.Finalized = true
+	return true, nil
+}
+func (d *dummyConsensus) SynchronizeState(targetState [32]byte, targetCount uint64) error {
+	return nil
+}
+func (d *dummyConsensus) GetValidators() []*types.Validator {
+	return []*types.Validator{}
+}
+func (d *dummyConsensus) GetActiveValidators() []*types.Validator {
+	return []*types.Validator{}
+}
+func (d *dummyConsensus) GetPendingEvents() []*types.Event {
+	return []*types.Event{}
+}
+func (d *dummyConsensus) GetFinalizedEvents(fromHeight, toHeight uint64) ([]*types.Event, error) {
+	return []*types.Event{}, nil
+}
+
+//
+// Dummy Ledger and Transaction Manager Helpers
+//
+
+// newDummyLedger returns a new ledger instance.
+func newDummyLedger() ledger.LedgerAPI {
+	return ledger.NewLedger()
+}
+
+// newDummyTxManager returns a new TransactionManager instance.
+func newDummyTxManager(ledgerInst ledger.LedgerAPI) *transaction.TransactionManager {
+	pool := transaction.NewTransactionPool(10, time.Minute, 0.001, 10.0, false, time.Hour, nil, nil)
+	return transaction.NewTransactionManager(pool, 0.001, false, ledgerInst)
+}
+
+//
+// API and Router Setup Helpers
+//
+
+// newTestAPI creates an API instance using a real ledger, dummy consensus, and a real TxManager.
+func newTestAPI() *API {
+	ledgerInst := newDummyLedger()
+	txMgr := newDummyTxManager(ledgerInst)
+	consensusInst := &dummyConsensus{}
+	return NewAPI(ledgerInst, consensusInst, txMgr)
+}
+
+// newTestRouter sets up a router that registers the API endpoints using the unexported handler functions.
+func newTestRouter(apiInst *API) *mux.Router {
+	router := mux.NewRouter()
+	router.HandleFunc("/status", apiInst.handleStatus).Methods("GET")
+	router.HandleFunc("/accounts/{id}", apiInst.handleGetAccount).Methods("GET")
+	router.HandleFunc("/blocks/{number}", apiInst.handleGetBlock).Methods("GET")
+	router.HandleFunc("/transactions", apiInst.handleSubmitTransaction).Methods("POST")
+	return router
+}
+
+//
+// Test Cases
+//
+
+// TestStatusEndpoint tests the /status endpoint.
+func TestStatusEndpoint(t *testing.T) {
+	apiInst := newTestAPI()
+	router := newTestRouter(apiInst)
+
+	req := httptest.NewRequest("GET", "/status", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code, "Expected HTTP 200 OK")
+
+	var resp map[string]interface{}
+	err := json.Unmarshal(rec.Body.Bytes(), &resp)
+	require.NoError(t, err, "JSON unmarshal failed")
+
+	h, err := strconv.ParseFloat(fmt.Sprintf("%v", resp["currentBlockHeight"]), 64)
+	require.NoError(t, err)
+	assert.Equal(t, 42.0, h, "Block height mismatch")
+
+	nl, err := strconv.ParseFloat(fmt.Sprintf("%v", resp["networkLoad"]), 64)
+	require.NoError(t, err)
+	assert.Equal(t, 75.0, nl, "Network load mismatch")
+}
+
+// TestGetAccountEndpoint tests the /accounts/{id} endpoint.
+func TestGetAccountEndpoint(t *testing.T) {
+	apiInst := newTestAPI()
+	router := newTestRouter(apiInst)
+
+	testAccountID := "test-account"
+	common.SetAccountBalance(testAccountID, 100.0)
+	common.SetPublicKey(testAccountID, []byte("dummy-public-key"))
+
+	req := httptest.NewRequest("GET", "/accounts/"+testAccountID, nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code, "Expected HTTP 200 OK for existing account")
+
+	var account common.Account
+	err := json.Unmarshal(rec.Body.Bytes(), &account)
+	require.NoError(t, err, "JSON unmarshal failed for account")
+	assert.Equal(t, testAccountID, account.ID, "Account ID mismatch")
+}
+
+// TestGetBlockEndpoint tests the /blocks/{number} endpoint.
+func TestGetBlockEndpoint(t *testing.T) {
+	apiInst := newTestAPI()
+	router := newTestRouter(apiInst)
+
+	ledgerInst := apiInst.Ledger
+
+	// Create a dummy block.
+	block := common.Block{
+		Number:       1,
+		Timestamp:    time.Now().Unix(), // Use Unix timestamp (int64)
+		Transactions: []common.Transaction{},
+		PreviousHash: "genesis",
+	}
+	block.Hash = common.ComputeBlockHash(block)
+
+	err := ledgerInst.CommitBlock(block)
+	require.NoError(t, err, "CommitBlock failed")
+
+	req := httptest.NewRequest("GET", "/blocks/1", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code, "Expected HTTP 200 OK for existing block")
+
+	var gotBlock common.Block
+	err = json.Unmarshal(rec.Body.Bytes(), &gotBlock)
+	require.NoError(t, err, "JSON unmarshal failed for block")
+	assert.Equal(t, block.Number, gotBlock.Number, "Block number mismatch")
+	assert.Equal(t, block.PreviousHash, gotBlock.PreviousHash, "Previous hash mismatch")
+	assert.Equal(t, block.Hash, gotBlock.Hash, "Block hash mismatch")
+}
+
+// TestGetBlockEndpoint_Invalid tests the /blocks/{number} endpoint with invalid input.
+func TestGetBlockEndpoint_Invalid(t *testing.T) {
+	apiInst := newTestAPI()
+	router := newTestRouter(apiInst)
+
+	req := httptest.NewRequest("GET", "/blocks/abc", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "Expected 400 Bad Request for invalid block number")
+
+	req = httptest.NewRequest("GET", "/blocks/9999", nil)
+	rec = httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusNotFound, rec.Code, "Expected 404 Not Found for non-existent block")
+}
+
+// TestSubmitTransactionEndpoint tests the /transactions endpoint.
+func TestSubmitTransactionEndpoint(t *testing.T) {
+	apiInst := newTestAPI()
+	router := newTestRouter(apiInst)
+
+	// Set up accounts with sufficient balances.
+	common.SetAccountBalance("sender-account", 1000.0)
+	common.SetAccountBalance("receiver-account", 100.0)
+
+	// Generate a valid Dilithium key pair for the sender.
+	dilKP, err := crypto.GenerateDilithiumKeyPair(crypto.DilithiumLevel3)
+	require.NoError(t, err, "Failed to generate Dilithium key pair for sender")
+	common.SetPublicKey("sender-account", dilKP.PublicKey)
+	acc := common.GetAccount("sender-account")
+	acc.PrivateKey = dilKP.PrivateKey
+
+	payload := map[string]interface{}{
+		"sender":   "sender-account",
+		"receiver": "receiver-account",
+		"amount":   25.0,
+		"fee":      0.1,
+		"data":     "Test payload",
+	}
+	body, err := json.Marshal(payload)
+	require.NoError(t, err, "Failed to marshal payload")
+
+	req := httptest.NewRequest("POST", "/transactions", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusCreated, rec.Code, "Expected 201 Created for transaction creation")
+
+	var tx common.Transaction
+	err = json.Unmarshal(rec.Body.Bytes(), &tx)
+	require.NoError(t, err, "Failed to unmarshal transaction response")
+
+	assert.NotEmpty(t, tx.ID, "Transaction ID should not be empty")
+	assert.Equal(t, "sender-account", tx.Sender, "Sender mismatch")
+	assert.Equal(t, "receiver-account", tx.Receiver, "Receiver mismatch")
+	assert.Equal(t, 25.0, tx.Amount, "Amount mismatch")
+	assert.Equal(t, 0.1, tx.Fee, "Fee mismatch")
+	assert.NotEmpty(t, tx.Signature, "Transaction signature should not be empty")
+}
+
+// TestSubmitTransaction_InvalidPayload tests the /transactions endpoint with invalid JSON.
+func TestSubmitTransaction_InvalidPayload(t *testing.T) {
+	apiInst := newTestAPI()
+	router := newTestRouter(apiInst)
+
+	invalidJSON := []byte(`{"sender": "A", "receiver": "B", "amount": "not-a-number"}`)
+	req := httptest.NewRequest("POST", "/transactions", bytes.NewReader(invalidJSON))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+	assert.Equal(t, http.StatusBadRequest, rec.Code, "Expected 400 Bad Request for invalid JSON payload")
+}

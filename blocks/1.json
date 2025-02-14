@@ -1,0 +1,15 @@
+{
+  "number": 1,
+  "timestamp": "2025-02-03T15:33:21.2790763+05:30",
+  "transactions": [
+    {
+      "id": "tx1",
+      "sender": "Alice",
+      "receiver": "Bob",
+      "amount": 100,
+      "timestamp": "2025-02-03T15:33:21.2790763+05:30"
+    }
+  ],
+  "prev_block_hash": "0000000000000000",
+  "block_hash": "abcd1234efgh5678"
+}
