@@ -17,6 +17,7 @@ Diamante Quant v2 is a modular blockchain network that integrates state-of-the-a
   - [Governance Module](#governance-module)
   - [Smart Contract Module](#smart-contract-module)
   - [Validator / Node Management Module](#validator--node-management-module)
+  - [Light Node Support](#light-node-support)
   - [Optimizer / Performance Tuning Module](#optimizer--performance-tuning-module)
   - [Transaction Pool (Mempool)](#transaction-pool-mempool)
   - [API / SDK Integration](#api--sdk-integration)
@@ -65,6 +66,8 @@ Provides cryptographic primitives (signing, hashing, key generation) and handles
 **Key Components:**
 - **Signature Schemes:** e.g., ECDSA, Ed25519, Dilithium (quantum-resistant), etc.
 - **Key Management:** Secure generation, storage, and usage of private/public keys.
+- **Keyber Implementation:**  
+  Incorporates **Keyber**, a robust key management solution that offers secure key storage, multi-signature support, and threshold signing. This enhances our cryptographic operations and ensures advanced security measures are in place.
 - **Hash Functions:** e.g., SHA-256, BLAKE2, or quantum-resistant hashes for block headers, Merkle trees, PoH, etc.
 - **Encryption:** (Optional) For confidential data or zero-knowledge proofs.
 
@@ -200,6 +203,31 @@ Orchestrates the lifecycle of validator nodes—from registration and staking to
 - **Consensus:** Determines which validators produce blocks or events.
 - **Governance:** Adjusts rules for validator eligibility and stake thresholds.
 - **Crypto:** Manages validator keys and signatures.
+
+---
+
+### Light Node Support
+
+**Purpose:**  
+Provides an efficient mechanism for resource-constrained nodes (light nodes) to participate in the blockchain network without needing full validation capabilities.
+
+**Key Features:**
+- **Efficient Block Verification:**  
+  Light nodes download and verify only block headers, relying on full nodes or validators for complete block and transaction verification.
+- **Voting and Staking via Delegation:**  
+  Light nodes delegate their staking and voting rights to validators through a Delegated Proof of Stake (DPoS) mechanism, ensuring network participation without the overhead of full block validation.
+- **Security Through Merkle Proofs:**  
+  Light nodes verify transaction inclusion using Merkle proofs obtained from full nodes, ensuring security without requiring the entire blockchain state.
+
+**How Light Nodes Participate in Key Activities:**
+- **Transaction Initiation:**  
+  Light nodes can initiate transactions and send them to validators for inclusion in the next block. The mechanism can be extended with multisignature and threshold signing approaches to securely manage assets.
+- **Voting and Governance:**  
+  By delegating votes to validators in a DPoS system, light nodes (e.g., those running on smartphones) can participate in governance without running a full node.
+- **Staking:**  
+  Light nodes stake tokens by delegating them to validators or full nodes. Validators use these stakes to propose and validate blocks, allowing light nodes to earn rewards without direct consensus participation.
+- **Synchronization:**  
+  Utilizing block headers and Merkle proofs, light nodes can quickly verify transaction integrity, enabling fast synchronization on devices with limited storage and bandwidth.
 
 ---
 
