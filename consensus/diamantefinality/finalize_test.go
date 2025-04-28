@@ -1,3 +1,4 @@
+// finalize_test.go
 package finality_test
 
 import (
@@ -9,16 +10,15 @@ import (
 	"diamante/consensus/types"
 )
 
-// mockVoting implements the same interface as VirtualVoting but overrides Vote.
+// mockVoting implements the Voting interface by wrapping a real VirtualVoting
+// and overriding Vote to return a controlled result.
 type mockVoting struct {
 	*finality.VirtualVoting
-
 	mu         sync.Mutex
 	voteCalls  int
 	voteResult bool
 }
 
-// Vote overrides the real VirtualVoting.Vote to return our custom boolean.
 func (mv *mockVoting) Vote(e *types.Event) bool {
 	mv.mu.Lock()
 	defer mv.mu.Unlock()
@@ -32,11 +32,8 @@ func (mv *mockVoting) SetVoteResult(result bool) {
 	mv.voteResult = result
 }
 
-// ----------------- Tests -----------------
-
 func TestFinalizer_Finalize_Success(t *testing.T) {
 	dag := finality.NewDAG()
-
 	realVV := finality.NewVirtualVoting(dag)
 	mv := &mockVoting{VirtualVoting: realVV}
 	mv.SetVoteResult(true)
@@ -52,7 +49,7 @@ func TestFinalizer_Finalize_Success(t *testing.T) {
 
 	success, err := finalizer.Finalize(event)
 	if err != nil {
-		t.Errorf("unexpected error: %v", err)
+		t.Errorf("unexpected error during finalization: %v", err)
 	}
 	if !success {
 		t.Error("expected success=true, got false")
@@ -61,13 +58,12 @@ func TestFinalizer_Finalize_Success(t *testing.T) {
 		t.Error("event.Finalized should be true after successful Finalize")
 	}
 	if !finalizer.IsFinalized(event.ID) {
-		t.Error("Finalizer should have event in its map")
+		t.Error("finalizer should record the finalized event in its map")
 	}
 }
 
 func TestFinalizer_Finalize_Fail(t *testing.T) {
 	dag := finality.NewDAG()
-
 	realVV := finality.NewVirtualVoting(dag)
 	mv := &mockVoting{VirtualVoting: realVV}
 	mv.SetVoteResult(false)
@@ -83,19 +79,18 @@ func TestFinalizer_Finalize_Fail(t *testing.T) {
 
 	success, err := finalizer.Finalize(event)
 	if err == nil {
-		t.Error("expected error due to failed vote, got nil")
+		t.Error("expected an error due to failed vote, got nil")
 	}
 	if success {
-		t.Error("expected success=false, got true")
+		t.Error("expected success=false when vote fails")
 	}
 	if event.Finalized {
-		t.Error("event should not be marked Finalized on vote fail")
+		t.Error("event should not be marked Finalized on vote failure")
 	}
 }
 
 func TestFinalizer_Finalize_AlreadyFinalized(t *testing.T) {
 	dag := finality.NewDAG()
-
 	realVV := finality.NewVirtualVoting(dag)
 	mv := &mockVoting{VirtualVoting: realVV}
 	finalizer := finality.NewFinalizer(dag, mv)
@@ -107,41 +102,41 @@ func TestFinalizer_Finalize_AlreadyFinalized(t *testing.T) {
 		t.Fatalf("dag.NewEvent error: %v", err)
 	}
 
-	// FIX: ensure the first finalize call actually succeeds
 	mv.SetVoteResult(true)
 
 	// First finalize
 	if success, err := finalizer.Finalize(ev); err != nil || !success {
-		t.Fatalf("expected first finalize to succeed, got success=%v err=%v", success, err)
+		t.Fatalf("expected first finalize to succeed, got success=%v, err=%v", success, err)
 	}
 
-	// Attempt to finalize again
+	// Attempt to finalize again; should return success without error.
 	success2, err2 := finalizer.Finalize(ev)
 	if err2 != nil {
-		t.Errorf("second finalize should not return error, got %v", err2)
+		t.Errorf("second finalize returned an unexpected error: %v", err2)
 	}
 	if !success2 {
-		t.Error("expected second finalize to return success=true")
+		t.Error("expected second finalize to succeed (already finalized)")
 	}
 }
 
 func TestFinalizer_Checkpoints(t *testing.T) {
 	dag := finality.NewDAG()
 	realVV := finality.NewVirtualVoting(dag)
-	mv := &mockVoting{VirtualVoting: realVV, voteResult: true} // Ensure voteResult is true
+	mv := &mockVoting{VirtualVoting: realVV, voteResult: true}
 	finalizer := finality.NewFinalizer(dag, mv)
 
 	nodeID := randomNodeID(t)
 	dag.AddNode(nodeID, 9999)
 
-	// Create an event with Height=1000
+	// Create an event with Height exactly 1000 (assuming checkpoint interval is 1000)
 	ev := &types.Event{
 		Creator:   nodeID,
-		Height:    1000, // Must match checkpointInterval
+		Height:    1000,
 		Data:      []byte("checkpoint data"),
 		Finalized: false,
 	}
-	dag.Events[ev.ID] = ev // manually placed
+	// Manually insert the event into the DAG.
+	dag.Events[ev.ID] = ev
 
 	success, err := finalizer.Finalize(ev)
 	if err != nil {
@@ -151,19 +146,17 @@ func TestFinalizer_Checkpoints(t *testing.T) {
 		t.Fatalf("expected success=true for checkpoint event, got false")
 	}
 
-	// Check that finalizer stored it
 	latest := finalizer.GetLatestCheckpoint()
 	if latest == nil {
 		t.Fatalf("expected at least one checkpoint, got nil")
 	}
 	if latest != ev {
-		t.Errorf("expected latest checkpoint to be ev, got something else")
+		t.Errorf("expected latest checkpoint to be the event ev, got a different event")
 	}
 }
 
 func TestFinalizer_GetStateAndRestore(t *testing.T) {
 	dag := finality.NewDAG()
-
 	realVV := finality.NewVirtualVoting(dag)
 	mv := &mockVoting{VirtualVoting: realVV}
 	finalizer := finality.NewFinalizer(dag, mv)
@@ -178,16 +171,15 @@ func TestFinalizer_GetStateAndRestore(t *testing.T) {
 
 	mv.SetVoteResult(true)
 	if success, err := finalizer.Finalize(ev1); err != nil || !success {
-		t.Fatalf("failed to finalize ev1: success=%v err=%v", success, err)
+		t.Fatalf("failed to finalize ev1: success=%v, err=%v", success, err)
 	}
 
-	// Serialize
 	stateData, err := finalizer.GetState()
 	if err != nil {
 		t.Fatalf("GetState error: %v", err)
 	}
 
-	// Restore into a new finalizer
+	// Restore into a new finalizer instance.
 	dag2 := finality.NewDAG()
 	realVV2 := finality.NewVirtualVoting(dag2)
 	mv2 := &mockVoting{VirtualVoting: realVV2}
@@ -211,7 +203,7 @@ func TestFinalizer_FinalizeEvents(t *testing.T) {
 	nodeID := randomNodeID(t)
 	dag.AddNode(nodeID, 999)
 
-	// Make 3 events
+	// Create 3 events.
 	events := make([]*types.Event, 3)
 	for i := 0; i < 3; i++ {
 		ev, err := dag.NewEvent(nodeID, nil, []byte(fmt.Sprintf("batch %d", i)))
@@ -221,7 +213,6 @@ func TestFinalizer_FinalizeEvents(t *testing.T) {
 		events[i] = ev
 	}
 
-	// Finalize them all concurrently
 	if err := finalizer.FinalizeEvents(events); err != nil {
 		t.Errorf("FinalizeEvents returned error: %v", err)
 	}
@@ -230,7 +221,7 @@ func TestFinalizer_FinalizeEvents(t *testing.T) {
 			t.Errorf("event %d should be finalized, but isn't", i)
 		}
 		if !finalizer.IsFinalized(ev.ID) {
-			t.Errorf("finalizer doesn't reflect finalized state for event %d", i)
+			t.Errorf("finalizer doesn't record finalized state for event %d", i)
 		}
 	}
 }
@@ -244,7 +235,7 @@ func TestFinalizer_FinalizeEvents_PartialFail(t *testing.T) {
 	nodeID := randomNodeID(t)
 	dag.AddNode(nodeID, 999)
 
-	// We'll create 3 events
+	// Create 3 events.
 	events := make([]*types.Event, 3)
 	for i := 0; i < 3; i++ {
 		ev, err := dag.NewEvent(nodeID, nil, []byte(fmt.Sprintf("partial %d", i)))
@@ -254,21 +245,19 @@ func TestFinalizer_FinalizeEvents_PartialFail(t *testing.T) {
 		events[i] = ev
 	}
 
-	// Force the second event to fail by toggling the vote to false
+	// Force failure on the second event by toggling the vote to false.
 	mv.SetVoteResult(true)
 	if len(events) > 1 {
-		mv.SetVoteResult(false) // cause a fail on "partial 1"
+		mv.SetVoteResult(false)
 	}
 
 	err := finalizer.FinalizeEvents(events)
 	if err == nil {
-		t.Error("expected an error because at least one event should fail")
+		t.Error("expected an error because at least one event should fail finalization")
 	}
 
-	// Optionally set it back
+	// Optionally, set vote result back to true and log finalized status.
 	mv.SetVoteResult(true)
-
-	// Check which events got finalized
 	for idx, ev := range events {
 		if finalizer.IsFinalized(ev.ID) {
 			t.Logf("Event[%d] %x is finalized", idx, ev.ID)

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -34,13 +36,17 @@ type DAG struct {
 	nodesMu     sync.RWMutex
 	eventsMu    sync.RWMutex
 	maxHeightMu sync.RWMutex
+
+	// NEW: Logger for structured logging.
+	logger *log.Logger
 }
 
-// NewDAG creates a new DAG with empty node and event maps.
+// NewDAG creates a new DAG with empty node and event maps and initializes a default logger.
 func NewDAG() *DAG {
 	return &DAG{
 		Nodes:  make(map[[32]byte]*Node),
 		Events: make(map[[32]byte]*types.Event),
+		logger: log.New(os.Stdout, "DAG: ", log.Ldate|log.Ltime|log.Lshortfile),
 	}
 }
 
@@ -53,12 +59,14 @@ func (d *DAG) AddNode(nodeID [32]byte, stake uint64) {
 	if node, exists := d.Nodes[nodeID]; exists {
 		node.Stake = stake
 		node.Active = true
+		d.logger.Printf("Updated node %x: stake set to %d and marked active", nodeID, stake)
 	} else {
 		d.Nodes[nodeID] = &Node{
 			ID:     nodeID,
 			Stake:  stake,
 			Active: true,
 		}
+		d.logger.Printf("Added new node %x with stake %d", nodeID, stake)
 	}
 }
 
@@ -69,9 +77,10 @@ func (d *DAG) UpdateNodeStake(nodeID [32]byte, newStake uint64) error {
 
 	node, exists := d.Nodes[nodeID]
 	if !exists {
-		return errors.New("node does not exist")
+		return errors.New("UpdateNodeStake: node does not exist")
 	}
 	node.Stake = newStake
+	d.logger.Printf("Node %x stake updated to %d", nodeID, newStake)
 	return nil
 }
 
@@ -82,9 +91,10 @@ func (d *DAG) RemoveNode(nodeID [32]byte) error {
 
 	node, exists := d.Nodes[nodeID]
 	if !exists {
-		return errors.New("node does not exist")
+		return errors.New("RemoveNode: node does not exist")
 	}
 	node.Active = false
+	d.logger.Printf("Node %x marked as inactive", nodeID)
 	return nil
 }
 
@@ -97,18 +107,18 @@ func (d *DAG) NewEvent(
 	data []byte,
 ) (*types.Event, error) {
 
-	// Verify creator node
+	// Verify creator node.
 	d.nodesMu.RLock()
 	creatorNode, exists := d.Nodes[creator]
 	d.nodesMu.RUnlock()
 	if !exists {
-		return nil, errors.New("creator node does not exist")
+		return nil, errors.New("NewEvent: creator node does not exist")
 	}
 	if !creatorNode.Active {
-		return nil, errors.New("creator node is inactive")
+		return nil, errors.New("NewEvent: creator node is inactive")
 	}
 
-	// Compute the event height (height = max parent height + 1)
+	// Compute the event height (height = max parent height + 1).
 	var height uint64 = 1
 	if len(parentIDs) > 0 {
 		d.eventsMu.RLock()
@@ -121,7 +131,7 @@ func (d *DAG) NewEvent(
 		height++
 	}
 
-	// Construct the event
+	// Construct the event.
 	event := &types.Event{
 		ParentIDs: parentIDs,
 		Timestamp: time.Now(),
@@ -131,7 +141,7 @@ func (d *DAG) NewEvent(
 		Finalized: false,
 	}
 
-	// Generate a deterministic event ID
+	// Generate a deterministic event ID.
 	d.eventsMu.RLock()
 	currentCount := len(d.Events) + 1
 	d.eventsMu.RUnlock()
@@ -147,23 +157,25 @@ func (d *DAG) NewEvent(
 
 	event.ID = sha256.Sum256(idData)
 
-	// Commit the event to the DAG (single write lock)
+	// Commit the event to the DAG.
 	d.eventsMu.Lock()
 	d.Events[event.ID] = event
 	d.eventsMu.Unlock()
 
-	// Append the event to the creator's node
+	// Append the event to the creator's node.
 	d.nodesMu.Lock()
 	creatorNode.Events = append(creatorNode.Events, event)
 	d.nodesMu.Unlock()
 
-	// Update MaxHeight if this event's height is the new maximum
+	// Update MaxHeight if this event's height is the new maximum.
 	d.maxHeightMu.Lock()
-	defer d.maxHeightMu.Unlock()
 	if height > d.MaxHeight {
 		d.MaxHeight = height
+		d.logger.Printf("MaxHeight updated to %d", height)
 	}
+	d.maxHeightMu.Unlock()
 
+	d.logger.Printf("New event created: creator %x, height %d, eventID %x", creator, height, event.ID)
 	return event, nil
 }
 
@@ -174,13 +186,12 @@ func (d *DAG) GetEvent(id [32]byte) (*types.Event, error) {
 
 	event, exists := d.Events[id]
 	if !exists {
-		return nil, errors.New("event not found")
+		return nil, errors.New("GetEvent: event not found")
 	}
 	return event, nil
 }
 
 // GetEvents returns a shallow copy of all events in the DAG.
-// Each value is a pointer to the original event struct.
 func (d *DAG) GetEvents() map[[32]byte]*types.Event {
 	d.eventsMu.RLock()
 	defer d.eventsMu.RUnlock()
@@ -206,14 +217,14 @@ func (d *DAG) GetActiveNodes() [][32]byte {
 	return active
 }
 
-// GetNodeStake returns the stake of a node, or error if the node doesn't exist.
+// GetNodeStake returns the stake of a node, or an error if the node doesn't exist.
 func (d *DAG) GetNodeStake(nodeID [32]byte) (uint64, error) {
 	d.nodesMu.RLock()
 	defer d.nodesMu.RUnlock()
 
 	node, exists := d.Nodes[nodeID]
 	if !exists {
-		return 0, errors.New("node not found")
+		return 0, errors.New("GetNodeStake: node not found")
 	}
 	return node.Stake, nil
 }
@@ -243,7 +254,7 @@ func (d *DAG) IsActiveValidator(nodeID [32]byte) bool {
 
 // GetState serializes all nodes, events, and the current MaxHeight into JSON.
 func (d *DAG) GetState() ([]byte, error) {
-	// Copy data under locks before serialization
+	// Copy data under locks before serialization.
 	d.nodesMu.RLock()
 	nodesCopy := make(map[string]*Node, len(d.Nodes))
 	for nodeID, node := range d.Nodes {
@@ -264,7 +275,6 @@ func (d *DAG) GetState() ([]byte, error) {
 	currentMaxHeight := d.MaxHeight
 	d.maxHeightMu.RUnlock()
 
-	// Prepare the state struct
 	state := struct {
 		Nodes     map[string]*Node        `json:"nodes"`
 		Events    map[string]*types.Event `json:"events"`
@@ -274,6 +284,7 @@ func (d *DAG) GetState() ([]byte, error) {
 		Events:    eventsCopy,
 		MaxHeight: currentMaxHeight,
 	}
+	d.logger.Printf("DAG state serialized with MaxHeight=%d", currentMaxHeight)
 	return json.Marshal(state)
 }
 
@@ -286,10 +297,10 @@ func (d *DAG) RestoreState(stateData []byte) error {
 	}
 
 	if err := json.Unmarshal(stateData, &state); err != nil {
-		return err
+		return fmt.Errorf("RestoreState: failed to unmarshal state data: %w", err)
 	}
 
-	// Acquire all locks needed
+	// Acquire all locks needed.
 	d.nodesMu.Lock()
 	defer d.nodesMu.Unlock()
 
@@ -299,12 +310,12 @@ func (d *DAG) RestoreState(stateData []byte) error {
 	d.maxHeightMu.Lock()
 	defer d.maxHeightMu.Unlock()
 
-	// Convert string IDs back to [32]byte and rebuild DAG
+	// Convert string IDs back to [32]byte and rebuild DAG.
 	d.Nodes = make(map[[32]byte]*Node, len(state.Nodes))
 	for nodeIDStr, nodeVal := range state.Nodes {
 		nodeID, err := stringToByteArray(nodeIDStr)
 		if err != nil {
-			return fmt.Errorf("failed to parse node ID '%s': %v", nodeIDStr, err)
+			return fmt.Errorf("RestoreState: failed to parse node ID '%s': %w", nodeIDStr, err)
 		}
 		d.Nodes[nodeID] = nodeVal
 	}
@@ -312,12 +323,13 @@ func (d *DAG) RestoreState(stateData []byte) error {
 	for evIDStr, evVal := range state.Events {
 		evID, err := stringToByteArray(evIDStr)
 		if err != nil {
-			return fmt.Errorf("failed to parse event ID '%s': %v", evIDStr, err)
+			return fmt.Errorf("RestoreState: failed to parse event ID '%s': %w", evIDStr, err)
 		}
 		d.Events[evID] = evVal
 	}
 
 	d.MaxHeight = state.MaxHeight
+	d.logger.Printf("DAG state restored with MaxHeight=%d", d.MaxHeight)
 	return nil
 }
 
@@ -335,12 +347,12 @@ func (d *DAG) GetUnfinalizedEvents() []*types.Event {
 	return results
 }
 
-// Helper function: [32]byte -> hex string
+// Helper function: [32]byte -> hex string.
 func byteArrayToString(b [32]byte) string {
 	return fmt.Sprintf("%x", b)
 }
 
-// Helper function: hex string -> [32]byte
+// Helper function: hex string -> [32]byte.
 func stringToByteArray(s string) ([32]byte, error) {
 	var out [32]byte
 	data, err := hex.DecodeString(s)
@@ -352,4 +364,136 @@ func stringToByteArray(s string) ([32]byte, error) {
 	}
 	copy(out[:], data)
 	return out, nil
+}
+
+// VerifyConsistency checks the internal consistency of the DAG
+func (d *DAG) VerifyConsistency() error {
+	d.nodesMu.RLock()
+	d.eventsMu.RLock()
+	defer d.nodesMu.RUnlock()
+	defer d.eventsMu.RUnlock()
+
+	// 1. Check that all events have valid creators
+	for id, event := range d.Events {
+		_, exists := d.Nodes[event.Creator]
+		if !exists {
+			return fmt.Errorf("event %x has creator %x that doesn't exist in nodes",
+				id, event.Creator)
+		}
+	}
+
+	// 2. Check that all events have valid parents (if any)
+	for id, event := range d.Events {
+		for _, parentID := range event.ParentIDs {
+			_, exists := d.Events[parentID]
+			if !exists {
+				return fmt.Errorf("event %x has parent %x that doesn't exist in events",
+					id, parentID)
+			}
+		}
+	}
+
+	// 3. Check for height consistency
+	for id, event := range d.Events {
+		if event.Height == 0 {
+			return fmt.Errorf("event %x has invalid height 0", id)
+		}
+
+		// If event has parents, its height should be at least 1 + max parent height
+		if len(event.ParentIDs) > 0 {
+			maxParentHeight := uint64(0)
+			for _, parentID := range event.ParentIDs {
+				parent := d.Events[parentID]
+				if parent.Height > maxParentHeight {
+					maxParentHeight = parent.Height
+				}
+			}
+
+			if event.Height <= maxParentHeight {
+				return fmt.Errorf("event %x has height %d <= max parent height %d",
+					id, event.Height, maxParentHeight)
+			}
+		}
+	}
+
+	// 4. Check that MaxHeight is consistent with event heights
+	actualMaxHeight := uint64(0)
+	for _, event := range d.Events {
+		if event.Height > actualMaxHeight {
+			actualMaxHeight = event.Height
+		}
+	}
+
+	if d.MaxHeight != actualMaxHeight {
+		return fmt.Errorf("DAG MaxHeight %d doesn't match actual max event height %d",
+			d.MaxHeight, actualMaxHeight)
+	}
+
+	return nil
+}
+
+// RepairConsistency attempts to fix common consistency issues in the DAG
+func (d *DAG) RepairConsistency() (bool, error) {
+	d.nodesMu.Lock()
+	d.eventsMu.Lock()
+	defer d.nodesMu.Unlock()
+	defer d.eventsMu.Unlock()
+
+	madeChanges := false
+
+	// 1. Remove events with non-existent creators
+	var eventsToRemove [][32]byte
+	for id, event := range d.Events {
+		_, exists := d.Nodes[event.Creator]
+		if !exists {
+			eventsToRemove = append(eventsToRemove, id)
+			madeChanges = true
+		}
+	}
+
+	// Actually remove the events after identification
+	for _, id := range eventsToRemove {
+		delete(d.Events, id)
+		d.logger.Printf("Removed event %x with non-existent creator", id)
+	}
+
+	// 2. Remove events with non-existent parents
+	eventsToRemove = eventsToRemove[:0] // Clear the slice
+	for id, event := range d.Events {
+		hasInvalidParent := false
+		for _, parentID := range event.ParentIDs {
+			_, exists := d.Events[parentID]
+			if !exists {
+				hasInvalidParent = true
+				break
+			}
+		}
+
+		if hasInvalidParent {
+			eventsToRemove = append(eventsToRemove, id)
+			madeChanges = true
+		}
+	}
+
+	// Actually remove the events
+	for _, id := range eventsToRemove {
+		delete(d.Events, id)
+		d.logger.Printf("Removed event %x with invalid parent references", id)
+	}
+
+	// 3. Fix MaxHeight
+	actualMaxHeight := uint64(0)
+	for _, event := range d.Events {
+		if event.Height > actualMaxHeight {
+			actualMaxHeight = event.Height
+		}
+	}
+
+	if d.MaxHeight != actualMaxHeight {
+		d.MaxHeight = actualMaxHeight
+		madeChanges = true
+		d.logger.Printf("Corrected MaxHeight to %d", actualMaxHeight)
+	}
+
+	return madeChanges, nil
 }

@@ -1,11 +1,10 @@
-//config.go
-
 package config
 
 import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,22 +14,21 @@ import (
 	"github.com/spf13/viper"
 )
 
+// CryptoConfig holds settings related to cryptographic operations.
 type CryptoConfig struct {
-	// Existing fields
-	DefaultAlgorithm     string        `mapstructure:"default_algorithm" validate:"oneof=Dilithium Kyber"`
-	KeyExpirationTime    time.Duration `mapstructure:"key_expiration_time" validate:"required"`
-	KeyExchangeAlgorithm string        `mapstructure:"key_exchange_algorithm" validate:"oneof=Kyber512 Kyber768 Kyber1024"`
-	SignatureAlgorithm   string        `mapstructure:"signature_algorithm" validate:"oneof=Dilithium2 Dilithium3 Dilithium5"`
-
-	// New fields
+	DefaultAlgorithm       string        `mapstructure:"default_algorithm" validate:"oneof=Dilithium Kyber"`
+	KeyExpirationTime      time.Duration `mapstructure:"key_expiration_time" validate:"required"`
+	KeyExchangeAlgorithm   string        `mapstructure:"key_exchange_algorithm" validate:"oneof=Kyber512 Kyber768 Kyber1024"`
+	SignatureAlgorithm     string        `mapstructure:"signature_algorithm" validate:"oneof=Dilithium2 Dilithium3 Dilithium5"`
 	KyberSecurityLevel     int           `mapstructure:"kyber_security_level" validate:"oneof=512 768 1024"`
 	DilithiumSecurityLevel int           `mapstructure:"dilithium_security_level" validate:"oneof=2 3 5"`
 	EnableKeyRotation      bool          `mapstructure:"enable_key_rotation"`
-	KeyRotationInterval    time.Duration `mapstructure:"key_rotation_interval"`
-	MinKeyGenerationTime   time.Duration `mapstructure:"min_key_generation_time"`
+	KeyRotationInterval    time.Duration `mapstructure:"key_rotation_interval" validate:"required"`
+	MinKeyGenerationTime   time.Duration `mapstructure:"min_key_generation_time" validate:"required"`
 	MaxKeyGenerationRetry  int           `mapstructure:"max_key_generation_retry" validate:"min=1,max=10"`
 }
 
+// ConsensusConfig holds settings for consensus-related parameters.
 type ConsensusConfig struct {
 	GossipDelay       time.Duration
 	DPoSSetSize       int
@@ -40,15 +38,13 @@ type ConsensusConfig struct {
 	CryptoConfig      CryptoConfig
 }
 
+// NewDefaultCryptoConfig returns a default CryptoConfig.
 func NewDefaultCryptoConfig() *CryptoConfig {
 	return &CryptoConfig{
-		// Existing defaults
-		DefaultAlgorithm:     "Dilithium",
-		KeyExpirationTime:    24 * time.Hour,
-		KeyExchangeAlgorithm: "Kyber1024",
-		SignatureAlgorithm:   "Dilithium3",
-
-		// New defaults
+		DefaultAlgorithm:       "Dilithium",
+		KeyExpirationTime:      24 * time.Hour,
+		KeyExchangeAlgorithm:   "Kyber1024",
+		SignatureAlgorithm:     "Dilithium3",
 		KyberSecurityLevel:     1024,
 		DilithiumSecurityLevel: 3,
 		EnableKeyRotation:      true,
@@ -58,7 +54,7 @@ func NewDefaultCryptoConfig() *CryptoConfig {
 	}
 }
 
-// Environment represents different deployment environments
+// Environment represents different deployment environments.
 type Environment string
 
 const (
@@ -67,21 +63,19 @@ const (
 	Production  Environment = "production"
 )
 
-// DatabaseConfig holds database-specific configuration
+// DatabaseConfig holds database connection settings.
 type DatabaseConfig struct {
-	// CouchDB Configuration
 	CouchDB struct {
 		URL            string        `mapstructure:"url" validate:"required,url"`
 		Database       string        `mapstructure:"database" validate:"required"`
-		Username       string        `mapstructure:"username"`
-		Password       string        `mapstructure:"password"`
+		Username       string        `mapstructure:"username" validate:"required"`
+		Password       string        `mapstructure:"password" validate:"required"`
 		MaxConnections int           `mapstructure:"max_connections" validate:"required,min=1"`
 		Timeout        time.Duration `mapstructure:"timeout" validate:"required"`
 		RetryLimit     int           `mapstructure:"retry_limit" validate:"required,min=1"`
 		RetryDelay     time.Duration `mapstructure:"retry_delay" validate:"required"`
 	} `mapstructure:"couchdb"`
 
-	// PostgreSQL Configuration
 	Postgres struct {
 		Host            string        `mapstructure:"host" validate:"required"`
 		Port            int           `mapstructure:"port" validate:"required,min=1"`
@@ -95,7 +89,7 @@ type DatabaseConfig struct {
 	} `mapstructure:"postgres"`
 }
 
-// SyncConfig holds synchronization-specific configuration
+// SyncConfig holds synchronization-specific configuration.
 type SyncConfig struct {
 	BatchSize        int           `mapstructure:"batch_size" validate:"required,min=1"`
 	SyncInterval     time.Duration `mapstructure:"sync_interval" validate:"required"`
@@ -107,7 +101,7 @@ type SyncConfig struct {
 	CompressionLevel int           `mapstructure:"compression_level" validate:"min=0,max=9"`
 }
 
-// CacheConfig holds caching-specific configuration
+// CacheConfig holds caching-specific configuration.
 type CacheConfig struct {
 	Enabled      bool          `mapstructure:"enabled"`
 	Type         string        `mapstructure:"type" validate:"oneof=memory redis"`
@@ -121,17 +115,15 @@ type CacheConfig struct {
 	WriteTimeout time.Duration `mapstructure:"write_timeout" validate:"required"`
 }
 
-// OptimizerConfig holds AI optimizer-specific configuration
+// OptimizerConfig holds AI optimizer-specific configuration.
 type OptimizerConfig struct {
 	Enabled bool `mapstructure:"enabled"`
-
 	// IOPS Configuration
 	IOPS struct {
 		MaxRead    int     `mapstructure:"max_read" validate:"required,min=1"`
 		MaxWrite   int     `mapstructure:"max_write" validate:"required,min=1"`
 		TargetUtil float64 `mapstructure:"target_utilization" validate:"required,min=0,max=1"`
 	} `mapstructure:"iops"`
-
 	// Rate Limiting
 	RateLimiter struct {
 		Enabled      bool    `mapstructure:"enabled"`
@@ -139,7 +131,6 @@ type OptimizerConfig struct {
 		BurstLimit   int     `mapstructure:"burst_limit" validate:"required,min=1"`
 		ScaleFactor  float64 `mapstructure:"scale_factor" validate:"required,min=0.1"`
 	} `mapstructure:"rate_limiter"`
-
 	// Sharding Configuration
 	Sharding struct {
 		Enabled    bool    `mapstructure:"enabled"`
@@ -148,7 +139,6 @@ type OptimizerConfig struct {
 		ShardSize  int64   `mapstructure:"shard_size" validate:"required_if=Enabled true,min=1"`
 		LoadFactor float64 `mapstructure:"load_factor" validate:"required,min=0,max=1"`
 	} `mapstructure:"sharding"`
-
 	// High Availability Configuration
 	HighAvailability struct {
 		Enabled           bool          `mapstructure:"enabled"`
@@ -156,7 +146,6 @@ type OptimizerConfig struct {
 		FailoverTimeout   time.Duration `mapstructure:"failover_timeout" validate:"required_if=Enabled true"`
 		MinReplicas       int           `mapstructure:"min_replicas" validate:"required_if=Enabled true,min=1"`
 	} `mapstructure:"high_availability"`
-
 	// Learning Parameters
 	Learning struct {
 		Interval   time.Duration `mapstructure:"interval" validate:"required"`
@@ -166,19 +155,20 @@ type OptimizerConfig struct {
 	} `mapstructure:"learning"`
 }
 
-// Config represents the complete configuration
+// Config represents the complete configuration.
 type Config struct {
-	Environment Environment     `mapstructure:"environment" validate:"required,oneof=development staging production"`
+	Environment string          `mapstructure:"environment" validate:"required,oneof=development staging production"`
 	Database    DatabaseConfig  `mapstructure:"database"`
 	Sync        SyncConfig      `mapstructure:"sync"`
 	Cache       CacheConfig     `mapstructure:"cache"`
 	Optimizer   OptimizerConfig `mapstructure:"optimizer"`
-
+	Crypto      CryptoConfig    `mapstructure:"crypto"`
+	// Add other sections as needed…
 	mu             sync.RWMutex
 	changeHandlers []func(*Config)
 }
 
-// Manager handles configuration loading and dynamic updates
+// Manager handles configuration loading and dynamic updates.
 type Manager struct {
 	config     *Config
 	configPath string
@@ -186,10 +176,15 @@ type Manager struct {
 	mu         sync.RWMutex
 }
 
-// NewManager creates a new configuration manager
+// NewManager creates a new configuration manager.
 func NewManager(configPath string) (*Manager, error) {
 	v := viper.New()
 	v.SetConfigFile(configPath)
+
+	// Enable environment variable overrides.
+	v.AutomaticEnv()
+	v.SetEnvPrefix("DIAMANTE")
+	v.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 
 	manager := &Manager{
 		configPath: configPath,
@@ -200,16 +195,14 @@ func NewManager(configPath string) (*Manager, error) {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	// Setup file watcher for dynamic updates
 	if err := manager.setupWatcher(); err != nil {
 		log.Printf("Warning: Config file watching disabled: %v", err)
-		// Continue without file watching
 	}
 
 	return manager, nil
 }
 
-// load reads and validates the configuration
+// load reads and validates the configuration.
 func (m *Manager) load() error {
 	if err := m.viper.ReadInConfig(); err != nil {
 		return fmt.Errorf("failed to read config file: %w", err)
@@ -233,7 +226,7 @@ func (m *Manager) load() error {
 	return nil
 }
 
-// setupWatcher configures file watching for dynamic updates
+// setupWatcher configures file watching for dynamic updates.
 func (m *Manager) setupWatcher() error {
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -263,40 +256,41 @@ func (m *Manager) setupWatcher() error {
 		}
 	}()
 
-	return watcher.Add(filepath.Dir(m.configPath))
+	configDir := filepath.Dir(m.configPath)
+	return watcher.Add(configDir)
 }
 
-// GetConfig returns the current configuration
+// GetConfig returns the current configuration.
 func (m *Manager) GetConfig() *Config {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.config
 }
 
-// RegisterChangeHandler registers a handler function for configuration changes
+// RegisterChangeHandler registers a handler function to be called on configuration changes.
 func (m *Manager) RegisterChangeHandler(handler func(*Config)) {
-	m.config.mu.Lock()
-	defer m.config.mu.Unlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.config.changeHandlers = append(m.config.changeHandlers, handler)
 }
 
-// notifyChangeHandlers notifies all registered handlers of configuration changes
+// notifyChangeHandlers notifies registered handlers about configuration changes.
 func (m *Manager) notifyChangeHandlers() {
-	m.config.mu.RLock()
+	m.mu.RLock()
 	handlers := m.config.changeHandlers
-	config := m.config
-	m.config.mu.RUnlock()
+	configCopy := m.config
+	m.mu.RUnlock()
 
 	for _, handler := range handlers {
-		go handler(config)
+		go handler(configCopy)
 	}
 }
 
-// validateConfig performs validation of the configuration values
+// validateConfig performs validation of the configuration values.
 func validateConfig(config *Config) error {
 	validate := validator.New()
 
-	// Register custom validation functions
+	// Register custom validation functions.
 	if err := registerCustomValidations(validate); err != nil {
 		return fmt.Errorf("failed to register custom validations: %w", err)
 	}
@@ -305,7 +299,7 @@ func validateConfig(config *Config) error {
 		return processValidationErrors(err)
 	}
 
-	// Additional custom validations
+	// Additional custom validations.
 	if err := performCustomValidations(config); err != nil {
 		return err
 	}
@@ -313,41 +307,35 @@ func validateConfig(config *Config) error {
 	return nil
 }
 
-// registerCustomValidations registers any custom validation functions
+// registerCustomValidations registers any custom validation functions.
 func registerCustomValidations(validate *validator.Validate) error {
-	// Register custom validation for URLs if needed
+	// Register custom validation for URLs.
 	if err := validate.RegisterValidation("url", validateURL); err != nil {
 		return fmt.Errorf("failed to register URL validator: %w", err)
 	}
-
 	return nil
 }
 
-// validateURL implements custom URL validation
+// validateURL implements custom URL validation.
 func validateURL(fl validator.FieldLevel) bool {
-	// Add URL validation logic if needed
 	url := fl.Field().String()
-	return len(url) > 0 // Basic check, enhance as needed
+	// Basic check; enhance as needed.
+	return len(url) > 0
 }
 
-// processValidationErrors formats validation errors nicely
+// processValidationErrors formats validation errors nicely.
 func processValidationErrors(err error) error {
 	if validationErrors, ok := err.(validator.ValidationErrors); ok {
 		var errorMessages []string
 		for _, e := range validationErrors {
-			errorMessages = append(errorMessages, fmt.Sprintf(
-				"field: %s, tag: %s, value: %s",
-				e.Field(),
-				e.Tag(),
-				e.Value(),
-			))
+			errorMessages = append(errorMessages, fmt.Sprintf("field: %s, tag: %s, value: %v", e.Field(), e.Tag(), e.Value()))
 		}
 		return fmt.Errorf("validation errors: %v", errorMessages)
 	}
 	return err
 }
 
-// performCustomValidations implements additional custom validation logic
+// performCustomValidations implements additional custom validation logic.
 func performCustomValidations(config *Config) error {
 	if config.Sync.BatchSize > 10000 {
 		return fmt.Errorf("batch size cannot exceed 10000")
@@ -366,7 +354,7 @@ func performCustomValidations(config *Config) error {
 	return nil
 }
 
-// validateOptimizer performs specific optimizer validations
+// validateOptimizer performs specific optimizer validations.
 func validateOptimizer(opt *OptimizerConfig) error {
 	if opt.IOPS.TargetUtil <= 0 || opt.IOPS.TargetUtil > 1 {
 		return fmt.Errorf("IOPS target utilization must be between 0 and 1")
@@ -387,47 +375,50 @@ func validateOptimizer(opt *OptimizerConfig) error {
 	return nil
 }
 
-// GetDatabaseConfig returns the database configuration
+// GetDatabaseConfig returns the database configuration.
 func (m *Manager) GetDatabaseConfig() DatabaseConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.config.Database
 }
 
-// GetSyncConfig returns the sync configuration
+// GetSyncConfig returns the sync configuration.
 func (m *Manager) GetSyncConfig() SyncConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.config.Sync
 }
 
-// GetCacheConfig returns the cache configuration
+// GetCacheConfig returns the cache configuration.
 func (m *Manager) GetCacheConfig() CacheConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.config.Cache
 }
 
-// GetOptimizerConfig returns the optimizer configuration
+// GetOptimizerConfig returns the optimizer configuration.
 func (m *Manager) GetOptimizerConfig() OptimizerConfig {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.config.Optimizer
 }
 
-// GetEnvironment returns the current environment
+// GetEnvironment returns the current environment.
 func (m *Manager) GetEnvironment() Environment {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.config.Environment
+	return Environment(m.config.Environment)
 }
 
-// ////crypto.go//
+// ----------------------------------------------------
+// Additional methods on CryptoConfig for backward compatibility.
+// ----------------------------------------------------
+
+// GetKyberSecurityLevel returns the Kyber security level.
 func (c *CryptoConfig) GetKyberSecurityLevel() int {
 	if c.KeyExchangeAlgorithm == "" {
-		return c.KyberSecurityLevel // Use new field if old one is not set
+		return c.KyberSecurityLevel // Use new field if old one is not set.
 	}
-	// Parse from existing field for backward compatibility
 	switch c.KeyExchangeAlgorithm {
 	case "Kyber512":
 		return 512
@@ -436,16 +427,15 @@ func (c *CryptoConfig) GetKyberSecurityLevel() int {
 	case "Kyber1024":
 		return 1024
 	default:
-		return 1024 // Default to highest security
+		return 1024 // Default to highest security.
 	}
 }
 
-// GetDilithiumSecurityLevel returns the numeric security level for Dilithium
+// GetDilithiumSecurityLevel returns the numeric security level for Dilithium.
 func (c *CryptoConfig) GetDilithiumSecurityLevel() int {
 	if c.SignatureAlgorithm == "" {
-		return c.DilithiumSecurityLevel // Use new field if old one is not set
+		return c.DilithiumSecurityLevel // Use new field if old one is not set.
 	}
-	// Parse from existing field for backward compatibility
 	switch c.SignatureAlgorithm {
 	case "Dilithium2":
 		return 2
@@ -454,16 +444,16 @@ func (c *CryptoConfig) GetDilithiumSecurityLevel() int {
 	case "Dilithium5":
 		return 5
 	default:
-		return 3 // Default to NIST Level 3
+		return 3 // Default to NIST Level 3.
 	}
 }
 
-// GetKeyExpiration returns the key expiration duration
+// GetKeyExpiration returns the key expiration duration.
 func (c *CryptoConfig) GetKeyExpiration() time.Duration {
 	return c.KeyExpirationTime
 }
 
-// IsKeyRotationDue checks if key rotation is due based on current configuration
+// IsKeyRotationDue checks if key rotation is due based on the last rotation time.
 func (c *CryptoConfig) IsKeyRotationDue(lastRotation time.Time) bool {
 	if !c.EnableKeyRotation {
 		return false

@@ -1,0 +1,15 @@
+{
+  "height": 100,
+  "timestamp": "2025-03-18T12:51:01.0890686+05:30",
+  "blockHash": "blockhash",
+  "previousHash": "prevhash",
+  "stateSize": 238,
+  "components": [
+    "lachesis",
+    "dpos",
+    "poh",
+    "consensus"
+  ],
+  "metrics": {},
+  "version": "1.0"
+}

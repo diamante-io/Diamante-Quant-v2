@@ -1,0 +1,911 @@
+// consensus/validator_manager.go
+
+package consensus
+
+import (
+	"encoding/json"
+	"fmt"
+	"math"
+	"sync"
+	"time"
+
+	"diamante/consensus/types"
+)
+
+// ValidatorStatus represents the current status of a validator
+type ValidatorStatus int
+
+const (
+	// ValidatorStatusActive indicates the validator is active and can participate in consensus
+	ValidatorStatusActive ValidatorStatus = iota
+	// ValidatorStatusInactive indicates the validator is registered but not active
+	ValidatorStatusInactive
+	// ValidatorStatusSlashed indicates the validator has been slashed for misbehavior
+	ValidatorStatusSlashed
+	// ValidatorStatusJailed indicates the validator is temporarily jailed
+	ValidatorStatusJailed
+)
+
+// ValidatorInfo extends the basic Validator type with additional information
+type ValidatorInfo struct {
+	ID               [32]byte
+	Stake            uint64
+	Status           ValidatorStatus
+	Performance      float64
+	BlocksProduced   uint64
+	EventsFinalized  uint64
+	LastRewardTime   time.Time
+	JoinTime         time.Time
+	MisbehaviorCount uint64
+}
+
+// ValidatorManager centralizes validator operations across consensus components
+type ValidatorManager struct {
+	hc *HybridConsensus
+
+	// Validator state
+	validators       map[[32]byte]*ValidatorInfo
+	activeValidators []*ValidatorInfo
+	validatorsMu     sync.RWMutex
+
+	// Stake tracking
+	totalStake       uint64
+	activeTotalStake uint64
+	stakeMu          sync.RWMutex
+
+	// Performance metrics
+	performanceDecayRate float64
+	minPerformance       float64
+	maxPerformance       float64
+	performanceMu        sync.RWMutex
+
+	// Reward distribution
+	blockRewardWeight float64 // Weight for block production rewards
+	eventRewardWeight float64 // Weight for event finalization rewards
+	lastRewardHeight  uint64
+	rewardMu          sync.RWMutex
+}
+
+// NewValidatorManager creates a new ValidatorManager instance
+func NewValidatorManager(hc *HybridConsensus) *ValidatorManager {
+	return &ValidatorManager{
+		hc:                   hc,
+		validators:           make(map[[32]byte]*ValidatorInfo),
+		performanceDecayRate: 0.99,
+		minPerformance:       0.1,
+		maxPerformance:       1.0,
+		blockRewardWeight:    0.6, // 60% of rewards for block production
+		eventRewardWeight:    0.4, // 40% of rewards for event finalization
+	}
+}
+
+// AddValidator registers a new validator with the given stake
+// It ensures the validator is properly registered in all consensus components
+func (vm *ValidatorManager) AddValidator(id [32]byte, stake uint64) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	vm.stakeMu.Lock()
+	defer vm.stakeMu.Unlock()
+
+	// Check if validator already exists
+	if _, exists := vm.validators[id]; exists {
+		return NewConsensusError(
+			ErrInvalidValidator,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x already exists", id),
+		).WithValidatorID(id).
+			WithContext("stake", stake)
+	}
+
+	// Validate stake
+	if stake == 0 {
+		return NewConsensusError(
+			ErrInsufficientStake,
+			ErrorCategoryTemporary,
+			"validator stake cannot be zero",
+		).WithValidatorID(id)
+	}
+
+	// Create new validator info with more detailed initialization
+	validator := &ValidatorInfo{
+		ID:             id,
+		Stake:          stake,
+		Status:         ValidatorStatusInactive, // Start as inactive
+		Performance:    1.0,                     // Start with perfect performance
+		LastRewardTime: time.Now(),
+		JoinTime:       time.Now(),
+	}
+
+	// Add to validators map
+	vm.validators[id] = validator
+	vm.totalStake += stake
+
+	// Add to DPoS and Lachesis
+	vm.hc.dpos.AddValidator(id, stake)
+	vm.hc.lachesis.AddNode(id, stake)
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	vm.hc.logger.Info("Validator added",
+		"id", fmt.Sprintf("%x", id),
+		"stake", stake,
+		"totalValidators", len(vm.validators),
+		"activeValidators", len(vm.activeValidators))
+
+	return nil
+}
+
+// UpdateStake modifies the stake of an existing validator
+func (vm *ValidatorManager) UpdateStake(id [32]byte, newStake uint64) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	vm.stakeMu.Lock()
+	defer vm.stakeMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id)
+	}
+
+	// Validate stake
+	if newStake == 0 {
+		return NewConsensusError(
+			ErrInsufficientStake,
+			ErrorCategoryTemporary,
+			"validator stake cannot be zero",
+		).WithValidatorID(id)
+	}
+
+	// Update total stake
+	vm.totalStake -= validator.Stake
+	vm.totalStake += newStake
+
+	// Update active total stake if validator is active
+	if validator.Status == ValidatorStatusActive {
+		vm.activeTotalStake -= validator.Stake
+		vm.activeTotalStake += newStake
+	}
+
+	// Update validator stake
+	oldStake := validator.Stake
+	validator.Stake = newStake
+
+	// Update stake in DPoS and Lachesis
+	vm.hc.dpos.UpdateStake(id, newStake)
+	vm.hc.lachesis.UpdateNodeStake(id, newStake)
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	vm.hc.logger.Info("Validator stake updated",
+		"id", fmt.Sprintf("%x", id),
+		"oldStake", oldStake,
+		"newStake", newStake)
+
+	return nil
+}
+
+// ActivateValidator activates a validator
+func (vm *ValidatorManager) ActivateValidator(id [32]byte) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id)
+	}
+
+	// Check if validator is already active
+	if validator.Status == ValidatorStatusActive {
+		return nil
+	}
+
+	// Check if validator is jailed
+	if validator.Status == ValidatorStatusJailed {
+		return NewConsensusError(
+			ErrInvalidValidator,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x is jailed", id),
+		).WithValidatorID(id).
+			WithContext("status", "jailed")
+	}
+
+	// Check if validator is slashed
+	if validator.Status == ValidatorStatusSlashed {
+		return NewConsensusError(
+			ErrInvalidValidator,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x is slashed", id),
+		).WithValidatorID(id).
+			WithContext("status", "slashed")
+	}
+
+	// Activate validator
+	validator.Status = ValidatorStatusActive
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	vm.hc.logger.Info("Validator activated",
+		"id", fmt.Sprintf("%x", id),
+		"activeValidators", len(vm.activeValidators))
+
+	return nil
+}
+
+// DeactivateValidator deactivates a validator
+func (vm *ValidatorManager) DeactivateValidator(id [32]byte) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id)
+	}
+
+	// Check if validator is already inactive
+	if validator.Status == ValidatorStatusInactive {
+		return nil
+	}
+
+	// Deactivate validator
+	validator.Status = ValidatorStatusInactive
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	vm.hc.logger.Info("Validator deactivated",
+		"id", fmt.Sprintf("%x", id),
+		"activeValidators", len(vm.activeValidators))
+
+	return nil
+}
+
+// SlashValidator slashes a validator for misbehavior
+func (vm *ValidatorManager) SlashValidator(id [32]byte, slashAmount uint64, reason string) error {
+	// Acquire locks in the correct order: validatorsMu then stakeMu
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	vm.stakeMu.Lock()
+	defer vm.stakeMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id)
+	}
+
+	// Cap slash amount to validator's stake
+	if slashAmount > validator.Stake {
+		slashAmount = validator.Stake
+	}
+
+	// Update validator stake
+	oldStake := validator.Stake
+	validator.Stake -= slashAmount
+	validator.Status = ValidatorStatusSlashed
+	validator.MisbehaviorCount++
+
+	// Update total stake
+	vm.totalStake -= slashAmount
+
+	// Update active total stake if validator is active
+	if validator.Status == ValidatorStatusActive {
+		vm.activeTotalStake -= slashAmount
+	}
+
+	// Update stake in DPoS and Lachesis
+	vm.hc.dpos.UpdateStake(id, validator.Stake)
+	vm.hc.lachesis.UpdateNodeStake(id, validator.Stake)
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	vm.hc.logger.Info("Validator slashed",
+		"id", fmt.Sprintf("%x", id),
+		"slashAmount", slashAmount,
+		"oldStake", oldStake,
+		"newStake", validator.Stake,
+		"reason", reason,
+		"misbehaviorCount", validator.MisbehaviorCount)
+
+	return nil
+}
+
+// JailValidator temporarily jails a validator
+func (vm *ValidatorManager) JailValidator(id [32]byte, reason string) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id)
+	}
+
+	// Check if validator is already jailed
+	if validator.Status == ValidatorStatusJailed {
+		return nil
+	}
+
+	// Jail validator
+	validator.Status = ValidatorStatusJailed
+	validator.MisbehaviorCount++
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	vm.hc.logger.Info("Validator jailed",
+		"id", fmt.Sprintf("%x", id),
+		"reason", reason,
+		"misbehaviorCount", validator.MisbehaviorCount,
+		"activeValidators", len(vm.activeValidators))
+
+	return nil
+}
+
+// UnjailValidator removes a validator from jail
+func (vm *ValidatorManager) UnjailValidator(id [32]byte) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id)
+	}
+
+	// Check if validator is jailed
+	if validator.Status != ValidatorStatusJailed {
+		return NewConsensusError(
+			ErrInvalidValidator,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x is not jailed", id),
+		).WithValidatorID(id).
+			WithContext("status", validator.Status)
+	}
+
+	// Unjail validator
+	validator.Status = ValidatorStatusInactive
+
+	vm.hc.logger.Info("Validator unjailed",
+		"id", fmt.Sprintf("%x", id),
+		"misbehaviorCount", validator.MisbehaviorCount)
+
+	return nil
+}
+
+// RewardBlockProduction rewards a validator for producing a block
+func (vm *ValidatorManager) RewardBlockProduction(id [32]byte, blockHeight uint64) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id).
+			WithContext("blockHeight", blockHeight)
+	}
+
+	// Increment blocks produced
+	validator.BlocksProduced++
+
+	// Update performance
+	vm.updateValidatorPerformance(validator)
+
+	// Reward validator in DPoS
+	vm.hc.dpos.RewardValidator(id)
+
+	vm.hc.logger.Info("Validator rewarded for block production",
+		"id", fmt.Sprintf("%x", id),
+		"blockHeight", blockHeight,
+		"blocksProduced", validator.BlocksProduced,
+		"performance", validator.Performance)
+
+	return nil
+}
+
+// RewardEventFinalization rewards a validator for finalizing an event
+func (vm *ValidatorManager) RewardEventFinalization(id [32]byte, eventHeight uint64) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	// Check if validator exists
+	validator, exists := vm.validators[id]
+	if !exists {
+		return NewConsensusError(
+			ErrValidatorNotFound,
+			ErrorCategoryTemporary,
+			fmt.Sprintf("validator %x not found", id),
+		).WithValidatorID(id).
+			WithContext("eventHeight", eventHeight)
+	}
+
+	// Increment events finalized
+	validator.EventsFinalized++
+
+	// Update performance
+	vm.updateValidatorPerformance(validator)
+
+	vm.hc.logger.Info("Validator rewarded for event finalization",
+		"id", fmt.Sprintf("%x", id),
+		"eventHeight", eventHeight,
+		"eventsFinalized", validator.EventsFinalized,
+		"performance", validator.Performance)
+
+	return nil
+}
+
+// updateValidatorPerformance updates a validator's performance metric
+func (vm *ValidatorManager) updateValidatorPerformance(validator *ValidatorInfo) {
+	vm.performanceMu.Lock()
+	defer vm.performanceMu.Unlock()
+
+	// Calculate time since last update
+	now := time.Now()
+	hoursSinceLastUpdate := now.Sub(validator.LastRewardTime).Hours()
+
+	// Apply time-based decay
+	if hoursSinceLastUpdate > 0 {
+		decayFactor := math.Pow(vm.performanceDecayRate, hoursSinceLastUpdate)
+		validator.Performance *= decayFactor
+	}
+
+	// Boost performance for activity
+	validator.Performance *= 1.01
+
+	// Clamp performance to valid range
+	validator.Performance = math.Max(vm.minPerformance, math.Min(validator.Performance, vm.maxPerformance))
+
+	// Update last reward time
+	validator.LastRewardTime = now
+}
+
+// updateActiveValidators updates the list of active validators
+func (vm *ValidatorManager) updateActiveValidators() {
+	// Reset active validators list
+	vm.activeValidators = nil
+	vm.activeTotalStake = 0
+
+	// Add active validators to the list
+	for _, validator := range vm.validators {
+		if validator.Status == ValidatorStatusActive {
+			vm.activeValidators = append(vm.activeValidators, validator)
+			vm.activeTotalStake += validator.Stake
+		}
+	}
+
+	// Sort active validators by stake * performance (descending)
+	sortValidatorsByScore(vm.activeValidators)
+
+	// Limit active validators to max set size
+	maxSetSize := vm.hc.dpos.GetSetSize()
+	if len(vm.activeValidators) > maxSetSize {
+		vm.activeValidators = vm.activeValidators[:maxSetSize]
+
+		// Recalculate active total stake
+		vm.activeTotalStake = 0
+		for _, validator := range vm.activeValidators {
+			vm.activeTotalStake += validator.Stake
+		}
+	}
+}
+
+// sortValidatorsByScore sorts validators by stake * performance (descending)
+func sortValidatorsByScore(validators []*ValidatorInfo) {
+	for i := 0; i < len(validators); i++ {
+		for j := i + 1; j < len(validators); j++ {
+			scoreI := float64(validators[i].Stake) * validators[i].Performance
+			scoreJ := float64(validators[j].Stake) * validators[j].Performance
+			if scoreJ > scoreI {
+				validators[i], validators[j] = validators[j], validators[i]
+			}
+		}
+	}
+}
+
+// ProcessEpoch processes validator updates at epoch boundaries
+func (vm *ValidatorManager) ProcessEpoch(blockHeight uint64) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	vm.rewardMu.Lock()
+	defer vm.rewardMu.Unlock()
+
+	// Check if we need to distribute rewards
+	epochDuration := vm.hc.dpos.GetEpochDuration()
+	if blockHeight%epochDuration != 0 {
+		return nil
+	}
+
+	// Calculate epoch number
+	epoch := blockHeight / epochDuration
+
+	// Distribute rewards
+	vm.distributeEpochRewards(epoch)
+
+	// Update validator performance
+	vm.decayAllValidatorPerformance()
+
+	// Update active validators
+	vm.updateActiveValidators()
+
+	// Update last reward height
+	vm.lastRewardHeight = blockHeight
+
+	vm.hc.logger.Info("Processed validator epoch",
+		"blockHeight", blockHeight,
+		"epoch", epoch,
+		"activeValidators", len(vm.activeValidators),
+		"totalStake", vm.totalStake,
+		"activeTotalStake", vm.activeTotalStake)
+
+	return nil
+}
+
+// distributeEpochRewards distributes rewards to validators based on their performance
+func (vm *ValidatorManager) distributeEpochRewards(epoch uint64) {
+	// Calculate total reward for this epoch
+	totalReward := calculateEpochReward(epoch)
+
+	if vm.activeTotalStake == 0 {
+		vm.hc.logger.Info("No active stake; skipping rewards")
+		return
+	}
+
+	// Distribute rewards to active validators
+	for _, validator := range vm.activeValidators {
+		// Calculate reward based on stake proportion and performance
+		stakeRatio := float64(validator.Stake) / float64(vm.activeTotalStake)
+
+		// Calculate block production component
+		blockComponent := vm.blockRewardWeight * stakeRatio * float64(validator.BlocksProduced)
+
+		// Calculate event finalization component
+		eventComponent := vm.eventRewardWeight * stakeRatio * float64(validator.EventsFinalized)
+
+		// Calculate total reward for this validator (proportion of total epoch reward)
+		validatorRewardRatio := (blockComponent + eventComponent) / float64(len(vm.activeValidators))
+		reward := uint64(float64(totalReward) * validatorRewardRatio)
+
+		// Apply reward
+		oldStake := validator.Stake
+		validator.Stake += reward
+		vm.totalStake += reward
+		vm.activeTotalStake += reward
+
+		// Reset counters for next epoch
+		validator.BlocksProduced = 0
+		validator.EventsFinalized = 0
+
+		vm.hc.logger.Info("Epoch reward distributed",
+			"validator", fmt.Sprintf("%x", validator.ID),
+			"oldStake", oldStake,
+			"reward", reward,
+			"newStake", validator.Stake,
+			"performance", validator.Performance)
+	}
+}
+
+// decayAllValidatorPerformance applies performance decay to all validators
+func (vm *ValidatorManager) decayAllValidatorPerformance() {
+	vm.performanceMu.Lock()
+	defer vm.performanceMu.Unlock()
+
+	now := time.Now()
+	for _, validator := range vm.validators {
+		// Calculate time since last update
+		hoursSinceLastUpdate := now.Sub(validator.LastRewardTime).Hours()
+
+		// Apply time-based decay
+		if hoursSinceLastUpdate > 0 {
+			oldPerformance := validator.Performance
+			decayFactor := math.Pow(vm.performanceDecayRate, hoursSinceLastUpdate)
+			validator.Performance *= decayFactor
+
+			// Clamp performance to valid range
+			validator.Performance = math.Max(vm.minPerformance, math.Min(validator.Performance, vm.maxPerformance))
+
+			validator.LastRewardTime = now
+
+			vm.hc.logger.Info("Validator performance decayed",
+				"validator", fmt.Sprintf("%x", validator.ID),
+				"oldPerformance", oldPerformance,
+				"newPerformance", validator.Performance)
+		}
+	}
+}
+
+// IsActiveValidator checks if a validator is active
+func (vm *ValidatorManager) IsActiveValidator(id [32]byte) bool {
+	vm.validatorsMu.RLock()
+	defer vm.validatorsMu.RUnlock()
+
+	validator, exists := vm.validators[id]
+	return exists && validator.Status == ValidatorStatusActive
+}
+
+// GetValidators returns all validators
+func (vm *ValidatorManager) GetValidators() []*types.Validator {
+	vm.validatorsMu.RLock()
+	defer vm.validatorsMu.RUnlock()
+
+	validators := make([]*types.Validator, 0, len(vm.validators))
+	for _, validator := range vm.validators {
+		validators = append(validators, &types.Validator{
+			ID:    validator.ID,
+			Stake: validator.Stake,
+		})
+	}
+
+	return validators
+}
+
+// GetActiveValidators returns active validators
+func (vm *ValidatorManager) GetActiveValidators() []*types.Validator {
+	vm.validatorsMu.RLock()
+	defer vm.validatorsMu.RUnlock()
+
+	validators := make([]*types.Validator, 0, len(vm.activeValidators))
+	for _, validator := range vm.activeValidators {
+		validators = append(validators, &types.Validator{
+			ID:    validator.ID,
+			Stake: validator.Stake,
+		})
+	}
+
+	return validators
+}
+
+// GetTotalStake returns the total stake of all validators
+func (vm *ValidatorManager) GetTotalStake() uint64 {
+	vm.stakeMu.RLock()
+	defer vm.stakeMu.RUnlock()
+	return vm.totalStake
+}
+
+// GetActiveTotalStake returns the total stake of active validators
+func (vm *ValidatorManager) GetActiveTotalStake() uint64 {
+	vm.stakeMu.RLock()
+	defer vm.stakeMu.RUnlock()
+	return vm.activeTotalStake
+}
+
+// GetNextValidator returns the next validator for block production
+func (vm *ValidatorManager) GetNextValidator(blockNumber uint64, lastBlockHash [32]byte) *types.Validator {
+	// Delegate to DPoS for now
+	return vm.hc.dpos.GetNextValidator(blockNumber, lastBlockHash)
+}
+
+// GetState returns the serialized state of the validator manager
+func (vm *ValidatorManager) GetState() ([]byte, error) {
+	vm.validatorsMu.RLock()
+	defer vm.validatorsMu.RUnlock()
+
+	vm.stakeMu.RLock()
+	defer vm.stakeMu.RUnlock()
+
+	vm.performanceMu.RLock()
+	defer vm.performanceMu.RUnlock()
+
+	vm.rewardMu.RLock()
+	defer vm.rewardMu.RUnlock()
+
+	// Create serializable state
+	type validatorState struct {
+		ID               string  `json:"id"`
+		Stake            uint64  `json:"stake"`
+		Status           int     `json:"status"`
+		Performance      float64 `json:"performance"`
+		BlocksProduced   uint64  `json:"blocks_produced"`
+		EventsFinalized  uint64  `json:"events_finalized"`
+		LastRewardTime   int64   `json:"last_reward_time"`
+		JoinTime         int64   `json:"join_time"`
+		MisbehaviorCount uint64  `json:"misbehavior_count"`
+	}
+
+	type state struct {
+		Validators           map[string]validatorState `json:"validators"`
+		ActiveValidators     []string                  `json:"active_validators"`
+		TotalStake           uint64                    `json:"total_stake"`
+		ActiveTotalStake     uint64                    `json:"active_total_stake"`
+		PerformanceDecayRate float64                   `json:"performance_decay_rate"`
+		MinPerformance       float64                   `json:"min_performance"`
+		MaxPerformance       float64                   `json:"max_performance"`
+		BlockRewardWeight    float64                   `json:"block_reward_weight"`
+		EventRewardWeight    float64                   `json:"event_reward_weight"`
+		LastRewardHeight     uint64                    `json:"last_reward_height"`
+	}
+
+	s := state{
+		Validators:           make(map[string]validatorState),
+		ActiveValidators:     make([]string, 0, len(vm.activeValidators)),
+		TotalStake:           vm.totalStake,
+		ActiveTotalStake:     vm.activeTotalStake,
+		PerformanceDecayRate: vm.performanceDecayRate,
+		MinPerformance:       vm.minPerformance,
+		MaxPerformance:       vm.maxPerformance,
+		BlockRewardWeight:    vm.blockRewardWeight,
+		EventRewardWeight:    vm.eventRewardWeight,
+		LastRewardHeight:     vm.lastRewardHeight,
+	}
+
+	// Add validators
+	for id, validator := range vm.validators {
+		idStr := fmt.Sprintf("%x", id)
+		s.Validators[idStr] = validatorState{
+			ID:               idStr,
+			Stake:            validator.Stake,
+			Status:           int(validator.Status),
+			Performance:      validator.Performance,
+			BlocksProduced:   validator.BlocksProduced,
+			EventsFinalized:  validator.EventsFinalized,
+			LastRewardTime:   validator.LastRewardTime.Unix(),
+			JoinTime:         validator.JoinTime.Unix(),
+			MisbehaviorCount: validator.MisbehaviorCount,
+		}
+	}
+
+	// Add active validators
+	for _, validator := range vm.activeValidators {
+		s.ActiveValidators = append(s.ActiveValidators, fmt.Sprintf("%x", validator.ID))
+	}
+
+	return json.Marshal(s)
+}
+
+// RestoreState restores the validator manager state from serialized data
+func (vm *ValidatorManager) RestoreState(data []byte) error {
+	vm.validatorsMu.Lock()
+	defer vm.validatorsMu.Unlock()
+
+	vm.stakeMu.Lock()
+	defer vm.stakeMu.Unlock()
+
+	vm.performanceMu.Lock()
+	defer vm.performanceMu.Unlock()
+
+	vm.rewardMu.Lock()
+	defer vm.rewardMu.Unlock()
+
+	// Define state structure
+	type validatorState struct {
+		ID               string  `json:"id"`
+		Stake            uint64  `json:"stake"`
+		Status           int     `json:"status"`
+		Performance      float64 `json:"performance"`
+		BlocksProduced   uint64  `json:"blocks_produced"`
+		EventsFinalized  uint64  `json:"events_finalized"`
+		LastRewardTime   int64   `json:"last_reward_time"`
+		JoinTime         int64   `json:"join_time"`
+		MisbehaviorCount uint64  `json:"misbehavior_count"`
+	}
+
+	type state struct {
+		Validators           map[string]validatorState `json:"validators"`
+		ActiveValidators     []string                  `json:"active_validators"`
+		TotalStake           uint64                    `json:"total_stake"`
+		ActiveTotalStake     uint64                    `json:"active_total_stake"`
+		PerformanceDecayRate float64                   `json:"performance_decay_rate"`
+		MinPerformance       float64                   `json:"min_performance"`
+		MaxPerformance       float64                   `json:"max_performance"`
+		BlockRewardWeight    float64                   `json:"block_reward_weight"`
+		EventRewardWeight    float64                   `json:"event_reward_weight"`
+		LastRewardHeight     uint64                    `json:"last_reward_height"`
+	}
+
+	// Unmarshal state
+	var s state
+	if err := json.Unmarshal(data, &s); err != nil {
+		return NewConsensusError(
+			ErrStateInconsistency,
+			ErrorCategoryState,
+			"failed to unmarshal validator manager state",
+		).WithContext("error", err.Error())
+	}
+
+	// Restore validators
+	vm.validators = make(map[[32]byte]*ValidatorInfo)
+	for idStr, valState := range s.Validators {
+		var id [32]byte
+		if _, err := fmt.Sscanf(idStr, "%x", &id); err != nil {
+			return NewConsensusError(
+				ErrStateInconsistency,
+				ErrorCategoryState,
+				fmt.Sprintf("failed to parse validator ID %s", idStr),
+			).WithContext("error", err.Error())
+		}
+
+		vm.validators[id] = &ValidatorInfo{
+			ID:               id,
+			Stake:            valState.Stake,
+			Status:           ValidatorStatus(valState.Status),
+			Performance:      valState.Performance,
+			BlocksProduced:   valState.BlocksProduced,
+			EventsFinalized:  valState.EventsFinalized,
+			LastRewardTime:   time.Unix(valState.LastRewardTime, 0),
+			JoinTime:         time.Unix(valState.JoinTime, 0),
+			MisbehaviorCount: valState.MisbehaviorCount,
+		}
+	}
+
+	// Restore active validators
+	vm.activeValidators = make([]*ValidatorInfo, 0, len(s.ActiveValidators))
+	for _, idStr := range s.ActiveValidators {
+		var id [32]byte
+		if _, err := fmt.Sscanf(idStr, "%x", &id); err != nil {
+			return NewConsensusError(
+				ErrStateInconsistency,
+				ErrorCategoryState,
+				fmt.Sprintf("failed to parse active validator ID %s", idStr),
+			).WithContext("error", err.Error())
+		}
+
+		if validator, exists := vm.validators[id]; exists {
+			vm.activeValidators = append(vm.activeValidators, validator)
+		}
+	}
+
+	// Restore other state
+	vm.totalStake = s.TotalStake
+	vm.activeTotalStake = s.ActiveTotalStake
+	vm.performanceDecayRate = s.PerformanceDecayRate
+	vm.minPerformance = s.MinPerformance
+	vm.maxPerformance = s.MaxPerformance
+	vm.blockRewardWeight = s.BlockRewardWeight
+	vm.eventRewardWeight = s.EventRewardWeight
+	vm.lastRewardHeight = s.LastRewardHeight
+
+	return nil
+}
+
+// calculateEpochReward calculates the total reward for an epoch
+// This is a placeholder implementation that can be replaced with a more sophisticated model
+func calculateEpochReward(epoch uint64) uint64 {
+	// Base reward
+	baseReward := uint64(1000000)
+
+	// Decay factor (reduces rewards over time)
+	decayFactor := 1.0
+	if epoch > 0 {
+		decayFactor = math.Pow(0.9999, float64(epoch))
+	}
+
+	// Calculate final reward
+	return uint64(float64(baseReward) * decayFactor)
+}

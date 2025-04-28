@@ -7,11 +7,12 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go" // Import for extracting gauge values
 	"github.com/sirupsen/logrus"
 
 	"diamante/api"
+	"diamante/common"
 	ctypes "diamante/consensus/types"
-	"diamante/ledger"
 	"diamante/transaction"
 )
 
@@ -25,8 +26,8 @@ type ValidatorMetrics interface {
 type Reporter struct {
 	mu              sync.RWMutex
 	logger          *logrus.Logger
-	consensus       ctypes.Consensus // Should implement GetNetworkLoad() and, if possible, ValidatorMetrics.
-	ledger          ledger.LedgerAPI
+	consensus       ctypes.Consensus                // Should implement GetNetworkLoad() and, if possible, ValidatorMetrics.
+	ledger          common.LedgerAPI                // Updated: use common.LedgerAPI instead of ledger.LedgerAPI.
 	txManager       *transaction.TransactionManager // Must expose GetPoolSize() method.
 	updateInterval  time.Duration
 	prometheusStats *PrometheusStats
@@ -57,7 +58,7 @@ type PrometheusStats struct {
 // NewReporter creates a new Reporter instance and registers metrics.
 func NewReporter(
 	cons ctypes.Consensus,
-	ledgerAPI ledger.LedgerAPI,
+	ledgerAPI common.LedgerAPI, // Changed from ledger.LedgerAPI to common.LedgerAPI.
 	txManager *transaction.TransactionManager,
 	updateInterval time.Duration,
 	logger *logrus.Logger,
@@ -160,6 +161,24 @@ func (r *Reporter) reportingLoop() {
 	}
 }
 
+// getGaugeValue extracts the current float64 value from a Prometheus gauge.
+func getGaugeValue(g prometheus.Gauge) float64 {
+	var m dto.Metric
+	_ = g.Write(&m)
+	return m.GetGauge().GetValue()
+}
+
+// GetMetricsSnapshot returns a snapshot of key metric values.
+func (r *Reporter) GetMetricsSnapshot() map[string]interface{} {
+	stats := make(map[string]interface{})
+	stats["blockHeight"] = getGaugeValue(r.prometheusStats.blockHeight)
+	stats["networkLoad"] = getGaugeValue(r.prometheusStats.networkLoad)
+	stats["activeValidators"] = getGaugeValue(r.prometheusStats.activeValidators)
+	stats["txPoolSize"] = getGaugeValue(r.prometheusStats.txPoolSize)
+	stats["peerCount"] = getGaugeValue(r.prometheusStats.peerCount)
+	return stats
+}
+
 // collectAndReportMetrics gathers metrics from consensus, transaction manager, and network.
 func (r *Reporter) collectAndReportMetrics() {
 	// Consensus metrics:
@@ -180,7 +199,6 @@ func (r *Reporter) collectAndReportMetrics() {
 	}
 
 	// Transaction metrics:
-	// Get pool size via TransactionManager.GetPoolSize() (make sure to add this method as explained).
 	r.prometheusStats.txPoolSize.Set(float64(r.txManager.GetPoolSize()))
 
 	// System metrics: placeholders (update with real system calls later).
@@ -191,15 +209,4 @@ func (r *Reporter) collectAndReportMetrics() {
 	// Log a snapshot of key metrics.
 	snapshot, _ := json.Marshal(r.GetMetricsSnapshot())
 	r.logger.Info("Metrics updated", "snapshot", string(snapshot))
-}
-
-// GetMetricsSnapshot returns a snapshot of key metric values.
-func (r *Reporter) GetMetricsSnapshot() map[string]interface{} {
-	stats := make(map[string]interface{})
-	stats["blockHeight"] = r.prometheusStats.blockHeight
-	stats["networkLoad"] = r.prometheusStats.networkLoad
-	stats["activeValidators"] = r.prometheusStats.activeValidators
-	stats["txPoolSize"] = r.prometheusStats.txPoolSize
-	stats["peerCount"] = r.prometheusStats.peerCount
-	return stats
 }

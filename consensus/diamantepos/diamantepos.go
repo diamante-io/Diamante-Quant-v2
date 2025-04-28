@@ -72,17 +72,18 @@ type DPoS struct {
 // NewDPoS constructs a DPoS instance with a maximum set size for active validators
 // and a specified `epochDuration`.
 func NewDPoS(maxSetSize int, epochDuration uint64, logger Logger) *DPoS {
-	return &DPoS{
+	d := &DPoS{
 		validators:    make(map[[32]byte]*Validator),
 		maxSetSize:    maxSetSize,
 		epochDuration: epochDuration,
 		logger:        logger,
 		slashLog:      make([]SlashEvent, 0),
 	}
+	d.logger.Info("Initialized DPoS", "maxSetSize", maxSetSize, "epochDuration", epochDuration)
+	return d
 }
 
-// AddValidator registers a new validator with the given stake. It then recalculates
-// the active validator set.
+// AddValidator registers a new validator with the given stake. It then recalculates the active validator set.
 func (d *DPoS) AddValidator(id [32]byte, stake uint64) {
 	d.validatorsMu.Lock()
 	defer d.validatorsMu.Unlock()
@@ -90,9 +91,7 @@ func (d *DPoS) AddValidator(id [32]byte, stake uint64) {
 	d.stakeMu.Lock()
 	defer d.stakeMu.Unlock()
 
-	if _, exists := d.validators[id]; exists {
-		// Possibly update if already exists, but typically you'd call UpdateStake
-	} else {
+	if _, exists := d.validators[id]; !exists {
 		d.validators[id] = &Validator{
 			ID:             id,
 			Stake:          stake,
@@ -100,8 +99,10 @@ func (d *DPoS) AddValidator(id [32]byte, stake uint64) {
 			LastUpdateTime: time.Now(),
 		}
 		d.totalStake += stake
+		d.logger.Info("Validator added", "id", hex.EncodeToString(id[:]), "stake", stake)
+	} else {
+		d.logger.Info("Validator already exists; skipping add", "id", hex.EncodeToString(id[:]))
 	}
-
 	// Rebuild the active set
 	d.updateActiveValidators()
 }
@@ -115,20 +116,24 @@ func (d *DPoS) UpdateStake(id [32]byte, newStake uint64) {
 	defer d.stakeMu.Unlock()
 
 	if val, exists := d.validators[id]; exists {
+		oldStake := val.Stake
 		d.totalStake -= val.Stake
 		d.totalStake += newStake
 		val.Stake = newStake
+		d.logger.Info("Stake updated", "id", hex.EncodeToString(id[:]), "oldStake", oldStake, "newStake", newStake)
 		d.updateActiveValidators()
+	} else {
+		d.logger.Error("UpdateStake: Validator not found", "id", hex.EncodeToString(id[:]))
 	}
 }
 
-// updateActiveValidators sorts validators by stake * performance, picks up to `maxSetSize`,
+// updateActiveValidators sorts validators by score (stake * performance), picks up to `maxSetSize`,
 // and updates `IsActive` status. Also recalculates `activeTotalStake`.
 func (d *DPoS) updateActiveValidators() {
 	d.activeValidatorsMu.Lock()
 	defer d.activeValidatorsMu.Unlock()
 
-	// Sort all validators by score: stake * performance
+	// Create a slice of validators to sort.
 	var sorted []*Validator
 	for _, v := range d.validators {
 		sorted = append(sorted, v)
@@ -139,11 +144,11 @@ func (d *DPoS) updateActiveValidators() {
 		return scoreI > scoreJ
 	})
 
-	// Take top N
+	// Select top validators up to maxSetSize.
 	top := min(len(sorted), d.maxSetSize)
 	d.activeValidators = sorted[:top]
 
-	// Reset all to inactive, then mark the active set
+	// Reset all validators' active status, then mark the active set.
 	d.activeTotalStake = 0
 	for _, v := range d.validators {
 		v.IsActive = false
@@ -152,6 +157,7 @@ func (d *DPoS) updateActiveValidators() {
 		v.IsActive = true
 		d.activeTotalStake += v.Stake
 	}
+	d.logger.Info("Active validators updated", "activeCount", len(d.activeValidators), "activeTotalStake", d.activeTotalStake)
 }
 
 // GetNextValidator pseudo-randomly selects the next block producer from the active set,
@@ -161,79 +167,94 @@ func (d *DPoS) GetNextValidator(blockNumber uint64, lastBlockHash [32]byte) *typ
 	defer d.activeValidatorsMu.RUnlock()
 
 	if len(d.activeValidators) == 0 {
+		d.logger.Error("GetNextValidator: No active validators available")
 		return nil
 	}
 
-	// Compute a random index from lastBlockHash + blockNumber
 	seed := sha256.Sum256(append(lastBlockHash[:], uint64ToBytes(blockNumber)...))
 	index := binary.BigEndian.Uint64(seed[:8]) % uint64(len(d.activeValidators))
 	selected := d.activeValidators[int(index)]
-
+	d.logger.Info("Next validator selected", "blockNumber", blockNumber, "validator", hex.EncodeToString(selected.ID[:]))
 	return &types.Validator{
 		ID:    selected.ID,
 		Stake: selected.Stake,
 	}
 }
 
+// ProcessEpoch processes epoch-related changes at the epoch boundary.
 func (d *DPoS) ProcessEpoch(blockNumber uint64) error {
 	d.epochMu.Lock()
 	defer d.epochMu.Unlock()
 
-	d.validatorsMu.Lock()
-	defer d.validatorsMu.Unlock()
+	// Check if epoch duration is valid.
+	if d.epochDuration == 0 {
+		return fmt.Errorf("epoch duration is zero")
+	}
 
-	d.stakeMu.Lock()
-	defer d.stakeMu.Unlock()
-
-	// Not the boundary of an epoch
+	// If not at an epoch boundary, nothing to do.
 	if blockNumber%d.epochDuration != 0 {
 		return nil
 	}
 
-	d.currentEpoch++
+	d.validatorsMu.Lock()
+	d.stakeMu.Lock()
+	// Ensure locks are released in defer statements.
+	defer d.validatorsMu.Unlock()
+	defer d.stakeMu.Unlock()
 
-	// 1) Perform slashing
+	d.currentEpoch++
+	d.logger.Info("Processing new epoch", "epoch", d.currentEpoch, "blockNumber", blockNumber)
+
+	// 1) Perform slashing.
 	slashedAny, err := d.handleSlashingAndPenalties()
 	if err != nil {
 		return fmt.Errorf("slashing/penalty failed: %w", err)
 	}
 
-	// 2) Update active validators
+	// 2) Update active validators.
 	d.updateActiveValidators()
 
-	// 3) If no slash happened, distribute rewards
+	// 3) Distribute rewards if no slashing occurred.
 	if !slashedAny {
 		if err := d.distributeRewards(); err != nil {
 			return fmt.Errorf("reward distribution failed: %w", err)
 		}
 	}
 
-	// 4) Decay performance
+	// 4) Decay performance.
 	d.updatePerformance()
 
-	// 5) Transition to next epoch
-	return d.transitionToNextEpoch()
+	// 5) Transition to next epoch.
+	if err := d.transitionToNextEpoch(); err != nil {
+		return fmt.Errorf("failed to transition to next epoch: %w", err)
+	}
+
+	d.logger.Info("Epoch processed successfully", "epoch", d.currentEpoch)
+	return nil
 }
 
-// distributeRewards adds new stake to each active validator proportionally
+// distributeRewards adds new stake to each active validator proportionally.
 func (d *DPoS) distributeRewards() error {
 	totalReward := calculateTotalReward(d.currentEpoch)
+	d.logger.Info("Distributing rewards", "totalReward", totalReward, "currentEpoch", d.currentEpoch)
 
 	if d.activeTotalStake == 0 {
-		// If no active stake, skip
+		d.logger.Info("No active stake; skipping rewards")
 		return nil
 	}
 
 	for _, val := range d.activeValidators {
 		reward := (totalReward * val.Stake) / d.activeTotalStake
+		oldStake := val.Stake
 		val.Stake += reward
 		d.totalStake += reward
 		d.activeTotalStake += reward
+		d.logger.Info("Reward distributed", "validator", hex.EncodeToString(val.ID[:]), "oldStake", oldStake, "reward", reward, "newStake", val.Stake)
 	}
 	return nil
 }
 
-// handleSlashingAndPenalties returns a bool if any slash was applied
+// handleSlashingAndPenalties applies slashing penalties to misbehaving validators.
 func (d *DPoS) handleSlashingAndPenalties() (bool, error) {
 	d.slashLogMu.Lock()
 	defer d.slashLogMu.Unlock()
@@ -247,20 +268,22 @@ func (d *DPoS) handleSlashingAndPenalties() (bool, error) {
 				penalty = val.Stake
 			}
 
-			// Deduct penalty
+			oldStake := val.Stake
 			val.Stake -= penalty
 			d.totalStake -= penalty
 			if val.IsActive {
 				d.activeTotalStake -= penalty
 			}
 
-			// Record slash event
+			// Record slash event.
 			d.slashLog = append(d.slashLog, SlashEvent{
 				ValidatorID: val.ID,
 				Amount:      penalty,
 				Reason:      "Misbehavior",
 				Timestamp:   time.Now(),
 			})
+
+			d.logger.Info("Validator slashed", "validator", hex.EncodeToString(val.ID[:]), "penalty", penalty, "oldStake", oldStake, "newStake", val.Stake)
 
 			val.MisbehaviorCount = 0
 
@@ -272,12 +295,12 @@ func (d *DPoS) handleSlashingAndPenalties() (bool, error) {
 	return slashedAny, nil
 }
 
-// transitionToNextEpoch resets only the blocksProduced (we no longer hard-reset Performance=1.0)
+// transitionToNextEpoch resets certain per-epoch counters.
 func (d *DPoS) transitionToNextEpoch() error {
 	for _, val := range d.validators {
-		// We remove any forced val.Performance = 1.0
 		val.BlocksProduced = 0
 	}
+	d.logger.Info("Transitioned to next epoch", "currentEpoch", d.currentEpoch)
 	return nil
 }
 
@@ -286,10 +309,13 @@ func (d *DPoS) RewardValidator(id [32]byte) {
 	d.validatorsMu.Lock()
 	defer d.validatorsMu.Unlock()
 
-	val, exists := d.validators[id]
-	if exists {
+	if val, exists := d.validators[id]; exists {
+		oldPerf := val.Performance
 		val.Performance = math.Min(val.Performance*1.01, 1.0)
 		val.LastUpdateTime = time.Now()
+		d.logger.Info("Validator rewarded", "validator", hex.EncodeToString(id[:]), "oldPerformance", oldPerf, "newPerformance", val.Performance)
+	} else {
+		d.logger.Error("RewardValidator: Validator not found", "id", hex.EncodeToString(id[:]))
 	}
 }
 
@@ -306,12 +332,11 @@ func (d *DPoS) updatePerformance() {
 	for _, val := range d.validators {
 		hoursDiff := now.Sub(val.LastUpdateTime).Hours()
 		if hoursDiff > 0 {
-			// Optionally round or let float remain
-			// hoursDiff = math.Floor(hoursDiff)
-
+			oldPerf := val.Performance
 			val.Performance *= math.Pow(0.99, hoursDiff)
 			val.Performance = math.Max(0.1, math.Min(val.Performance, 1.0))
 			val.LastUpdateTime = now
+			d.logger.Info("Validator performance decayed", "validator", hex.EncodeToString(val.ID[:]), "oldPerformance", oldPerf, "newPerformance", val.Performance)
 		}
 	}
 }
@@ -361,12 +386,12 @@ func (d *DPoS) GetTotalStake() uint64 {
 	return d.totalStake
 }
 
-// GetValidatorStake returns the stake of a specific validator, or 0 if not found.
+// GetValidatorStake returns the stake of a specific validator if active; otherwise, returns 0.
 func (d *DPoS) GetValidatorStake(validatorID [32]byte) uint64 {
 	d.validatorsMu.RLock()
 	val, exists := d.validators[validatorID]
 	if !exists {
-		// Not found => no stake
+		d.logger.Error("GetValidatorStake: Validator not found", "id", hex.EncodeToString(validatorID[:]))
 		d.validatorsMu.RUnlock()
 		return 0
 	}
@@ -374,20 +399,16 @@ func (d *DPoS) GetValidatorStake(validatorID [32]byte) uint64 {
 		d.validatorsMu.RUnlock()
 		return 0
 	}
+	d.validatorsMu.RUnlock()
 
-	// If your code doesn't always call AddValidator, then val.Stake might be 0 here.
-	// So let's do a fallback: each active gets an equal share of the totalStake.
 	d.activeValidatorsMu.RLock()
 	activeCount := len(d.activeValidators)
 	d.activeValidatorsMu.RUnlock()
 
-	total := d.totalStake
-	d.validatorsMu.RUnlock()
-
 	if activeCount == 0 {
 		return 0
 	}
-	return total / uint64(activeCount)
+	return d.totalStake / uint64(activeCount)
 }
 
 // GetSetSize returns the maximum size for the active validator set.
@@ -407,6 +428,7 @@ func (d *DPoS) SetSetSize(size int) {
 	defer d.stakeMu.Unlock()
 
 	d.maxSetSize = size
+	d.logger.Info("Set maximum active validator set size", "newSize", size)
 	d.updateActiveValidators()
 }
 
@@ -419,9 +441,14 @@ func (d *DPoS) GetEpochDuration() uint64 {
 
 // SetEpochDuration updates the length (in blocks) of each epoch boundary.
 func (d *DPoS) SetEpochDuration(duration uint64) {
+	if duration == 0 {
+		d.logger.Error("SetEpochDuration: duration must be greater than zero")
+		return
+	}
 	d.epochMu.Lock()
 	defer d.epochMu.Unlock()
 	d.epochDuration = duration
+	d.logger.Info("Epoch duration updated", "newDuration", duration)
 }
 
 // GetState serializes the entire DPoS state (validators, active set, epoch info) into JSON.
@@ -485,12 +512,10 @@ func (d *DPoS) GetState() ([]byte, error) {
 	}
 	// Fill active validators
 	for _, v := range actives {
-		state.ActiveValidators = append(
-			state.ActiveValidators,
-			hex.EncodeToString(v.ID[:]),
-		)
+		state.ActiveValidators = append(state.ActiveValidators, hex.EncodeToString(v.ID[:]))
 	}
 
+	d.logger.Info("DPoS state serialized")
 	return json.Marshal(state)
 }
 
@@ -513,7 +538,7 @@ func (d *DPoS) RestoreState(stateData []byte) error {
 	}
 
 	if err := json.Unmarshal(stateData, &st); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal DPoS state: %w", err)
 	}
 
 	d.validatorsMu.Lock()
@@ -525,7 +550,6 @@ func (d *DPoS) RestoreState(stateData []byte) error {
 	d.stakeMu.Lock()
 	defer d.stakeMu.Unlock()
 
-	// Rebuild validators
 	newVals := make(map[[32]byte]*Validator)
 	var total uint64
 	for idStr, valData := range st.Validators {
@@ -558,7 +582,6 @@ func (d *DPoS) RestoreState(stateData []byte) error {
 	d.currentEpoch = st.CurrentEpoch
 	d.maxSetSize = st.MaxSetSize
 
-	// Rebuild active validator slice
 	var actives []*Validator
 	var activeTotal uint64
 	for _, activeIDStr := range st.ActiveValidators {
@@ -584,10 +607,9 @@ func (d *DPoS) RestoreState(stateData []byte) error {
 	d.totalStake = total
 	d.activeTotalStake = activeTotal
 
+	d.logger.Info("DPoS state restored", "totalStake", total, "activeTotalStake", activeTotal)
 	return nil
 }
-
-// In diamantepos.go:
 
 // InjectMisbehaviorCount sets the MisbehaviorCount for a validator (public helper).
 func (d *DPoS) InjectMisbehaviorCount(validatorID [32]byte, count uint64) {
@@ -596,6 +618,9 @@ func (d *DPoS) InjectMisbehaviorCount(validatorID [32]byte, count uint64) {
 
 	if v, exists := d.validators[validatorID]; exists {
 		v.MisbehaviorCount = count
+		d.logger.Info("Injected misbehavior count", "validator", hex.EncodeToString(validatorID[:]), "count", count)
+	} else {
+		d.logger.Error("InjectMisbehaviorCount: Validator not found", "id", hex.EncodeToString(validatorID[:]))
 	}
 }
 
@@ -606,6 +631,9 @@ func (d *DPoS) InjectLastUpdateTime(validatorID [32]byte, t time.Time) {
 
 	if v, exists := d.validators[validatorID]; exists {
 		v.LastUpdateTime = t
+		d.logger.Info("Injected last update time", "validator", hex.EncodeToString(validatorID[:]), "time", t)
+	} else {
+		d.logger.Error("InjectLastUpdateTime: Validator not found", "id", hex.EncodeToString(validatorID[:]))
 	}
 }
 
@@ -617,14 +645,13 @@ func (d *DPoS) GetValidatorPerformance(validatorID [32]byte) float64 {
 	if v, exists := d.validators[validatorID]; exists {
 		return v.Performance
 	}
-	return 0.0 // or some default
+	d.logger.Error("GetValidatorPerformance: Validator not found", "id", hex.EncodeToString(validatorID[:]))
+	return 0.0
 }
 
 // calculateTotalReward is a placeholder that reduces rewards as the epoch grows.
 func calculateTotalReward(epoch uint64) uint64 {
-	// If epoch=1, produce a modest reward
 	if epoch <= 1 {
-		// e.g., 100 => total stake grows from 300 to 400 if staked validators are active
 		return 100
 	}
 	baseReward := uint64(1000000)

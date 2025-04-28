@@ -1,5 +1,4 @@
-// consensus/diamantefinality/finality/lachesis_test.go
-
+// lachesis_test.go
 package finality_test
 
 import (
@@ -12,27 +11,27 @@ import (
 func TestLachesis_BasicFlow(t *testing.T) {
 	lach := finality.NewLachesis(100 * time.Millisecond)
 
-	// Initially, not running
+	// Start Lachesis.
 	if err := lach.Start(); err != nil {
 		t.Fatalf("failed to start Lachesis: %v", err)
 	}
 	defer lach.Stop()
 
-	// Add a validator
 	validatorID := randomNodeID(t)
 	lach.AddNode(validatorID, 1000)
 
-	// Create an event
+	// Create an event.
 	event := lach.CreateEvent(validatorID, nil, []byte("hello lachesis"))
 	if event == nil {
 		t.Fatal("CreateEvent returned nil, expected event")
 	}
+	// Allow some time for asynchronous processing.
 	time.Sleep(100 * time.Millisecond)
 
-	// Check if it's in pending
+	// Verify that there is at least one pending event.
 	pending := lach.GetPendingEvents()
 	if len(pending) == 0 {
-		t.Error("expected 1 pending event, got 0")
+		t.Error("expected at least 1 pending event, got 0")
 	}
 }
 
@@ -41,6 +40,7 @@ func TestLachesis_DoubleStart(t *testing.T) {
 	if err := lach.Start(); err != nil {
 		t.Errorf("first Start failed: %v", err)
 	}
+	// Second call should return an error.
 	if err := lach.Start(); err == nil {
 		t.Error("expected error on second Start, got nil")
 	}
@@ -49,7 +49,9 @@ func TestLachesis_DoubleStart(t *testing.T) {
 
 func TestLachesis_CreateAndProcessEvent(t *testing.T) {
 	lach := finality.NewLachesis(50 * time.Millisecond)
-	lach.Start()
+	if err := lach.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
 	defer lach.Stop()
 
 	nodeID := randomNodeID(t)
@@ -60,12 +62,11 @@ func TestLachesis_CreateAndProcessEvent(t *testing.T) {
 		t.Fatal("CreateEvent returned nil")
 	}
 
-	// Manually call ProcessEvent (as if not in a goroutine)
+	// Manually invoke ProcessEvent to simulate synchronous processing.
 	success := lach.ProcessEvent(ev)
 	if !success {
-		t.Error("ProcessEvent returned false, expected true (vote should pass by default?)")
+		t.Error("ProcessEvent returned false, expected true")
 	}
-
 	if !ev.Finalized {
 		t.Error("event should be marked Finalized after successful ProcessEvent")
 	}
@@ -73,8 +74,9 @@ func TestLachesis_CreateAndProcessEvent(t *testing.T) {
 
 func TestLachesis_UpdateNetworkLoad(t *testing.T) {
 	lach := finality.NewLachesis(50 * time.Millisecond)
-	if lach.GetNetworkLoad() != 0.0 {
-		t.Errorf("expected default load=0.0, got %f", lach.GetNetworkLoad())
+
+	if load := lach.GetNetworkLoad(); load != 0.0 {
+		t.Errorf("expected default networkLoad=0.0, got %f", load)
 	}
 
 	lach.AdjustNetworkLoad(+0.3)
@@ -83,57 +85,59 @@ func TestLachesis_UpdateNetworkLoad(t *testing.T) {
 	}
 
 	lach.AdjustNetworkLoad(+1.0)
-	if load2 := lach.GetNetworkLoad(); load2 != 1.0 {
-		t.Errorf("expected load=1.0 after clamp, got %f", load2)
+	if load := lach.GetNetworkLoad(); load != 1.0 {
+		t.Errorf("expected networkLoad to clamp at 1.0, got %f", load)
 	}
 }
 
 func TestLachesis_SetVotingThreshold(t *testing.T) {
 	lach := finality.NewLachesis(50 * time.Millisecond)
-	if lach.GetVotingThreshold() != 0.66 {
-		t.Errorf("expected default=0.66, got %f", lach.GetVotingThreshold())
+	if thresh := lach.GetVotingThreshold(); thresh != 0.66 {
+		t.Errorf("expected default voting threshold=0.66, got %f", thresh)
 	}
 	lach.SetVotingThreshold(0.75)
-	if lach.GetVotingThreshold() != 0.75 {
-		t.Errorf("expected threshold=0.75, got %f", lach.GetVotingThreshold())
+	if thresh := lach.GetVotingThreshold(); thresh != 0.75 {
+		t.Errorf("expected voting threshold=0.75 after update, got %f", thresh)
 	}
 }
 
 func TestLachesis_ForceSync(t *testing.T) {
 	lach := finality.NewLachesis(50 * time.Millisecond)
-	lach.Start()
+	if err := lach.Start(); err != nil {
+		t.Fatalf("failed to start Lachesis: %v", err)
+	}
 	defer lach.Stop()
 
-	// ForceSyncAll just calls gossip.ForceSyncAll, we can do a quick check
+	// ForceSync simply calls GossipProtocol.ForceSyncAll.
 	lach.ForceSync()
+	// No error is expected; if it panics or errors, the test will fail.
 }
 
 func TestLachesis_Serialization(t *testing.T) {
 	lach := finality.NewLachesis(50 * time.Millisecond)
 	if err := lach.Start(); err != nil {
-		t.Fatalf("failed to start: %v", err)
+		t.Fatalf("failed to start Lachesis: %v", err)
 	}
 	nodeA := randomNodeID(t)
 	lach.AddNode(nodeA, 100)
 	ev1 := lach.CreateEvent(nodeA, nil, []byte("serialize me"))
-	time.Sleep(100 * time.Millisecond) // Let it finalize
+	// Allow time for event finalization.
+	time.Sleep(100 * time.Millisecond)
 
-	// Snapshot
-	data, err := lach.GetState()
+	stateData, err := lach.GetState()
 	if err != nil {
 		t.Fatalf("GetState error: %v", err)
 	}
 
-	// Make a new Lachesis and restore
+	// Create a new Lachesis instance and restore state.
 	lach2 := finality.NewLachesis(100 * time.Millisecond)
-	if err := lach2.RestoreState(data); err != nil {
+	if err := lach2.RestoreState(stateData); err != nil {
 		t.Fatalf("RestoreState error: %v", err)
 	}
 
-	// Check that the event is found in finalized
 	finals, _ := lach2.GetFinalizedEvents(ev1.Height, ev1.Height)
 	if len(finals) == 0 {
-		t.Error("expected to see the event in the new Lachesis's finalized list")
+		t.Error("expected to see the event in finalized list after restore")
 	}
 }
 

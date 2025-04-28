@@ -1,10 +1,11 @@
-// File: wallet/wallet.go
 package wallet
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"os"
 	"sync"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// Wallet represents a user wallet that manages keys and provides methods to create and sign transactions.
+// Wallet represents a user wallet that manages keys and provides methods to create, sign, and submit transactions.
 type Wallet struct {
 	// ID is the unique identifier for the wallet/account.
 	ID string `json:"id"`
@@ -84,22 +85,114 @@ func NewWallet(logger *logrus.Logger) (*Wallet, error) {
 }
 
 // RegisterAccount registers the wallet’s account in the global account store.
+// In production, the account's private key is stored encrypted.
+// The encryption key is obtained from the environment variable DIAMANTE_WALLET_ENCRYPTION_KEY,
+// which must be a 64-character hex string (32 bytes).
 func (w *Wallet) RegisterAccount() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	account := &common.Account{
-		ID:         w.ID,
-		PublicKey:  w.SigKeyPair.PublicKey,
-		PrivateKey: w.SigKeyPair.PrivateKey,
-		Balance:    0,
+	encKey := os.Getenv("DIAMANTE_WALLET_ENCRYPTION_KEY")
+	if encKey == "" {
+		return fmt.Errorf("DIAMANTE_WALLET_ENCRYPTION_KEY environment variable not set")
+	}
+	keyBytes, err := hex.DecodeString(encKey)
+	if err != nil {
+		return fmt.Errorf("failed to decode DIAMANTE_WALLET_ENCRYPTION_KEY: %w", err)
+	}
+	if len(keyBytes) != 32 {
+		return fmt.Errorf("DIAMANTE_WALLET_ENCRYPTION_KEY must be 64 hex characters representing 32 bytes")
 	}
 
-	// Use the common package function to register the account.
+	// Create account using the new common.Account which stores an encrypted private key.
+	account := &common.Account{
+		ID:        w.ID,
+		PublicKey: w.SigKeyPair.PublicKey,
+		Balance:   0,
+	}
+	// Encrypt the private key using the provided encryption key.
+	if err := account.SetPrivateKey(w.SigKeyPair.PrivateKey, encKey); err != nil {
+		return fmt.Errorf("failed to encrypt private key: %w", err)
+	}
+
 	if err := common.RegisterAccount(account); err != nil {
 		return fmt.Errorf("failed to register account: %w", err)
 	}
 	return nil
+}
+
+// GetBalance returns the current balance for the wallet’s account from the global store.
+func (w *Wallet) GetBalance() (float64, error) {
+	account := common.GetAccount(w.ID)
+	if account == nil {
+		return 0, fmt.Errorf("account %s not found", w.ID)
+	}
+	return account.Balance, nil
+}
+
+// FundWallet credits the wallet’s account with a given amount.
+func (w *Wallet) FundWallet(amount float64) error {
+	return common.UpdateAccountBalance(w.ID, amount)
+}
+
+// CreateTransaction constructs a new transaction using the wallet as the sender.
+// It generates a unique transaction ID, increments the nonce, signs the transaction,
+// and returns the transaction object.
+func (w *Wallet) CreateTransaction(receiver string, amount float64, fee float64, data []byte) (*common.Transaction, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	txID := common.GenerateUniqueID()
+	w.Nonce++
+
+	tx := &common.Transaction{
+		ID:        txID,
+		Sender:    w.ID,
+		Receiver:  receiver,
+		Amount:    amount,
+		Fee:       fee,
+		Timestamp: time.Now().Unix(),
+		Nonce:     w.Nonce,
+		Data:      data,
+	}
+
+	sig, err := crypto.SignDataWithDilithium(w.SigKeyPair.PrivateKey, []byte(tx.ID))
+	if err != nil {
+		return nil, fmt.Errorf("failed to sign transaction: %w", err)
+	}
+	tx.Signature = sig
+
+	return tx, nil
+}
+
+// SubmitTransaction creates and submits a transaction via the provided TransactionManager.
+// It returns the created transaction.
+func (w *Wallet) SubmitTransaction(receiver string, amount float64, fee float64, data []byte, txManager *transaction.TransactionManager) (*common.Transaction, error) {
+	tx, err := w.CreateTransaction(receiver, amount, fee, data)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = txManager.CreateTransaction(tx.Sender, tx.Receiver, tx.Amount, tx.Fee, tx.Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to submit transaction via TransactionManager: %w", err)
+	}
+	return tx, nil
+}
+
+// SignMessage signs an arbitrary message using the wallet's signature key.
+func (w *Wallet) SignMessage(message string) ([]byte, error) {
+	return crypto.SignDataWithDilithium(w.SigKeyPair.PrivateKey, []byte(message))
+}
+
+// VerifySignature verifies a signature for a given message using the wallet's public key.
+func (w *Wallet) VerifySignature(message string, signature []byte) (bool, error) {
+	return crypto.VerifySignature(w.SigKeyPair.PublicKey, []byte(message), signature)
+}
+
+// GetPublicKeyHex returns the wallet's public key as a hex-encoded string.
+func (w *Wallet) GetPublicKeyHex() string {
+	return hex.EncodeToString(w.SigKeyPair.PublicKey)
 }
 
 // Export writes the wallet’s data to a JSON file.
@@ -172,51 +265,4 @@ func ImportWallet(filePath string, logger *logrus.Logger) (*Wallet, error) {
 
 	logger.WithField("walletID", wallet.ID).Info("Wallet imported successfully")
 	return wallet, nil
-}
-
-// CreateTransaction constructs a new transaction using the wallet as the sender.
-// It generates a unique transaction ID, increments the nonce, and signs the transaction ID.
-func (w *Wallet) CreateTransaction(receiver string, amount float64, fee float64, data []byte) (*common.Transaction, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-
-	txID := common.GenerateUniqueID()
-	w.Nonce++
-
-	// Note: common.Transaction expects Timestamp as an int64.
-	tx := &common.Transaction{
-		ID:        txID,
-		Sender:    w.ID,
-		Receiver:  receiver,
-		Amount:    amount,
-		Fee:       fee,
-		Timestamp: time.Now().Unix(),
-		Nonce:     w.Nonce,
-		Data:      data,
-	}
-
-	sig, err := crypto.SignDataWithDilithium(w.SigKeyPair.PrivateKey, []byte(tx.ID))
-	if err != nil {
-		return nil, fmt.Errorf("failed to sign transaction: %w", err)
-	}
-	tx.Signature = sig
-
-	return tx, nil
-}
-
-// SubmitTransaction submits a transaction via the provided TransactionManager.
-// It creates a transaction, then calls the TransactionManager to add it to the pool.
-func (w *Wallet) SubmitTransaction(receiver string, amount float64, fee float64, data []byte, txManager *transaction.TransactionManager) (*common.Transaction, error) {
-	tx, err := w.CreateTransaction(receiver, amount, fee, data)
-	if err != nil {
-		return nil, err
-	}
-
-	// Call the TransactionManager's CreateTransaction and ignore the returned transaction.
-	_, err = txManager.CreateTransaction(tx.Sender, tx.Receiver, tx.Amount, tx.Fee, tx.Data)
-	if err != nil {
-		return nil, fmt.Errorf("failed to submit transaction via TransactionManager: %w", err)
-	}
-
-	return tx, nil
 }

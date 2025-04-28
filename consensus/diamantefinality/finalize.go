@@ -7,9 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sync"
 )
 
+// Voting interface remains unchanged.
 type Voting interface {
 	Vote(e *types.Event) bool
 	HasSeen(validatorID [32]byte, event *types.Event) bool
@@ -19,24 +22,29 @@ type Voting interface {
 	RestoreState([]byte) error
 }
 
+// Finalizer finalizes events using voting results and maintains checkpoints.
 type Finalizer struct {
 	dag           *DAG
 	virtualVoting Voting
 	mu            sync.RWMutex
 	finalized     map[[32]byte]bool
 	checkpoints   map[uint64]*types.Event
+	logger        *log.Logger
 }
 
+// NewFinalizer creates a new Finalizer instance and initializes a logger.
 func NewFinalizer(dag *DAG, voting Voting) *Finalizer {
 	return &Finalizer{
 		dag:           dag,
 		virtualVoting: voting,
 		finalized:     make(map[[32]byte]bool),
 		checkpoints:   make(map[uint64]*types.Event),
+		// Use os.Stdout (or io.Discard if you wish to suppress output) instead of nil.
+		logger: log.New(os.Stdout, "Finalizer: ", log.Ldate|log.Ltime|log.Lshortfile),
 	}
 }
 
-// Finalize tries to finalize an event. If voting fails, return error.
+// Finalize tries to finalize an event. If voting fails, returns an error.
 func (f *Finalizer) Finalize(event *types.Event) (bool, error) {
 	f.mu.RLock()
 	if f.finalized[event.ID] {
@@ -45,21 +53,22 @@ func (f *Finalizer) Finalize(event *types.Event) (bool, error) {
 	}
 	f.mu.RUnlock()
 
-	// Must succeed via voting
+	// Must succeed via voting.
 	if f.virtualVoting.Vote(event) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
 
-		// double-check inside write lock
+		// Double-check inside write lock.
 		if f.finalized[event.ID] {
 			return true, nil
 		}
 		event.Finalized = true
 		f.finalized[event.ID] = true
 
-		// The crucial line:
+		// Update checkpoints.
 		f.updateCheckpoints(event)
 
+		f.logger.Printf("Event %x finalized successfully", event.ID)
 		return true, nil
 	}
 	return false, errors.New("vote failed, cannot finalize event")
@@ -72,12 +81,12 @@ func (f *Finalizer) IsFinalized(eventID [32]byte) bool {
 	return f.finalized[eventID]
 }
 
+// updateCheckpoints updates checkpoints if the event's height is a multiple of the interval.
 func (f *Finalizer) updateCheckpoints(event *types.Event) {
-	fmt.Println("DEBUG: updateCheckpoints called, event height =", event.Height)
 	const checkpointInterval = 1000
 	if event.Height%checkpointInterval == 0 {
 		f.checkpoints[event.Height] = event
-		fmt.Println("DEBUG: checkpoint stored at height =", event.Height)
+		f.logger.Printf("Checkpoint stored at height=%d", event.Height)
 	}
 }
 
@@ -102,13 +111,13 @@ func (f *Finalizer) GetState() ([]byte, error) {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	// Convert finalized map [32]byte -> bool into a string -> bool for JSON
+	// Convert finalized map from [32]byte -> bool into a string -> bool map.
 	finalizedMap := make(map[string]bool, len(f.finalized))
 	for id, val := range f.finalized {
 		finalizedMap[byteArrayToString(id)] = val
 	}
 
-	// Copy checkpoints
+	// Copy checkpoints.
 	cpMap := make(map[uint64]*types.Event, len(f.checkpoints))
 	for h, ev := range f.checkpoints {
 		cpMap[h] = ev
@@ -131,7 +140,7 @@ func (f *Finalizer) RestoreState(data []byte) error {
 		Checkpoints map[uint64]*types.Event
 	}
 	if err := json.Unmarshal(data, &state); err != nil {
-		return err
+		return fmt.Errorf("failed to unmarshal Finalizer state: %w", err)
 	}
 
 	f.mu.Lock()
@@ -153,9 +162,11 @@ func (f *Finalizer) RestoreState(data []byte) error {
 
 	f.finalized = newFin
 	f.checkpoints = newCP
+	f.logger.Println("Finalizer state restored successfully")
 	return nil
 }
 
+// FinalizeEvents finalizes a batch of events concurrently.
 func (f *Finalizer) FinalizeEvents(events []*types.Event) error {
 	var wg sync.WaitGroup
 	errChan := make(chan error, len(events))
@@ -165,7 +176,6 @@ func (f *Finalizer) FinalizeEvents(events []*types.Event) error {
 		go func(e *types.Event) {
 			defer wg.Done()
 			success, err := f.Finalize(e)
-			// If we get an error, push it. If success==false, also push an error.
 			if err != nil {
 				errChan <- err
 				return

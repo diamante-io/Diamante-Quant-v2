@@ -1,0 +1,102 @@
+package storage
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/tecbot/gorocksdb"
+)
+
+// Block represents a blockchain block for storage purposes.
+type Block struct {
+	Number        uint64        `json:"number"`
+	Timestamp     time.Time     `json:"timestamp"`
+	Transactions  []Transaction `json:"transactions"`
+	PrevBlockHash string        `json:"prev_block_hash"`
+	BlockHash     string        `json:"block_hash"`
+}
+
+// Transaction represents a simple blockchain transaction.
+type Transaction struct {
+	ID        string    `json:"id"`
+	Sender    string    `json:"sender"`
+	Receiver  string    `json:"receiver"`
+	Amount    float64   `json:"amount"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+// Store defines the interface for block storage.
+type Store interface {
+	SaveBlock(block *Block) error
+	GetBlock(blockNumber uint64) (*Block, error)
+}
+
+// RocksDBStore implements Store using RocksDB.
+type RocksDBStore struct {
+	db *gorocksdb.DB
+	ro *gorocksdb.ReadOptions
+	wo *gorocksdb.WriteOptions
+	mu sync.RWMutex
+}
+
+// NewRocksDBStore creates a new RocksDBStore instance and ensures the blocks directory exists.
+func NewRocksDBStore(dbPath string) (*RocksDBStore, error) {
+	opts := gorocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(true)
+	db, err := gorocksdb.OpenDb(opts, dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open RocksDB for storage: %w", err)
+	}
+	return &RocksDBStore{
+		db: db,
+		ro: gorocksdb.NewDefaultReadOptions(),
+		wo: gorocksdb.NewDefaultWriteOptions(),
+	}, nil
+}
+
+// Close closes the RocksDBStore.
+func (rs *RocksDBStore) Close() {
+	rs.db.Close()
+	rs.ro.Destroy()
+	rs.wo.Destroy()
+}
+
+func blockStorageKey(blockNumber uint64) []byte {
+	return []byte("block:" + strconv.FormatUint(blockNumber, 10))
+}
+
+func (rs *RocksDBStore) SaveBlock(block *Block) error {
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	data, err := json.MarshalIndent(block, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal block: %w", err)
+	}
+	key := blockStorageKey(block.Number)
+	if err := rs.db.Put(rs.wo, key, data); err != nil {
+		return fmt.Errorf("failed to write block: %w", err)
+	}
+	return nil
+}
+
+func (rs *RocksDBStore) GetBlock(blockNumber uint64) (*Block, error) {
+	rs.mu.RLock()
+	defer rs.mu.RUnlock()
+	key := blockStorageKey(blockNumber)
+	slice, err := rs.db.Get(rs.ro, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read block: %w", err)
+	}
+	defer slice.Free()
+	if slice.Size() == 0 {
+		return nil, fmt.Errorf("block %d not found", blockNumber)
+	}
+	var block Block
+	if err := json.Unmarshal(slice.Data(), &block); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block: %w", err)
+	}
+	return &block, nil
+}

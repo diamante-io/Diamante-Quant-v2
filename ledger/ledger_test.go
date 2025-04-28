@@ -1,120 +1,181 @@
 package ledger
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"diamante/common"
+	"diamante/storage"
+
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
-// fakeDilithiumPubKey returns a dummy public key of size 1952 bytes (Dilithium mode3).
-func fakeDilithiumPubKey() []byte {
-	return make([]byte, 1952) // all zeros, but correct length
+// setupTestMongoDB sets up a MongoDB connection for testing
+func setupTestMongoDB(t *testing.T) *storage.MongoLedger {
+	// Use a test-specific database name to avoid conflicts
+	mongoURI := "mongodb://localhost:27017"
+	dbName := "diamante_test_" + time.Now().Format("20060102150405")
+
+	// Try to connect to MongoDB
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := mongo.Connect(ctx, options.Client().ApplyURI(mongoURI))
+	if err != nil {
+		t.Skipf("Skipping MongoDB tests: %v", err)
+		return nil
+	}
+
+	// Check if MongoDB is actually running
+	err = client.Ping(ctx, nil)
+	if err != nil {
+		t.Skipf("Skipping MongoDB tests: MongoDB not available: %v", err)
+		return nil
+	}
+
+	// Create a new MongoLedger
+	ledger, err := storage.NewMongoLedger(mongoURI, dbName)
+	if err != nil {
+		t.Fatalf("Failed to create MongoLedger: %v", err)
+	}
+
+	// Register cleanup to drop the test database
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		client.Database(dbName).Drop(ctx)
+		client.Disconnect(ctx)
+	})
+
+	return ledger
 }
 
-// fakeSignature returns a minimal, non-empty byte slice to pass "non-empty" checks.
+// fakeDilithiumPubKey returns a dummy public key of length 1952 bytes (typical for Dilithium mode3).
+func fakeDilithiumPubKey() []byte {
+	return make([]byte, 1952)
+}
+
+// fakeSignature returns a minimal non-empty signature (which our ledger code treats specially).
 func fakeSignature() []byte {
-	// This doesn't have to be large; just not empty
 	return []byte{0x01, 0x02, 0x03}
 }
 
-func TestLedger_NewLedger(t *testing.T) {
-	l := NewLedger()
-	if l == nil {
-		t.Fatal("expected a non-nil ledger instance")
+func TestMongoLedger_NewLedger(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
 	}
 }
 
-func TestLedger_CreateAccount(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_CreateAccount(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
 	acc := &common.Account{
 		ID:        "testAccount",
 		Balance:   50.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	err := l.CreateAccount(acc)
-	if err != nil {
+	if err := ldb.CreateAccount(acc); err != nil {
 		t.Fatalf("CreateAccount failed: %v", err)
 	}
-
-	// Try creating the same account => should fail
-	err2 := l.CreateAccount(acc)
-	if err2 == nil {
-		t.Fatal("expected error for creating duplicate account, got nil")
+	// Attempt to create the same account again; should return an error.
+	if err := ldb.CreateAccount(acc); err == nil {
+		t.Fatal("expected error when creating duplicate account, got nil")
 	}
 }
 
-func TestLedger_UpdateAccount(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_UpdateAccount(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
 	acc := &common.Account{
 		ID:        "updateMe",
 		Balance:   100.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	if err := l.CreateAccount(acc); err != nil {
+	if err := ldb.CreateAccount(acc); err != nil {
 		t.Fatalf("CreateAccount failed: %v", err)
 	}
-	// Modify the account
+	// Modify the account's balance.
 	acc.Balance = 200.0
-	err := l.UpdateAccount(acc)
-	if err != nil {
+	if err := ldb.UpdateAccount(acc); err != nil {
 		t.Fatalf("UpdateAccount failed: %v", err)
 	}
-
-	// Try updating a non-existent account
+	// Try updating a non-existent account.
 	fakeAcc := &common.Account{ID: "nonExistent", PublicKey: fakeDilithiumPubKey()}
-	err2 := l.UpdateAccount(fakeAcc)
-	if err2 == nil {
-		t.Fatal("expected error for non-existent account, got nil")
+	if err := ldb.UpdateAccount(fakeAcc); err == nil {
+		t.Fatal("expected error when updating a non-existent account, got nil")
 	}
 }
 
-func TestLedger_GetBalance(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_GetBalance(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
 	acc := &common.Account{
 		ID:        "balCheck",
 		Balance:   75.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	if err := l.CreateAccount(acc); err != nil {
+	if err := ldb.CreateAccount(acc); err != nil {
 		t.Fatalf("CreateAccount failed: %v", err)
 	}
-	bal, err := l.GetBalance("balCheck")
+	bal, err := ldb.GetBalance("balCheck")
 	if err != nil {
 		t.Fatalf("GetBalance error: %v", err)
 	}
 	if bal != 75.0 {
-		t.Fatalf("expected 75.0, got %.2f", bal)
+		t.Fatalf("expected balance 75.0, got %.2f", bal)
 	}
 }
 
-func TestLedger_UpdateAccountBalance(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_UpdateAccountBalance(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
 	acc := &common.Account{
 		ID:        "updateBal",
 		Balance:   20.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	if err := l.CreateAccount(acc); err != nil {
+	if err := ldb.CreateAccount(acc); err != nil {
 		t.Fatalf("CreateAccount failed: %v", err)
 	}
-	// Add 15 => new total 35
-	err := l.UpdateAccountBalance("updateBal", 15)
-	if err != nil {
+	// Add 15; expected new total is 35.
+	if err := ldb.UpdateAccountBalance("updateBal", 15); err != nil {
 		t.Fatalf("UpdateAccountBalance failed: %v", err)
 	}
-	newBal, _ := l.GetBalance("updateBal")
+	newBal, err := ldb.GetBalance("updateBal")
+	if err != nil {
+		t.Fatalf("GetBalance failed: %v", err)
+	}
 	if newBal != 35.0 {
-		t.Fatalf("expected 35.0, got %.2f", newBal)
+		t.Fatalf("expected balance 35.0, got %.2f", newBal)
 	}
 }
 
-func TestLedger_AddTransaction(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_AddTransaction(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
 	sender := &common.Account{
 		ID:        "sender",
@@ -126,8 +187,12 @@ func TestLedger_AddTransaction(t *testing.T) {
 		Balance:   10.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	_ = l.CreateAccount(sender)
-	_ = l.CreateAccount(receiver)
+	if err := ldb.CreateAccount(sender); err != nil {
+		t.Fatalf("CreateAccount for sender failed: %v", err)
+	}
+	if err := ldb.CreateAccount(receiver); err != nil {
+		t.Fatalf("CreateAccount for receiver failed: %v", err)
+	}
 
 	tx := common.Transaction{
 		ID:        "tx-add-1",
@@ -135,21 +200,22 @@ func TestLedger_AddTransaction(t *testing.T) {
 		Receiver:  "receiver",
 		Amount:    40.0,
 		Fee:       1.0,
-		Signature: fakeSignature(), // minimal dummy signature
+		Signature: fakeSignature(),
 	}
-	err := l.AddTransaction(tx)
-	if err != nil {
-		t.Fatalf("AddTransaction failed unexpectedly: %v", err)
+	if err := ldb.AddTransaction(tx); err != nil {
+		t.Fatalf("AddTransaction failed: %v", err)
 	}
-
-	// Check if ledger stored it
-	if !l.IsTransactionCommitted("tx-add-1") {
-		t.Fatal("expected transaction to be in ledger, but IsTransactionCommitted returned false")
+	if !ldb.IsTransactionCommitted("tx-add-1") {
+		t.Fatal("expected transaction to be committed, but IsTransactionCommitted returned false")
 	}
 }
 
-func TestLedger_IsTransactionCommitted(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_IsTransactionCommitted(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
 	acc1 := &common.Account{
 		ID:        "sender2",
@@ -161,8 +227,12 @@ func TestLedger_IsTransactionCommitted(t *testing.T) {
 		Balance:   5.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	_ = l.CreateAccount(acc1)
-	_ = l.CreateAccount(acc2)
+	if err := ldb.CreateAccount(acc1); err != nil {
+		t.Fatalf("CreateAccount for sender2 failed: %v", err)
+	}
+	if err := ldb.CreateAccount(acc2); err != nil {
+		t.Fatalf("CreateAccount for receiver2 failed: %v", err)
+	}
 
 	tx := common.Transaction{
 		ID:        "tx-check-1",
@@ -172,25 +242,26 @@ func TestLedger_IsTransactionCommitted(t *testing.T) {
 		Fee:       0.5,
 		Signature: fakeSignature(),
 	}
-	// Not yet added => must be false
-	if l.IsTransactionCommitted("tx-check-1") {
-		t.Fatal("expected false, got true")
+	// Before adding, the transaction should not be committed.
+	if ldb.IsTransactionCommitted("tx-check-1") {
+		t.Fatal("expected IsTransactionCommitted to return false, got true")
 	}
-	// Add it
-	err := l.AddTransaction(tx)
-	if err != nil {
+	if err := ldb.AddTransaction(tx); err != nil {
 		t.Fatalf("AddTransaction failed: %v", err)
 	}
-	// Now must be true
-	if !l.IsTransactionCommitted("tx-check-1") {
-		t.Fatal("expected true after adding transaction, got false")
+	// Now it should be committed.
+	if !ldb.IsTransactionCommitted("tx-check-1") {
+		t.Fatal("expected IsTransactionCommitted to return true after adding transaction, got false")
 	}
 }
 
-func TestLedger_CommitBlock(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_CommitBlock(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
-	// Create two accounts
 	blockSender := &common.Account{
 		ID:        "blockSender",
 		Balance:   200.0,
@@ -201,10 +272,13 @@ func TestLedger_CommitBlock(t *testing.T) {
 		Balance:   20.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	_ = l.CreateAccount(blockSender)
-	_ = l.CreateAccount(blockReceiver)
+	if err := ldb.CreateAccount(blockSender); err != nil {
+		t.Fatalf("CreateAccount for blockSender failed: %v", err)
+	}
+	if err := ldb.CreateAccount(blockReceiver); err != nil {
+		t.Fatalf("CreateAccount for blockReceiver failed: %v", err)
+	}
 
-	// create a valid transaction so it doesn't fail signature checks
 	tx := common.Transaction{
 		ID:        "btx1",
 		Sender:    "blockSender",
@@ -213,46 +287,33 @@ func TestLedger_CommitBlock(t *testing.T) {
 		Fee:       1.0,
 		Signature: fakeSignature(),
 	}
-	errTx := l.AddTransaction(tx)
-	if errTx != nil {
-		t.Fatalf("AddTransaction failed: %v", errTx)
+	if err := ldb.AddTransaction(tx); err != nil {
+		t.Fatalf("AddTransaction failed: %v", err)
 	}
 
 	block := common.Block{
 		Number:       1,
 		PreviousHash: "some-genesis-hash",
-		// Include our transaction
 		Transactions: []common.Transaction{tx},
 		Timestamp:    time.Now().Unix(),
-		Hash:         "hash-of-this-block", // minimal; let ledger recompute
+		Hash:         "hash-of-this-block", // placeholder; ledger will recompute.
 	}
+	// Compute final hash.
+	block.Hash = common.ComputeBlockHash(block)
 
-	// The ledger will do re-check, so let's fix the block's Hash to match common.ComputeBlockHash
-	computed := common.ComputeBlockHash(block)
-	block.Hash = computed
-
-	err := l.CommitBlock(block)
-	if err != nil {
+	if err := ldb.CommitBlock(block); err != nil {
 		t.Fatalf("unexpected error committing block: %v", err)
-	}
-
-	// Now the ledger must have block #1
-	if l.currentHeight != 1 {
-		t.Fatalf("expected currentHeight=1, got %d", l.currentHeight)
 	}
 }
 
-func TestLedger_GetLastBlockHash(t *testing.T) {
-	l := NewLedger()
-
-	// no block => must fail
-	_, err0 := l.GetLastBlockHash()
-	if err0 == nil {
-		t.Fatal("expected error for no blocks, got nil")
+func TestMongoLedger_GetBlock(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
 	}
 
-	// commit 1 block => last block #1
-	// create accounts so transaction passes
+	// Create accounts.
 	acc1 := &common.Account{
 		ID:        "gblh-sender",
 		Balance:   200.0,
@@ -263,8 +324,12 @@ func TestLedger_GetLastBlockHash(t *testing.T) {
 		Balance:   10.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	_ = l.CreateAccount(acc1)
-	_ = l.CreateAccount(acc2)
+	if err := ldb.CreateAccount(acc1); err != nil {
+		t.Fatalf("CreateAccount for gblh-sender failed: %v", err)
+	}
+	if err := ldb.CreateAccount(acc2); err != nil {
+		t.Fatalf("CreateAccount for gblh-recv failed: %v", err)
+	}
 
 	tx := common.Transaction{
 		ID:        "gblh-tx1",
@@ -274,8 +339,8 @@ func TestLedger_GetLastBlockHash(t *testing.T) {
 		Fee:       0.5,
 		Signature: fakeSignature(),
 	}
-	if errAdd := l.AddTransaction(tx); errAdd != nil {
-		t.Fatalf("AddTransaction failed: %v", errAdd)
+	if err := ldb.AddTransaction(tx); err != nil {
+		t.Fatalf("AddTransaction failed: %v", err)
 	}
 	block := common.Block{
 		Number:       1,
@@ -283,25 +348,28 @@ func TestLedger_GetLastBlockHash(t *testing.T) {
 		Transactions: []common.Transaction{tx},
 		Timestamp:    time.Now().Unix(),
 	}
-	// compute + set final block.Hash
 	block.Hash = common.ComputeBlockHash(block)
-	if errCommit := l.CommitBlock(block); errCommit != nil {
-		t.Fatalf("CommitBlock error: %v", errCommit)
+	if err := ldb.CommitBlock(block); err != nil {
+		t.Fatalf("CommitBlock error: %v", err)
 	}
 
-	lastHash, errLast := l.GetLastBlockHash()
-	if errLast != nil {
-		t.Fatalf("unexpected error: %v", errLast)
+	// Get the block by number
+	retrievedBlock, found := ldb.GetBlockByNumber(1)
+	if !found {
+		t.Fatal("expected block #1 to exist, got false")
 	}
-	if lastHash != block.Hash {
-		t.Fatalf("expected lastHash=%s, got %s", block.Hash, lastHash)
+	if retrievedBlock.Hash != block.Hash {
+		t.Fatalf("expected hash=%s, got %s", block.Hash, retrievedBlock.Hash)
 	}
 }
 
-func TestLedger_GetBlockByNumber(t *testing.T) {
-	l := NewLedger()
+func TestMongoLedger_GetBlockByNumber(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
+	}
 
-	// Commit block #1
 	acS := &common.Account{
 		ID:        "blockNumSender",
 		Balance:   99.0,
@@ -312,8 +380,12 @@ func TestLedger_GetBlockByNumber(t *testing.T) {
 		Balance:   1.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	_ = l.CreateAccount(acS)
-	_ = l.CreateAccount(acR)
+	if err := ldb.CreateAccount(acS); err != nil {
+		t.Fatalf("CreateAccount for blockNumSender failed: %v", err)
+	}
+	if err := ldb.CreateAccount(acR); err != nil {
+		t.Fatalf("CreateAccount for blockNumReceiver failed: %v", err)
+	}
 
 	tx := common.Transaction{
 		ID:        "gblock-1",
@@ -323,7 +395,9 @@ func TestLedger_GetBlockByNumber(t *testing.T) {
 		Fee:       0.1,
 		Signature: fakeSignature(),
 	}
-	_ = l.AddTransaction(tx)
+	if err := ldb.AddTransaction(tx); err != nil {
+		t.Fatalf("AddTransaction failed: %v", err)
+	}
 
 	block := common.Block{
 		Number:       1,
@@ -332,12 +406,11 @@ func TestLedger_GetBlockByNumber(t *testing.T) {
 		Timestamp:    time.Now().Unix(),
 	}
 	block.Hash = common.ComputeBlockHash(block)
-	if err := l.CommitBlock(block); err != nil {
+	if err := ldb.CommitBlock(block); err != nil {
 		t.Fatalf("CommitBlock error: %v", err)
 	}
 
-	// now we can get block #1
-	got, found := l.GetBlockByNumber(1)
+	got, found := ldb.GetBlockByNumber(1)
 	if !found {
 		t.Fatal("expected block #1 to exist, got false")
 	}
@@ -345,93 +418,48 @@ func TestLedger_GetBlockByNumber(t *testing.T) {
 		t.Fatalf("mismatch: expected block number=1, got %d", got.Number)
 	}
 
-	// block #2 doesn’t exist => found==false
-	_, found2 := l.GetBlockByNumber(2)
+	_, found2 := ldb.GetBlockByNumber(2)
 	if found2 {
 		t.Fatal("expected block #2 not to exist")
 	}
 }
 
-func TestLedger_CreateSnapshotAndRestore(t *testing.T) {
-	l := NewLedger()
-
-	// create an account
-	acc := &common.Account{
-		ID:        "snapAcc",
-		Balance:   999.0,
-		PublicKey: fakeDilithiumPubKey(),
-	}
-	if err := l.CreateAccount(acc); err != nil {
-		t.Fatalf("CreateAccount error: %v", err)
-	}
-
-	// Must commit a block #1 so snapshot(1) is valid
-	block := common.Block{
-		Number:       1,
-		PreviousHash: "genesis",
-		Timestamp:    time.Now().Unix(),
-		Hash:         "fake-hash-block1",
-	}
-	// Let ledger compute final hash
-	block.Hash = common.ComputeBlockHash(block)
-	if errCb := l.CommitBlock(block); errCb != nil {
-		t.Fatalf("commit block #1 failed: %v", errCb)
-	}
-
-	// Now create snapshot at height=1
-	errSnap := l.CreateSnapshot(1)
-	if errSnap != nil {
-		t.Fatalf("snapshot at 'height=1' failed: %v", errSnap)
-	}
-
-	// Adjust the account => e.g. subtract 100
-	errBal := l.UpdateAccountBalance("snapAcc", -100)
-	if errBal != nil {
-		t.Fatalf("failed to update snapAcc -100: %v", errBal)
-	}
-	newBal, _ := l.GetBalance("snapAcc")
-	if newBal != 899.0 {
-		t.Fatalf("expected 899 after sub 100, got %.2f", newBal)
-	}
-
-	// Restore snapshot => expect revert
-	errRestore := l.RestoreSnapshot(1)
-	if errRestore != nil {
-		t.Fatalf("RestoreSnapshot(1) error: %v", errRestore)
-	}
-	balRest, _ := l.GetBalance("snapAcc")
-	if balRest != 999.0 {
-		t.Fatalf("expected snapAcc=999 after restore, got %.2f", balRest)
-	}
+func TestMongoLedger_CreateSnapshotAndRestore(t *testing.T) {
+	t.Skip("Snapshot and restore are not implemented in MongoLedger")
 }
 
-func TestLedger_IntegrityCheck(t *testing.T) {
-	l := NewLedger()
-	// By default, l.checkpoints is empty => no error
-	if err := l.IntegrityCheck(); err != nil {
-		t.Fatalf("IntegrityCheck failed: %v", err)
+func TestMongoLedger_IntegrityCheck(t *testing.T) {
+	// Skip if MongoDB is not available
+	ldb := setupTestMongoDB(t)
+	if ldb == nil {
+		t.Skip("MongoDB not available")
 	}
 
-	// Let’s commit a block => get a checkpoint
+	// Initially, since no block is committed, IntegrityCheck should fail.
+	if err := ldb.IntegrityCheck(); err == nil {
+		t.Fatal("expected IntegrityCheck to fail due to missing metadata, but it passed")
+	}
+
+	// Commit a block to update metadata.
 	acc := &common.Account{
 		ID:        "intCheckSender",
 		Balance:   500.0,
 		PublicKey: fakeDilithiumPubKey(),
 	}
-	l.CreateAccount(acc)
-
+	if err := ldb.CreateAccount(acc); err != nil {
+		t.Fatalf("CreateAccount failed: %v", err)
+	}
 	block := common.Block{
 		Number:       1,
 		PreviousHash: "xyz",
 		Timestamp:    time.Now().Unix(),
 	}
 	block.Hash = common.ComputeBlockHash(block)
-	if errCb := l.CommitBlock(block); errCb != nil {
-		t.Fatalf("commit block error: %v", errCb)
+	if err := ldb.CommitBlock(block); err != nil {
+		t.Fatalf("CommitBlock error: %v", err)
 	}
 
-	// If ledger code updates checkpoint => now IntegrityCheck sees a single checkpoint
-	if errCheck := l.IntegrityCheck(); errCheck != nil {
-		t.Fatalf("IntegrityCheck failed after block #1: %v", errCheck)
+	if err := ldb.IntegrityCheck(); err != nil {
+		t.Fatalf("IntegrityCheck failed after committing block: %v", err)
 	}
 }

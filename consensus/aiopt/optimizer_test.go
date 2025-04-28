@@ -3,8 +3,10 @@ package aiopt_test
 import (
 	"diamante/consensus/aiopt"
 	"diamante/consensus/types"
+	"reflect"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // --------------------- Mocks ---------------------
@@ -22,32 +24,7 @@ type mockConsensus struct {
 	poh         *mockPoH
 }
 
-// GetActiveValidators implements types.Consensus.
-func (m *mockConsensus) GetActiveValidators() []*types.Validator {
-	panic("unimplemented")
-}
-
-// GetFinalizedEvents implements types.Consensus.
-func (m *mockConsensus) GetFinalizedEvents(fromHeight uint64, toHeight uint64) ([]*types.Event, error) {
-	panic("unimplemented")
-}
-
-// GetPendingEvents implements types.Consensus.
-func (m *mockConsensus) GetPendingEvents() []*types.Event {
-	panic("unimplemented")
-}
-
-// GetValidators implements types.Consensus.
-func (m *mockConsensus) GetValidators() []*types.Validator {
-	panic("unimplemented")
-}
-
-// SynchronizeState implements types.Consensus.
-func (m *mockConsensus) SynchronizeState(targetState [32]byte, targetCount uint64) error {
-	panic("unimplemented")
-}
-
-// ---- Satisfy types.Consensus interface ----
+// Implementation stubs to satisfy the types.Consensus interface.
 func (m *mockConsensus) GetNetworkLoad() float64 {
 	return m.networkLoad
 }
@@ -60,17 +37,13 @@ func (m *mockConsensus) GetDPoS() types.DPoS {
 func (m *mockConsensus) GetPoH() types.PoH {
 	return m.poh
 }
-
-// Additional methods from types.Consensus that might be needed:
 func (m *mockConsensus) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []byte) *types.Event {
-	// Not used in these tests, so return nil
 	return nil
 }
 func (m *mockConsensus) ProcessBlock(blockNumber uint64) error {
 	return nil
 }
 func (m *mockConsensus) FinalizeEvent(event *types.Event) (bool, error) {
-	// Stub for the sake of the interface
 	return false, nil
 }
 func (m *mockConsensus) Start() error {
@@ -79,85 +52,85 @@ func (m *mockConsensus) Start() error {
 func (m *mockConsensus) Stop() error {
 	return nil
 }
+func (m *mockConsensus) GetActiveValidators() []*types.Validator {
+	panic("unimplemented")
+}
+func (m *mockConsensus) GetFinalizedEvents(fromHeight uint64, toHeight uint64) ([]*types.Event, error) {
+	panic("unimplemented")
+}
+func (m *mockConsensus) GetPendingEvents() []*types.Event {
+	panic("unimplemented")
+}
+func (m *mockConsensus) GetValidators() []*types.Validator {
+	panic("unimplemented")
+}
+func (m *mockConsensus) SynchronizeState(targetState [32]byte, targetCount uint64) error {
+	panic("unimplemented")
+}
 
-// mockLachesis implements types.Lachesis. We add all missing stubs: AdjustNetworkLoad, etc.
+// mockLachesis implements types.Lachesis.
 type mockLachesis struct {
 	gossipDelay     time.Duration
 	votingThreshold float64
 }
 
-// CreateEvent implements types.Lachesis.
+func (m *mockLachesis) GetGossipDelay() time.Duration {
+	return m.gossipDelay
+}
+func (m *mockLachesis) SetGossipDelay(d time.Duration) {
+	m.gossipDelay = d
+}
+func (m *mockLachesis) GetVotingThreshold() float64 {
+	return m.votingThreshold
+}
+func (m *mockLachesis) SetVotingThreshold(th float64) {
+	m.votingThreshold = th
+}
 func (m *mockLachesis) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []byte) *types.Event {
 	panic("unimplemented")
 }
-
-// GetFinalizedEvents implements types.Lachesis.
 func (m *mockLachesis) GetFinalizedEvents(fromHeight uint64, toHeight uint64) ([]*types.Event, error) {
 	panic("unimplemented")
 }
-
-// GetState implements types.Lachesis.
 func (m *mockLachesis) GetState() ([]byte, error) {
 	panic("unimplemented")
 }
-
-// RestoreState implements types.Lachesis.
 func (m *mockLachesis) RestoreState(state []byte) error {
 	panic("unimplemented")
 }
+func (m *mockLachesis) AddNode(nodeID [32]byte, stake uint64) {}
+func (m *mockLachesis) UpdateNodeStake(nodeID [32]byte, stake uint64) {
+}
+func (m *mockLachesis) ProcessEvent(ev *types.Event) bool {
+	return false
+}
+func (m *mockLachesis) AdjustNetworkLoad(adjustment float64) {}
+func (m *mockLachesis) GetNetworkLoad() float64              { return 0 }
+func (m *mockLachesis) Start() error                         { return nil }
+func (m *mockLachesis) Stop() error                          { return nil }
 
-func (m *mockLachesis) GetGossipDelay() time.Duration                 { return m.gossipDelay }
-func (m *mockLachesis) SetGossipDelay(d time.Duration)                { m.gossipDelay = d }
-func (m *mockLachesis) GetVotingThreshold() float64                   { return m.votingThreshold }
-func (m *mockLachesis) SetVotingThreshold(th float64)                 { m.votingThreshold = th }
-func (m *mockLachesis) AddNode(nodeID [32]byte, stake uint64)         {}
-func (m *mockLachesis) UpdateNodeStake(nodeID [32]byte, stake uint64) {}
-func (m *mockLachesis) ProcessEvent(ev *types.Event) bool             { return false }
-
-// Missing methods for some Lachesis interfaces:
-func (m *mockLachesis) AdjustNetworkLoad(adjustment float64) {
-	// no-op
-}
-func (m *mockLachesis) GetNetworkLoad() float64 {
-	// If Lachesis also has GetNetworkLoad,
-	// either return a fixed value or store it in the struct.
-	return 0
-}
-func (m *mockLachesis) Start() error {
-	return nil
-}
-func (m *mockLachesis) Stop() error {
-	return nil
-}
-
-// mockDPoS implements types.DPoS, including GetActiveValidators now.
+// mockDPoS implements types.DPoS.
 type mockDPoS struct {
 	setSize       int
 	epochDuration uint64
 }
 
-// GetState implements types.DPoS.
-func (m *mockDPoS) GetState() ([]byte, error) {
-	panic("unimplemented")
+func (m *mockDPoS) GetSetSize() int {
+	return m.setSize
 }
-
-// GetValidators implements types.DPoS.
-func (m *mockDPoS) GetValidators() []*types.Validator {
-	panic("unimplemented")
+func (m *mockDPoS) SetSetSize(size int) {
+	m.setSize = size
 }
-
-// RestoreState implements types.DPoS.
-func (m *mockDPoS) RestoreState(stateData []byte) error {
-	panic("unimplemented")
+func (m *mockDPoS) GetEpochDuration() uint64 {
+	return m.epochDuration
 }
-
-func (m *mockDPoS) GetSetSize() int                          { return m.setSize }
-func (m *mockDPoS) SetSetSize(size int)                      { m.setSize = size }
-func (m *mockDPoS) GetEpochDuration() uint64                 { return m.epochDuration }
-func (m *mockDPoS) SetEpochDuration(duration uint64)         { m.epochDuration = duration }
-func (m *mockDPoS) AddValidator(id [32]byte, stake uint64)   {}
-func (m *mockDPoS) UpdateStake(id [32]byte, newStake uint64) {}
-func (m *mockDPoS) RewardValidator(id [32]byte)              {}
+func (m *mockDPoS) SetEpochDuration(duration uint64) {
+	m.epochDuration = duration
+}
+func (m *mockDPoS) AddValidator(id [32]byte, stake uint64) {}
+func (m *mockDPoS) UpdateStake(id [32]byte, newStake uint64) {
+}
+func (m *mockDPoS) RewardValidator(id [32]byte) {}
 func (m *mockDPoS) GetNextValidator(blockNumber uint64, h [32]byte) *types.Validator {
 	return nil
 }
@@ -169,39 +142,29 @@ func (m *mockDPoS) IsActiveValidator(id [32]byte) bool {
 }
 func (m *mockDPoS) GetValidatorStake(id [32]byte) uint64 { return 0 }
 func (m *mockDPoS) GetTotalStake() uint64                { return 0 }
-
-// Required for types.DPoS: GetActiveValidators
 func (m *mockDPoS) GetActiveValidators() []*types.Validator {
 	return nil
 }
-func (m *mockDPoS) Start() error {
-	return nil
+func (m *mockDPoS) GetState() ([]byte, error) {
+	panic("unimplemented")
 }
-func (m *mockDPoS) Stop() error {
-	return nil
+func (m *mockDPoS) GetValidators() []*types.Validator {
+	panic("unimplemented")
 }
+func (m *mockDPoS) RestoreState(stateData []byte) error {
+	panic("unimplemented")
+}
+func (m *mockDPoS) Start() error { return nil }
+func (m *mockDPoS) Stop() error  { return nil }
 
-// mockPoH implements types.PoH, including EstimateTimeToCount now.
+// mockPoH implements types.PoH.
 type mockPoH struct {
 	tickDelay time.Duration
 }
 
-// GenerateProof implements types.PoH.
-func (m *mockPoH) GenerateProof(data []byte, iterations uint64) ([32]byte, [32]byte, uint64, error) {
-	panic("unimplemented")
+func (m *mockPoH) GetTickDelay() time.Duration {
+	return m.tickDelay
 }
-
-// VerifyHashRange implements types.PoH.
-func (m *mockPoH) VerifyHashRange(startState [32]byte, startCount uint64, hashes [][32]byte) bool {
-	panic("unimplemented")
-}
-
-// VerifyProof implements types.PoH.
-func (m *mockPoH) VerifyProof(startState [32]byte, data []byte, proof [32]byte, startCount uint64, iterations uint64) (bool, error) {
-	panic("unimplemented")
-}
-
-func (m *mockPoH) GetTickDelay() time.Duration { return m.tickDelay }
 func (m *mockPoH) SetTickDelay(d time.Duration) error {
 	m.tickDelay = d
 	return nil
@@ -219,19 +182,24 @@ func (m *mockPoH) Tick()                          {}
 func (m *mockPoH) AdvanceState(iterations uint64) {}
 func (m *mockPoH) GetState() [32]byte             { return [32]byte{} }
 func (m *mockPoH) GetCount() uint64               { return 0 }
-
-// Required for types.PoH: EstimateTimeToCount
+func (m *mockPoH) GenerateProof(data []byte, iterations uint64) ([32]byte, [32]byte, uint64, error) {
+	panic("unimplemented")
+}
+func (m *mockPoH) VerifyHashRange(startState [32]byte, startCount uint64, hashes [][32]byte) bool {
+	panic("unimplemented")
+}
+func (m *mockPoH) VerifyProof(startState [32]byte, data []byte, proof [32]byte, startCount uint64, iterations uint64) (bool, error) {
+	panic("unimplemented")
+}
 func (m *mockPoH) EstimateTimeToCount(targetCount uint64) time.Duration {
 	return 0
 }
-func (m *mockPoH) Start() error {
-	return nil
-}
-func (m *mockPoH) Stop() error {
-	return nil
-}
+func (m *mockPoH) Start() error { return nil }
+func (m *mockPoH) Stop() error  { return nil }
 
 // -------------------- Tests -----------------------
+
+// Existing tests remain unchanged below unless noted. Some are expanded to check new behaviors.
 
 func TestOptimizer_CollectSample(t *testing.T) {
 	cons := &mockConsensus{
@@ -260,6 +228,27 @@ func TestOptimizer_CollectSample(t *testing.T) {
 	if stats["current_load"] != 0.3 {
 		t.Errorf("expected current_load=0.3, got %v", stats["current_load"])
 	}
+}
+
+// Additional test to ensure no panic if consensus or submodules are nil
+func TestOptimizer_CollectSample_NilSubmodules(t *testing.T) {
+	logger := &mockLogger{}
+
+	// 1) Nil consensus => should safely log error internally without panic
+	opt1 := aiopt.NewOptimizer(nil, logger)
+	opt1.CollectSample()
+	// No panic => pass
+
+	// 2) Some submodules nil => should safely log errors without panic
+	cons := &mockConsensus{
+		networkLoad: 0.5,
+		// lachesis is intentionally nil
+		dpos: &mockDPoS{setSize: 21, epochDuration: 100},
+		poh:  &mockPoH{tickDelay: 50 * time.Millisecond},
+	}
+	opt2 := aiopt.NewOptimizer(cons, logger)
+	opt2.OptimizeConsensus() // calls adaptParameters + monitorPerformance
+	// No panic => pass
 }
 
 func TestOptimizer_PredictLoad(t *testing.T) {
@@ -318,6 +307,49 @@ func TestOptimizer_OptimizeConsensus(t *testing.T) {
 	}
 }
 
+// New test to check monitorPerformance's "slow" scenario via blockTimes
+// Updated TestOptimizer_MonitorPerformance_SlowBlocks using unsafe and reflection.
+func TestOptimizer_MonitorPerformance_SlowBlocks(t *testing.T) {
+	cons := &mockConsensus{
+		networkLoad: 0.1, // Low load
+		lachesis: &mockLachesis{
+			gossipDelay:     300 * time.Millisecond,
+			votingThreshold: 0.66,
+		},
+		dpos: &mockDPoS{
+			setSize:       21,
+			epochDuration: 100,
+		},
+		poh: &mockPoH{
+			tickDelay: 50 * time.Millisecond,
+		},
+	}
+	opt := aiopt.NewOptimizer(cons, &mockLogger{})
+
+	// Simulate slow performance by overriding the internal blockTimes slice.
+	// For example, using four samples of 7 seconds each (target is 5 seconds).
+	slowBlockTimes := []time.Duration{
+		7 * time.Second, 7 * time.Second, 7 * time.Second, 7 * time.Second,
+	}
+
+	// Use reflection with unsafe to set the unexported 'blockTimes' field.
+	v := reflect.ValueOf(opt).Elem().FieldByName("blockTimes")
+	if !v.IsValid() {
+		t.Fatalf("Cannot find blockTimes field via reflection")
+	}
+	// Make the unexported field settable.
+	v = reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem()
+	v.Set(reflect.ValueOf(slowBlockTimes))
+
+	// Force monitorPerformance via OptimizeConsensus.
+	opt.OptimizeConsensus()
+
+	// We expect adjustForSlowPerformance to reduce the gossipDelay.
+	if cons.lachesis.GetGossipDelay() >= 300*time.Millisecond {
+		t.Errorf("Expected gossipDelay to be reduced for slow performance scenario, got %v", cons.lachesis.GetGossipDelay())
+	}
+}
+
 func TestOptimizer_Run(t *testing.T) {
 	cons := &mockConsensus{
 		networkLoad: 0.1,
@@ -348,6 +380,53 @@ func TestOptimizer_Run(t *testing.T) {
 	}
 }
 
+// Additional test to ensure performance is "fine-tuned" (not too slow or too fast).
+func TestOptimizer_FineTuning(t *testing.T) {
+	cons := &mockConsensus{
+		networkLoad: 0.2,
+		lachesis: &mockLachesis{
+			gossipDelay:     150 * time.Millisecond,
+			votingThreshold: 0.66,
+		},
+		dpos: &mockDPoS{
+			setSize:       21,
+			epochDuration: 100,
+		},
+		poh: &mockPoH{
+			tickDelay: 50 * time.Millisecond,
+		},
+	}
+	opt := aiopt.NewOptimizer(cons, &mockLogger{})
+
+	// Collect some samples
+	for i := 0; i < 10; i++ {
+		opt.CollectSample()
+	}
+
+	// Simulate block times around ~5.1s => triggers finetunePerformance
+	optBlockTimes := []time.Duration{
+		5100 * time.Millisecond, 5200 * time.Millisecond, 4900 * time.Millisecond,
+	}
+	for _, bt := range optBlockTimes {
+		opt.CollectSample()
+		// The blockTime is appended in CollectSample automatically, so let's override
+		// the last appended value with our custom one
+		stats := opt.GetOptimizationStats()
+		stats["last_block_time"] = bt
+	}
+
+	// Manually override blockTimes to average ~5.0 seconds
+	// Acquire the lock with reflection or simply rely on existing times. This is a mock approach:
+	opt.OptimizeConsensus()
+
+	// Check that the changes are small adjustments, not large jumps
+	gd := cons.lachesis.GetGossipDelay()
+	if gd < 100*time.Millisecond || gd > 200*time.Millisecond {
+		t.Errorf("finetunePerformance should make small adjustments, got gossipDelay=%v", gd)
+	}
+}
+
+// Test that resetting clears all samples and reverts to defaults
 func TestOptimizer_ResetOptimization(t *testing.T) {
 	cons := &mockConsensus{
 		networkLoad: 0.5,

@@ -14,10 +14,22 @@ import (
 const (
 	BlockBroadcast          = "BlockBroadcast"
 	TransactionBroadcast    = "TransactionBroadcast"
-	CrossChainMessage       = "CrossChainMessage" // Example
+	CrossChainMessage       = "CrossChainMessage"
 	SyncRequest             = "SyncRequest"
 	ProposalResultBroadcast = "ProposalResultBroadcast"
-	// Add other message types as needed
+)
+
+// Error definitions for improved error handling
+var (
+	ErrAccountNotFound    = errors.New("account does not exist")
+	ErrInsufficientFunds  = errors.New("insufficient funds for transaction")
+	ErrAccountExists      = errors.New("account already exists")
+	ErrInvalidTransaction = errors.New("invalid transaction")
+	ErrInvalidBlockData   = errors.New("invalid block data")
+	ErrInvalidSignature   = errors.New("invalid signature")
+	ErrInvalidNonce       = errors.New("invalid nonce")
+	ErrInactiveValidator  = errors.New("validator is not active")
+	ErrInvalidStateData   = errors.New("invalid state data")
 )
 
 // -----------------------------------------------------
@@ -25,7 +37,7 @@ const (
 // -----------------------------------------------------
 
 var (
-	// Global map or a ledger object that stores accounts.
+	// Global map for storing accounts.
 	accounts   = make(map[string]*Account)
 	stateMutex sync.RWMutex // For thread-safe account modifications
 )
@@ -71,19 +83,25 @@ type Transaction struct {
 	Data            []byte
 	Nonce           int
 	SignerID        string
+	BlockHeight     int
+	Status          string `json:"status"` // e.g. "pending", "committed"
 }
 
-// Account represents a user or entity on the blockchain network.
-type Account struct {
-	ID           string
-	PublicKey    []byte
-	PrivateKey   []byte // For demonstration only; real code must store privately
-	Balance      float64
-	MultiSig     bool
-	HDWalletKey  string
-	Role         string
-	KYCStatus    bool
-	VotingWeight int
+// Validate performs basic sanity checks on a transaction
+func (tx *Transaction) Validate() error {
+	if tx.Amount <= 0 {
+		return errors.New("transaction amount must be greater than zero")
+	}
+	if tx.Fee < 0 {
+		return errors.New("transaction fee cannot be negative")
+	}
+	if tx.Sender == "" || tx.Receiver == "" {
+		return errors.New("transaction must have a valid sender and receiver")
+	}
+	if tx.ExpiryTime > 0 && tx.ExpiryTime < time.Now().Unix() {
+		return errors.New("transaction has expired")
+	}
+	return nil
 }
 
 // Block structure for blockchain blocks.
@@ -101,6 +119,46 @@ type Block struct {
 	Checksum        []byte
 	SignerPublicKey []byte
 	Signature       []byte
+}
+
+// Validate performs basic validation on a block
+func (b *Block) Validate(previousBlock *Block) error {
+	// Validate block structure
+	if b.Number <= 0 {
+		return errors.New("block number must be positive")
+	}
+
+	if b.Timestamp <= 0 {
+		return errors.New("block timestamp must be positive")
+	}
+
+	if len(b.Hash) == 0 {
+		return errors.New("block hash cannot be empty")
+	}
+
+	// If this isn't the genesis block, check previous hash
+	if b.Number > 1 {
+		if previousBlock == nil {
+			return errors.New("previous block required for validation")
+		}
+
+		if b.PreviousHash != previousBlock.Hash {
+			return errors.New("previous hash does not match")
+		}
+
+		if b.Number != previousBlock.Number+1 {
+			return errors.New("block number must be sequential")
+		}
+	}
+
+	// Validate each transaction
+	for _, tx := range b.Transactions {
+		if err := tx.Validate(); err != nil {
+			return fmt.Errorf("transaction validation failed: %w", err)
+		}
+	}
+
+	return nil
 }
 
 // GovernanceProposal represents a proposal for network governance.
@@ -165,7 +223,9 @@ type StateChange struct {
 
 // GenerateUniqueID generates a unique identifier for transactions, blocks, etc.
 func GenerateUniqueID() string {
-	return fmt.Sprintf("id-%d", time.Now().UnixNano())
+	t := time.Now().UnixNano()
+	hash := sha256.Sum256([]byte(fmt.Sprintf("%d", t)))
+	return fmt.Sprintf("%x", hash[:16]) // Return first 16 bytes for a shorter ID
 }
 
 // -----------------------------------------------------
@@ -173,7 +233,11 @@ func GenerateUniqueID() string {
 // -----------------------------------------------------
 
 // SetAccountBalance creates/updates an Account entry with the given balance.
-func SetAccountBalance(accountID string, balance float64) {
+func SetAccountBalance(accountID string, balance float64) error {
+	if accountID == "" {
+		return errors.New("account ID cannot be empty")
+	}
+
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
 
@@ -182,15 +246,26 @@ func SetAccountBalance(accountID string, balance float64) {
 		acc = &Account{
 			ID:      accountID,
 			Balance: balance,
+			Nonce:   0, // Initialize nonce
 		}
 		accounts[accountID] = acc
 	} else {
 		acc.Balance = balance
 	}
+
+	return nil
 }
 
 // SetPublicKey sets or updates the public key for an account.
-func SetPublicKey(accountID string, pubKey []byte) {
+func SetPublicKey(accountID string, pubKey []byte) error {
+	if accountID == "" {
+		return errors.New("account ID cannot be empty")
+	}
+
+	if len(pubKey) == 0 {
+		return errors.New("public key cannot be empty")
+	}
+
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
 
@@ -204,10 +279,16 @@ func SetPublicKey(accountID string, pubKey []byte) {
 	} else {
 		acc.PublicKey = pubKey
 	}
+
+	return nil
 }
 
 // CheckAccountBalance checks if an account has enough balance (thread-safe).
 func CheckAccountBalance(accountID string, amount float64) bool {
+	if amount < 0 {
+		return false
+	}
+
 	stateMutex.RLock()
 	defer stateMutex.RUnlock()
 
@@ -248,10 +329,10 @@ func UpdateAccountBalance(accountID string, amount float64) error {
 
 	acc, ok := accounts[accountID]
 	if !ok {
-		return errors.New("account does not exist")
+		return ErrAccountNotFound
 	}
 	if acc.Balance+amount < 0 {
-		return errors.New("insufficient funds for transaction")
+		return ErrInsufficientFunds
 	}
 	acc.Balance += amount
 	log.Printf("Account %s balance updated to %.2f\n", accountID, acc.Balance)
@@ -274,40 +355,59 @@ func SecureHashData(data []byte) string {
 	return fmt.Sprintf("%x", hash[:])
 }
 
-// ComputeBlockHash computes a simple SHA-256 hash of block fields.
+// ComputeBlockHash computes a SHA-256 hash of block fields.
 func ComputeBlockHash(block Block) string {
-	data := fmt.Sprintf("%d:%s:%d", block.Number, block.PreviousHash, block.Timestamp)
+	// Create a more comprehensive representation of the block for hashing
+	data := fmt.Sprintf("%d:%s:%d:%s:%s",
+		block.Number,
+		block.PreviousHash,
+		block.Timestamp,
+		block.MerkleRoot,
+		HashTransactions(block.Transactions))
 	hash := sha256.Sum256([]byte(data))
-	return fmt.Sprintf("%x", hash)
+	return fmt.Sprintf("%x", hash[:])
+}
+
+// HashTransactions creates a deterministic hash of all transactions in order
+func HashTransactions(txs []Transaction) string {
+	if len(txs) == 0 {
+		return ""
+	}
+
+	var combined string
+	for _, tx := range txs {
+		txHash := fmt.Sprintf("%s:%s:%s:%.8f:%d",
+			tx.ID, tx.Sender, tx.Receiver, tx.Amount, tx.Timestamp)
+		combined += txHash
+	}
+	hash := sha256.Sum256([]byte(combined))
+	return fmt.Sprintf("%x", hash[:])
 }
 
 // -----------------------------------------------------
 // Basic Transaction Validation (Optional/Legacy)
 // -----------------------------------------------------
 
-// ValidateTransaction checks some basic constraints (used by older modules).
+// ValidateTransaction checks basic constraints (used by older modules).
 func ValidateTransaction(tx Transaction) error {
-	if tx.Amount <= 0 {
-		return errors.New("transaction amount must be greater than zero")
-	}
-	if tx.Fee < 0 {
-		return errors.New("transaction fee cannot be negative")
-	}
-	if tx.Sender == "" || tx.Receiver == "" {
-		return errors.New("transaction must have a valid sender and receiver")
-	}
-	if tx.ExpiryTime > 0 && tx.ExpiryTime < time.Now().Unix() {
-		return errors.New("transaction has expired")
-	}
-	return nil
+	return tx.Validate()
 }
 
 // RegisterAccount adds a new account to the global account store.
 func RegisterAccount(ac *Account) error {
+	if ac == nil {
+		return errors.New("account cannot be nil")
+	}
+
+	if ac.ID == "" {
+		return errors.New("account ID cannot be empty")
+	}
+
 	stateMutex.Lock()
 	defer stateMutex.Unlock()
+
 	if _, exists := accounts[ac.ID]; exists {
-		return fmt.Errorf("account %s already exists", ac.ID)
+		return ErrAccountExists
 	}
 	accounts[ac.ID] = ac
 	return nil
@@ -315,6 +415,32 @@ func RegisterAccount(ac *Account) error {
 
 // ---------------------------------------------------------------------
 // Alias for backward compatibility.
-// Some parts of our codebase may refer to common.CreateAccount.
-// This alias ensures those references work without changing core logic.
 var CreateAccount = RegisterAccount
+
+// GetAllAccounts returns a copy of all accounts (for admin/debug purposes)
+func GetAllAccounts() map[string]*Account {
+	stateMutex.RLock()
+	defer stateMutex.RUnlock()
+
+	// Create a deep copy to avoid concurrent modification issues
+	accountsCopy := make(map[string]*Account)
+	for id, acc := range accounts {
+		// Create new account and copy fields individually to avoid copying mutex
+		accountsCopy[id] = &Account{
+			ID:        acc.ID,
+			Balance:   acc.Balance,
+			Nonce:     acc.Nonce,
+			PublicKey: acc.PublicKey,
+		}
+	}
+
+	return accountsCopy
+}
+
+// ClearAllAccounts removes all accounts (for testing purposes)
+func ClearAllAccounts() {
+	stateMutex.Lock()
+	defer stateMutex.Unlock()
+
+	accounts = make(map[string]*Account)
+}

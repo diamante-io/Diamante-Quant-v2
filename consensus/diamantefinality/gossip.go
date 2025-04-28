@@ -3,10 +3,13 @@
 package finality
 
 import (
+	"context"
 	"diamante/consensus/types"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math"
+	"os"
 	"sync"
 	"time"
 )
@@ -30,17 +33,26 @@ type GossipProtocol struct {
 	// If 0, currentDelay=baseDelay.
 	networkLoad float64
 	loadMu      sync.RWMutex
+
+	// NEW: Context for cancellation and a logger for structured logging.
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger *log.Logger
 }
 
 // NewGossipProtocol returns a new GossipProtocol with the specified base delay
 // for sending/receiving gossip events.
 func NewGossipProtocol(dag *DAG, baseDelay time.Duration) *GossipProtocol {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &GossipProtocol{
 		dag:          dag,
 		peers:        make(map[[32]byte]chan *types.Event),
 		baseDelay:    baseDelay,
 		currentDelay: baseDelay,
 		stopChannels: make(map[[32]byte]chan struct{}),
+		logger:       log.New(os.Stdout, "GossipProtocol: ", log.Ldate|log.Ltime|log.Lshortfile),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 }
 
@@ -89,6 +101,7 @@ func (g *GossipProtocol) BroadcastEvent(event *types.Event, excludeNodeID [32]by
 			// Enqueued successfully
 		default:
 			// Channel is full; skip to avoid blocking the entire broadcast
+			g.logger.Printf("Dropping event %x for peer %s: channel full", event.ID, byteArrayToString(peerID))
 		}
 	}
 }
@@ -130,15 +143,14 @@ func (g *GossipProtocol) getCurrentDelay() time.Duration {
 //
 //	currentDelay = baseDelay * (1 + networkLoad)
 //
-// Must be called under g.loadMu.Lock() for thread safety, but
-// we also read baseDelay which is protected by g.mu.
+// Must be called under g.loadMu.Lock() for thread safety, but we also read baseDelay which is protected by g.mu.
 func (g *GossipProtocol) adjustGossipRate() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.adjustGossipRateLocked()
 }
 
-// adjustGossipRateLocked expects both g.mu and g.loadMu to be locked by the caller (or exclusively locked).
+// adjustGossipRateLocked expects both g.mu and g.loadMu to be locked by the caller.
 func (g *GossipProtocol) adjustGossipRateLocked() {
 	loadFactor := 1 + g.networkLoad
 	g.currentDelay = time.Duration(float64(g.baseDelay) * loadFactor)
@@ -152,29 +164,40 @@ func (g *GossipProtocol) StartGossiping(nodeID [32]byte) {
 		defer ticker.Stop()
 
 		for {
-			// We read from peers and stopChannels under a read lock
+			// Check if the context is canceled.
+			select {
+			case <-g.ctx.Done():
+				g.logger.Printf("Gossip loop for peer %s exiting due to context cancellation", byteArrayToString(nodeID))
+				return
+			default:
+			}
+
+			// Read peer channels under lock.
 			g.mu.RLock()
 			peerChan, ok1 := g.peers[nodeID]
 			stopChan, ok2 := g.stopChannels[nodeID]
 			g.mu.RUnlock()
 
 			if !ok1 || !ok2 {
-				// The peer or stop channel was removed
 				return
 			}
 
 			select {
 			case <-stopChan:
-				// Gossip routine ends
+				// Gossip routine ends.
+				g.logger.Printf("Gossip loop for peer %s stopped via stopChan", byteArrayToString(nodeID))
+				return
+			case <-g.ctx.Done():
+				g.logger.Printf("Gossip loop for peer %s exiting due to context cancellation", byteArrayToString(nodeID))
 				return
 			case event, ok := <-peerChan:
 				if !ok {
-					// The peerChan was closed (peer removed)
+					// The peerChan was closed (peer removed).
 					return
 				}
 				g.processReceivedEvent(nodeID, event)
 			case <-ticker.C:
-				// Periodic tick for maintenance, if any
+				// Periodic tick for maintenance, if any.
 			}
 		}
 	}()
@@ -184,25 +207,25 @@ func (g *GossipProtocol) processReceivedEvent(nodeID [32]byte, event *types.Even
 	if event == nil {
 		return
 	}
-	// If we already have this event, skip
+	// If we already have this event, skip.
 	if existingEvent, err := g.dag.GetEvent(event.ID); err == nil && existingEvent != nil {
 		return
 	}
 
-	// If node is missing, auto-add with small stake so DAG.NewEvent won't fail
+	// If node is missing, auto-add with small stake so DAG.NewEvent won't fail.
 	if !g.dag.IsActiveValidator(nodeID) {
 		g.dag.AddNode(nodeID, 1)
 	}
 
-	// Attempt to insert
+	// Attempt to insert.
 	if _, err := g.dag.NewEvent(nodeID, event.ParentIDs, event.Data); err != nil {
-		fmt.Printf("[Gossip] DAG.NewEvent error: %v\n", err)
+		g.logger.Printf("Gossip: DAG.NewEvent error for node %s: %v", byteArrayToString(nodeID), err)
 		return
 	}
 
-	// Re-broadcast
+	// Re-broadcast the event.
 	g.BroadcastEvent(event, nodeID)
-	// Slightly increase load
+	// Slightly increase load.
 	curLoad := g.GetNetworkLoad()
 	g.UpdateNetworkLoad(curLoad + 0.01)
 }
@@ -245,7 +268,7 @@ func (g *GossipProtocol) GetState() ([]byte, error) {
 		NetworkLoad:  g.networkLoad,
 	}
 
-	// Convert each peer ID from [32]byte to hex
+	// Convert each peer ID from [32]byte to hex.
 	for peerID := range g.peers {
 		state.Peers[byteArrayToString(peerID)] = true
 	}
@@ -268,7 +291,7 @@ func (g *GossipProtocol) RestoreState(stateData []byte) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	// Rebuild peers
+	// Rebuild peers.
 	newPeers := make(map[[32]byte]chan *types.Event, len(state.Peers))
 	newStopChannels := make(map[[32]byte]chan struct{}, len(state.Peers))
 	for peerIDStr := range state.Peers {
@@ -299,7 +322,7 @@ func (g *GossipProtocol) Start() {
 	}
 }
 
-// Stop closes each peer's stopChan, halting their gossip loops.
+// Stop closes each peer's stopChan, halting their gossip loops, and cancels the context.
 func (g *GossipProtocol) Stop() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -307,6 +330,9 @@ func (g *GossipProtocol) Stop() {
 	for nodeID, stopCh := range g.stopChannels {
 		close(stopCh) // stop the goroutine
 		delete(g.stopChannels, nodeID)
+	}
+	if g.cancel != nil {
+		g.cancel()
 	}
 }
 

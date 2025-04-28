@@ -1,0 +1,98 @@
+// ledger/rocksdb_state_db.go
+package ledger
+
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"sync"
+
+	"github.com/tecbot/gorocksdb"
+)
+
+// RocksDBStateDB is a production-level key/value store for ledger state.
+type RocksDBStateDB struct {
+	db *gorocksdb.DB
+	ro *gorocksdb.ReadOptions
+	wo *gorocksdb.WriteOptions
+	mu sync.RWMutex
+}
+
+// NewRocksDBStateDB opens (or creates) a RocksDB instance at the given path.
+func NewRocksDBStateDB(path string) (*RocksDBStateDB, error) {
+	opts := gorocksdb.NewDefaultOptions()
+	opts.SetCreateIfMissing(true)
+	db, err := gorocksdb.OpenDb(opts, path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open RocksDB for state: %w", err)
+	}
+	return &RocksDBStateDB{
+		db: db,
+		ro: gorocksdb.NewDefaultReadOptions(),
+		wo: gorocksdb.NewDefaultWriteOptions(),
+	}, nil
+}
+
+// Close closes the RocksDBStateDB.
+func (sdb *RocksDBStateDB) Close() {
+	sdb.db.Close()
+	sdb.ro.Destroy()
+	sdb.wo.Destroy()
+}
+
+func blockStorageKey(blockNumber uint64) []byte {
+	return []byte("block:" + strconv.FormatUint(blockNumber, 10))
+}
+
+// SaveBlock stores a block in the state database.
+func (sdb *RocksDBStateDB) SaveBlock(block *Block) error {
+	sdb.mu.Lock()
+	defer sdb.mu.Unlock()
+	data, err := json.MarshalIndent(block, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal block: %w", err)
+	}
+	key := blockStorageKey(block.Number)
+	if err := sdb.db.Put(sdb.wo, key, data); err != nil {
+		return fmt.Errorf("failed to write block: %w", err)
+	}
+	return nil
+}
+
+// GetBlock retrieves a block by its number.
+func (sdb *RocksDBStateDB) GetBlock(blockNumber uint64) (*Block, error) {
+	sdb.mu.RLock()
+	defer sdb.mu.RUnlock()
+	key := blockStorageKey(blockNumber)
+	slice, err := sdb.db.Get(sdb.ro, key)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read block: %w", err)
+	}
+	defer slice.Free()
+	if slice.Size() == 0 {
+		return nil, fmt.Errorf("block %d not found", blockNumber)
+	}
+	var block Block
+	if err := json.Unmarshal(slice.Data(), &block); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block: %w", err)
+	}
+	return &block, nil
+}
+
+// Block represents a blockchain block for state storage.
+type Block struct {
+	Number        uint64        `json:"number"`
+	Timestamp     int64         `json:"timestamp"`
+	Transactions  []Transaction `json:"transactions"`
+	PrevBlockHash string        `json:"prev_block_hash"`
+	BlockHash     string        `json:"block_hash"`
+}
+
+// Transaction represents a simple blockchain transaction.
+type Transaction struct {
+	ID        string  `json:"id"`
+	Sender    string  `json:"sender"`
+	Receiver  string  `json:"receiver"`
+	Amount    float64 `json:"amount"`
+	Timestamp int64   `json:"timestamp"`
+}

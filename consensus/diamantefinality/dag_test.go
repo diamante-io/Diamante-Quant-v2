@@ -1,3 +1,4 @@
+// dag_test.go
 package finality_test
 
 import (
@@ -9,9 +10,9 @@ import (
 
 // randomNodeID creates a new random [32]byte ID for testing.
 func randomNodeID(t *testing.T) [32]byte {
+	t.Helper()
 	var b [32]byte
-	_, err := rand.Read(b[:])
-	if err != nil {
+	if _, err := rand.Read(b[:]); err != nil {
 		t.Fatalf("failed to generate random node ID: %v", err)
 	}
 	return b
@@ -20,7 +21,6 @@ func randomNodeID(t *testing.T) [32]byte {
 func TestDAG_AddNode(t *testing.T) {
 	dag := finality.NewDAG()
 	nodeID := randomNodeID(t)
-
 	dag.AddNode(nodeID, 1000)
 
 	stake, err := dag.GetNodeStake(nodeID)
@@ -31,8 +31,7 @@ func TestDAG_AddNode(t *testing.T) {
 		t.Errorf("expected stake=1000, got %d", stake)
 	}
 
-	active := dag.IsActiveValidator(nodeID)
-	if !active {
+	if !dag.IsActiveValidator(nodeID) {
 		t.Error("expected node to be active after AddNode, but it's not")
 	}
 }
@@ -40,10 +39,8 @@ func TestDAG_AddNode(t *testing.T) {
 func TestDAG_UpdateNodeStake(t *testing.T) {
 	dag := finality.NewDAG()
 	nodeID := randomNodeID(t)
-
 	dag.AddNode(nodeID, 500)
-	err := dag.UpdateNodeStake(nodeID, 1500)
-	if err != nil {
+	if err := dag.UpdateNodeStake(nodeID, 1500); err != nil {
 		t.Errorf("unexpected error updating stake: %v", err)
 	}
 
@@ -59,13 +56,10 @@ func TestDAG_UpdateNodeStake(t *testing.T) {
 func TestDAG_RemoveNode(t *testing.T) {
 	dag := finality.NewDAG()
 	nodeID := randomNodeID(t)
-
 	dag.AddNode(nodeID, 1000)
-	err := dag.RemoveNode(nodeID)
-	if err != nil {
+	if err := dag.RemoveNode(nodeID); err != nil {
 		t.Errorf("RemoveNode error: %v", err)
 	}
-
 	if dag.IsActiveValidator(nodeID) {
 		t.Errorf("expected node to be inactive after RemoveNode")
 	}
@@ -94,7 +88,6 @@ func TestDAG_NewEvent(t *testing.T) {
 		t.Errorf("expected height=1, got %d", event.Height)
 	}
 
-	// Check DAG updated
 	stored, err := dag.GetEvent(event.ID)
 	if err != nil {
 		t.Fatalf("GetEvent error: %v", err)
@@ -108,7 +101,6 @@ func TestDAG_NewEventInactiveCreator(t *testing.T) {
 	dag := finality.NewDAG()
 	nodeID := randomNodeID(t)
 	dag.AddNode(nodeID, 100)
-	// Remove the node to set it inactive
 	if err := dag.RemoveNode(nodeID); err != nil {
 		t.Fatalf("failed to remove node: %v", err)
 	}
@@ -124,9 +116,9 @@ func TestDAG_GetUnfinalizedEvents(t *testing.T) {
 	nodeID := randomNodeID(t)
 	dag.AddNode(nodeID, 100)
 
+	// Create 3 events.
 	for i := 0; i < 3; i++ {
-		_, err := dag.NewEvent(nodeID, nil, []byte{byte(i)})
-		if err != nil {
+		if _, err := dag.NewEvent(nodeID, nil, []byte{byte(i)}); err != nil {
 			t.Fatalf("creating event %d: %v", i, err)
 		}
 	}
@@ -136,9 +128,8 @@ func TestDAG_GetUnfinalizedEvents(t *testing.T) {
 		t.Errorf("expected 3 unfinalized events, got %d", len(unfinalized))
 	}
 
-	// Mark one event as finalized
+	// Mark one event as finalized.
 	unfinalized[0].Finalized = true
-
 	unfinalized2 := dag.GetUnfinalizedEvents()
 	if len(unfinalized2) != 2 {
 		t.Errorf("expected 2 unfinalized after finalizing one, got %d", len(unfinalized2))
@@ -149,7 +140,6 @@ func TestDAG_GetTotalStake(t *testing.T) {
 	dag := finality.NewDAG()
 	n1 := randomNodeID(t)
 	n2 := randomNodeID(t)
-
 	dag.AddNode(n1, 100)
 	dag.AddNode(n2, 200)
 
@@ -158,7 +148,6 @@ func TestDAG_GetTotalStake(t *testing.T) {
 		t.Errorf("expected total=300, got %d", total)
 	}
 
-	// Deactivate one node
 	if err := dag.RemoveNode(n2); err != nil {
 		t.Errorf("RemoveNode error: %v", err)
 	}
@@ -177,19 +166,16 @@ func TestDAG_GetStateAndRestoreState(t *testing.T) {
 		t.Fatalf("NewEvent error: %v", err)
 	}
 
-	// Serialize state
 	stateData, err := dag.GetState()
 	if err != nil {
 		t.Fatalf("GetState error: %v", err)
 	}
 
-	// Create a new DAG and restore state
 	newDAG := finality.NewDAG()
 	if err := newDAG.RestoreState(stateData); err != nil {
 		t.Fatalf("RestoreState error: %v", err)
 	}
 
-	// Check restored data
 	stake, err := newDAG.GetNodeStake(nodeID)
 	if err != nil {
 		t.Fatalf("GetNodeStake error: %v", err)

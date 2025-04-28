@@ -1,4 +1,3 @@
-// File: api/server_test.go
 package api
 
 import (
@@ -15,6 +14,7 @@ import (
 	"diamante/consensus/types"
 	"diamante/crypto"
 	"diamante/ledger"
+	"diamante/storage"
 	"diamante/transaction"
 
 	"github.com/gorilla/mux"
@@ -22,37 +22,47 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// Define testEncKey as a constant for testing purposes (64 hex characters = 32 bytes).
+const testEncKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 //
 // Dummy Consensus Implementation
 //
 
-// dummyConsensus implements the types.Consensus interface (including HeightGetter).
 type dummyConsensus struct{}
 
 func (d *dummyConsensus) GetLastBlockHeight() uint64 {
 	return 42
 }
+
 func (d *dummyConsensus) GetNetworkLoad() float64 {
 	return 75.0
 }
+
 func (d *dummyConsensus) GetLachesis() types.Lachesis {
 	return nil
 }
+
 func (d *dummyConsensus) GetDPoS() types.DPoS {
 	return nil
 }
+
 func (d *dummyConsensus) GetPoH() types.PoH {
 	return nil
 }
+
 func (d *dummyConsensus) Start() error {
 	return nil
 }
+
 func (d *dummyConsensus) Stop() error {
 	return nil
 }
+
 func (d *dummyConsensus) ProcessBlock(blockNumber uint64) error {
 	return nil
 }
+
 func (d *dummyConsensus) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []byte) *types.Event {
 	return &types.Event{
 		ID:        [32]byte{1, 2, 3},
@@ -64,22 +74,28 @@ func (d *dummyConsensus) CreateEvent(creator [32]byte, parentIDs [][32]byte, dat
 		Finalized: false,
 	}
 }
+
 func (d *dummyConsensus) FinalizeEvent(event *types.Event) (bool, error) {
 	event.Finalized = true
 	return true, nil
 }
+
 func (d *dummyConsensus) SynchronizeState(targetState [32]byte, targetCount uint64) error {
 	return nil
 }
+
 func (d *dummyConsensus) GetValidators() []*types.Validator {
 	return []*types.Validator{}
 }
+
 func (d *dummyConsensus) GetActiveValidators() []*types.Validator {
 	return []*types.Validator{}
 }
+
 func (d *dummyConsensus) GetPendingEvents() []*types.Event {
 	return []*types.Event{}
 }
+
 func (d *dummyConsensus) GetFinalizedEvents(fromHeight, toHeight uint64) ([]*types.Event, error) {
 	return []*types.Event{}, nil
 }
@@ -88,36 +104,59 @@ func (d *dummyConsensus) GetFinalizedEvents(fromHeight, toHeight uint64) ([]*typ
 // Dummy Ledger and Transaction Manager Helpers
 //
 
-// newDummyLedger returns a new ledger instance.
-func newDummyLedger() ledger.LedgerAPI {
-	return ledger.NewLedger()
+// newDummyLedger returns a new ledger instance using RocksDBLedger in a temporary directory.
+func newDummyLedger(t *testing.T) ledger.LedgerAPI {
+	ledgerDir := t.TempDir()
+	ldb, err := ledger.NewRocksDBLedger(ledgerDir)
+	require.NoError(t, err, "failed to create RocksDBLedger")
+	return ldb
 }
 
-// newDummyTxManager returns a new TransactionManager instance.
+// newDummyTxManager returns a new TransactionManager instance using the provided ledger.
 func newDummyTxManager(ledgerInst ledger.LedgerAPI) *transaction.TransactionManager {
-	pool := transaction.NewTransactionPool(10, time.Minute, 0.001, 10.0, false, time.Hour, nil, nil)
+	pool := transaction.NewTransactionPool(
+		10,
+		time.Minute,
+		0.001,
+		10.0,
+		false,
+		time.Hour,
+		nil,
+		nil,
+	)
 	return transaction.NewTransactionManager(pool, 0.001, false, ledgerInst)
+}
+
+// newDummyStorage returns a new JSONStore instance for persistent storage.
+func newDummyStorage(t *testing.T) storage.Store {
+	storeDir := t.TempDir()
+	js, err := storage.NewJSONStore(storeDir)
+	require.NoError(t, err, "failed to create JSONStore")
+	return js
 }
 
 //
 // API and Router Setup Helpers
 //
 
-// newTestAPI creates an API instance using a real ledger, dummy consensus, and a real TxManager.
-func newTestAPI() *API {
-	ledgerInst := newDummyLedger()
-	txMgr := newDummyTxManager(ledgerInst)
+// newTestAPI creates an API instance using RocksDBLedger, JSONStore, dummy consensus,
+// and a real TransactionManager.
+func newTestAPI(t *testing.T) *API {
+	ldb := newDummyLedger(t)
+	store := newDummyStorage(t)
 	consensusInst := &dummyConsensus{}
-	return NewAPI(ledgerInst, consensusInst, txMgr)
+	txMgr := newDummyTxManager(ldb)
+	return NewAPI(ldb.(*ledger.RocksDBLedger), consensusInst, txMgr, store)
 }
 
-// newTestRouter sets up a router that registers the API endpoints using the unexported handler functions.
 func newTestRouter(apiInst *API) *mux.Router {
 	router := mux.NewRouter()
 	router.HandleFunc("/status", apiInst.handleStatus).Methods("GET")
 	router.HandleFunc("/accounts/{id}", apiInst.handleGetAccount).Methods("GET")
 	router.HandleFunc("/blocks/{number}", apiInst.handleGetBlock).Methods("GET")
 	router.HandleFunc("/transactions", apiInst.handleSubmitTransaction).Methods("POST")
+	// We assume /wallets, /ledger/snapshot/{height}, /ledger/restore/{height},
+	// and /storage/block/{number} are tested elsewhere.
 	return router
 }
 
@@ -125,9 +164,8 @@ func newTestRouter(apiInst *API) *mux.Router {
 // Test Cases
 //
 
-// TestStatusEndpoint tests the /status endpoint.
 func TestStatusEndpoint(t *testing.T) {
-	apiInst := newTestAPI()
+	apiInst := newTestAPI(t)
 	router := newTestRouter(apiInst)
 
 	req := httptest.NewRequest("GET", "/status", nil)
@@ -149,9 +187,8 @@ func TestStatusEndpoint(t *testing.T) {
 	assert.Equal(t, 75.0, nl, "Network load mismatch")
 }
 
-// TestGetAccountEndpoint tests the /accounts/{id} endpoint.
 func TestGetAccountEndpoint(t *testing.T) {
-	apiInst := newTestAPI()
+	apiInst := newTestAPI(t)
 	router := newTestRouter(apiInst)
 
 	testAccountID := "test-account"
@@ -170,17 +207,16 @@ func TestGetAccountEndpoint(t *testing.T) {
 	assert.Equal(t, testAccountID, account.ID, "Account ID mismatch")
 }
 
-// TestGetBlockEndpoint tests the /blocks/{number} endpoint.
 func TestGetBlockEndpoint(t *testing.T) {
-	apiInst := newTestAPI()
+	apiInst := newTestAPI(t)
 	router := newTestRouter(apiInst)
 
+	// Use the ledger (RocksDBLedger) to commit a block.
 	ledgerInst := apiInst.Ledger
 
-	// Create a dummy block.
 	block := common.Block{
 		Number:       1,
-		Timestamp:    time.Now().Unix(), // Use Unix timestamp (int64)
+		Timestamp:    time.Now().Unix(),
 		Transactions: []common.Transaction{},
 		PreviousHash: "genesis",
 	}
@@ -203,9 +239,8 @@ func TestGetBlockEndpoint(t *testing.T) {
 	assert.Equal(t, block.Hash, gotBlock.Hash, "Block hash mismatch")
 }
 
-// TestGetBlockEndpoint_Invalid tests the /blocks/{number} endpoint with invalid input.
 func TestGetBlockEndpoint_Invalid(t *testing.T) {
-	apiInst := newTestAPI()
+	apiInst := newTestAPI(t)
 	router := newTestRouter(apiInst)
 
 	req := httptest.NewRequest("GET", "/blocks/abc", nil)
@@ -219,20 +254,24 @@ func TestGetBlockEndpoint_Invalid(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, rec.Code, "Expected 404 Not Found for non-existent block")
 }
 
-// TestSubmitTransactionEndpoint tests the /transactions endpoint.
 func TestSubmitTransactionEndpoint(t *testing.T) {
-	apiInst := newTestAPI()
+	apiInst := newTestAPI(t)
 	router := newTestRouter(apiInst)
 
-	// Set up accounts with sufficient balances.
 	common.SetAccountBalance("sender-account", 1000.0)
 	common.SetAccountBalance("receiver-account", 100.0)
 
-	// Generate a valid Dilithium key pair for the sender.
 	dilKP, err := crypto.GenerateDilithiumKeyPair(crypto.DilithiumLevel3)
 	require.NoError(t, err, "Failed to generate Dilithium key pair for sender")
 	common.SetPublicKey("sender-account", dilKP.PublicKey)
 	acc := common.GetAccount("sender-account")
+	if acc == nil {
+		acc = &common.Account{ID: "sender-account", Balance: 1000.0}
+		if err := common.RegisterAccount(acc); err != nil {
+			t.Fatalf("failed to register sender account: %v", err)
+		}
+	}
+	// Directly assign the private key.
 	acc.PrivateKey = dilKP.PrivateKey
 
 	payload := map[string]interface{}{
@@ -264,9 +303,8 @@ func TestSubmitTransactionEndpoint(t *testing.T) {
 	assert.NotEmpty(t, tx.Signature, "Transaction signature should not be empty")
 }
 
-// TestSubmitTransaction_InvalidPayload tests the /transactions endpoint with invalid JSON.
 func TestSubmitTransaction_InvalidPayload(t *testing.T) {
-	apiInst := newTestAPI()
+	apiInst := newTestAPI(t)
 	router := newTestRouter(apiInst)
 
 	invalidJSON := []byte(`{"sender": "A", "receiver": "B", "amount": "not-a-number"}`)

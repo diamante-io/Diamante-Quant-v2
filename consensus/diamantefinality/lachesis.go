@@ -3,11 +3,14 @@
 package finality
 
 import (
+	"context"
 	"diamante/consensus/types"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math"
+	"os"
 	"sync"
 	"time"
 )
@@ -36,6 +39,11 @@ type Lachesis struct {
 	// Additional concurrency structures
 	activeProposals   sync.Map   // Tracks proposals & states if using governance extensions
 	eventProcessingMu sync.Mutex // Serializes event processing in ProcessEvent
+
+	// NEW: unified context and logging for cancellation and structured logging.
+	ctx    context.Context
+	cancel context.CancelFunc
+	logger *log.Logger
 }
 
 // NewLachesis constructs a Lachesis instance with default votingThreshold=0.66
@@ -48,6 +56,8 @@ func NewLachesis(gossipDelay time.Duration) *Lachesis {
 		votingThreshold: 0.66, // can be adjusted later
 		networkLoad:     0,
 		finalizedEvents: make(map[uint64][]*types.Event),
+		// Initialize logger with default settings.
+		logger: log.New(os.Stdout, "Lachesis: ", log.Ldate|log.Ltime|log.Lshortfile),
 	}
 	l.GossipProtocol = NewGossipProtocol(dag, gossipDelay)
 	l.VirtualVoting = NewVirtualVoting(dag)
@@ -306,12 +316,15 @@ func (l *Lachesis) Start() error {
 	}
 	l.running = true
 	l.activeProposals = sync.Map{} // Reset proposals if needed
+	// Create a cancellable context for the consensus loop.
+	l.ctx, l.cancel = context.WithCancel(context.Background())
 
 	// Start gossip loops
 	go l.GossipProtocol.Start()
 
-	// Start consensus worker
+	// Start consensus worker using runConsensus which now checks context cancellation.
 	go l.runConsensus()
+	l.logger.Println("Lachesis started successfully")
 	return nil
 }
 
@@ -324,8 +337,11 @@ func (l *Lachesis) Stop() error {
 		return errors.New("Lachesis is not running")
 	}
 	l.running = false
-
+	if l.cancel != nil {
+		l.cancel()
+	}
 	l.GossipProtocol.Stop()
+	l.logger.Println("Lachesis stopped")
 	return nil
 }
 
@@ -335,15 +351,13 @@ func (l *Lachesis) runConsensus() {
 	defer ticker.Stop()
 
 	for {
-		l.stateMu.RLock()
-		run := l.running
-		l.stateMu.RUnlock()
-
-		if !run {
+		select {
+		case <-ticker.C:
+			l.processEvents()
+		case <-l.ctx.Done():
+			l.logger.Println("runConsensus: context cancelled, exiting")
 			return
 		}
-		l.processEvents()
-		time.Sleep(100 * time.Millisecond)
 	}
 }
 
