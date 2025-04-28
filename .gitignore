@@ -7,7 +7,7 @@
 node_modules/
 dist/
 config.yaml
-main.go
+
 # Compiled Java class files
 *.class
 
