@@ -242,19 +242,6 @@ Licensed under the [MIT License](LICENSE).
 
 ---
 
-## Alignment Notes
-
-*Why this README matches the whitepaper:*
-
-- ✅ Fixes consensus description to **PoH + DPoS + aBFT** (not a grab-bag of algorithms).
-- ✅ Corrects cryptography to the **NIST PQC trio** (Kyber, Dilithium, SPHINCS+).
-- ✅ Adds the **Unified Smart-Contract Stack** and CVM atomicity.
-- ✅ Introduces the **Confidentiality Layer** details (commitments/nullifiers + zk).
-- ✅ Restores the **tiered storage model** (LMDB/Redis/Mongo/SQLite).
-- ✅ Includes **performance targets**, observability/SRE, and deterministic genesis checks.
-
----
-
 **Built with ❤️ by the Diamante team**
 
 *Empowering the future of decentralized technology with quantum-safe, enterprise-grade blockchain infrastructure.*
