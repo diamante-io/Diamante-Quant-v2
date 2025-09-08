@@ -1,0 +1,491 @@
+// Package network provides typed network protocol handling
+package network
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"diamante/common"
+	"diamante/types"
+	"github.com/sirupsen/logrus"
+)
+
+// TypedProtocol handles the network protocol using typed messages
+type TypedProtocol struct {
+	nodeID          string
+	chainID         string
+	version         string
+	
+	peerManager     *TypedPeerManager
+	messageHandler  *TypedMessageHandler
+	
+	// Handlers for different message types
+	blockHandler    BlockHandler
+	txHandler       TransactionHandler
+	consensusHandler ConsensusHandler
+	syncHandler     SyncHandler
+	queryHandler    QueryHandler
+	
+	// State
+	currentHeight   uint64
+	syncing         bool
+	
+	logger          *logrus.Logger
+	mu              sync.RWMutex
+}
+
+// ProtocolConfig contains configuration for the protocol
+type ProtocolConfig struct {
+	NodeID          string
+	ChainID         string
+	Version         string
+	PeerManager     *TypedPeerManager
+	Logger          *logrus.Logger
+}
+
+// Handler interfaces for different message types
+type (
+	BlockHandler interface {
+		HandleBlock(block *BlockData, peer *TypedPeer) error
+	}
+	
+	TransactionHandler interface {
+		HandleTransaction(tx *TransactionData, peer *TypedPeer) error
+	}
+	
+	ConsensusHandler interface {
+		HandleConsensus(msg *ConsensusData, peer *TypedPeer) error
+	}
+	
+	SyncHandler interface {
+		HandleSync(sync *SyncData, peer *TypedPeer) error
+	}
+	
+	QueryHandler interface {
+		HandleQuery(query *QueryData, peer *TypedPeer) (*ResponseData, error)
+	}
+)
+
+// NewTypedProtocol creates a new typed protocol handler
+func NewTypedProtocol(config *ProtocolConfig) *TypedProtocol {
+	if config.Logger == nil {
+		config.Logger = logrus.New()
+	}
+	
+	protocol := &TypedProtocol{
+		nodeID:         config.NodeID,
+		chainID:        config.ChainID,
+		version:        config.Version,
+		peerManager:    config.PeerManager,
+		messageHandler: config.PeerManager.messageHandler,
+		logger:         config.Logger,
+	}
+	
+	// Register message handlers
+	protocol.registerHandlers()
+	
+	return protocol
+}
+
+// registerHandlers registers all message type handlers
+func (p *TypedProtocol) registerHandlers() {
+	p.messageHandler.RegisterHandler(MessageTypeHandshake, p.handleHandshake)
+	p.messageHandler.RegisterHandler(MessageTypePing, p.handlePing)
+	p.messageHandler.RegisterHandler(MessageTypePong, p.handlePong)
+	p.messageHandler.RegisterHandler(MessageTypeBlock, p.handleBlock)
+	p.messageHandler.RegisterHandler(MessageTypeTransaction, p.handleTransaction)
+	p.messageHandler.RegisterHandler(MessageTypeConsensus, p.handleConsensus)
+	p.messageHandler.RegisterHandler(MessageTypeSync, p.handleSync)
+	p.messageHandler.RegisterHandler(MessageTypeState, p.handleState)
+	p.messageHandler.RegisterHandler(MessageTypeQuery, p.handleQuery)
+	p.messageHandler.RegisterHandler(MessageTypeResponse, p.handleResponse)
+}
+
+// SetBlockHandler sets the block handler
+func (p *TypedProtocol) SetBlockHandler(handler BlockHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.blockHandler = handler
+}
+
+// SetTransactionHandler sets the transaction handler
+func (p *TypedProtocol) SetTransactionHandler(handler TransactionHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.txHandler = handler
+}
+
+// SetConsensusHandler sets the consensus handler
+func (p *TypedProtocol) SetConsensusHandler(handler ConsensusHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.consensusHandler = handler
+}
+
+// SetSyncHandler sets the sync handler
+func (p *TypedProtocol) SetSyncHandler(handler SyncHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.syncHandler = handler
+}
+
+// SetQueryHandler sets the query handler
+func (p *TypedProtocol) SetQueryHandler(handler QueryHandler) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.queryHandler = handler
+}
+
+// handleHandshake handles handshake messages
+func (p *TypedProtocol) handleHandshake(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Handshake == nil {
+		return fmt.Errorf("invalid handshake message")
+	}
+	
+	handshake := msg.Payload.Handshake
+	
+	// Validate handshake
+	if handshake.ChainID != p.chainID {
+		return fmt.Errorf("chain ID mismatch: expected %s, got %s", p.chainID, handshake.ChainID)
+	}
+	
+	// Update peer info
+	peer.UpdateHandshake(handshake)
+	
+	// Send handshake response if this was initial handshake
+	if peer.State() == PeerStateHandshaking {
+		response := NewHandshakeMessage(p.nodeID, p.chainID, p.currentHeight, p.version)
+		if err := p.messageHandler.SendMessage(response, peer); err != nil {
+			return fmt.Errorf("failed to send handshake response: %w", err)
+		}
+		peer.SetState(PeerStateConnected)
+	}
+	
+	p.logger.WithFields(logrus.Fields{
+		"peer":    peer.ID(),
+		"version": handshake.Version,
+		"height":  handshake.Height,
+	}).Info("Handshake completed")
+	
+	return nil
+}
+
+// handlePing handles ping messages
+func (p *TypedProtocol) handlePing(msg *TypedMessage, peer *TypedPeer) error {
+	// Send pong response
+	pong := &TypedMessage{
+		Type:      MessageTypePong,
+		ID:        generateMessageID(),
+		Sender:    p.nodeID,
+		Recipient: msg.Sender,
+		Timestamp: common.ConsensusUnix(),
+		Payload:   &MessagePayload{},
+	}
+	
+	return p.messageHandler.SendMessage(pong, peer)
+}
+
+// handlePong handles pong messages
+func (p *TypedProtocol) handlePong(msg *TypedMessage, peer *TypedPeer) error {
+	// Update peer last activity
+	p.logger.WithField("peer", peer.ID()).Debug("Received pong")
+	return nil
+}
+
+// handleBlock handles block messages
+func (p *TypedProtocol) handleBlock(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Block == nil {
+		return fmt.Errorf("invalid block message")
+	}
+	
+	p.mu.RLock()
+	handler := p.blockHandler
+	p.mu.RUnlock()
+	
+	if handler == nil {
+		return fmt.Errorf("no block handler registered")
+	}
+	
+	return handler.HandleBlock(msg.Payload.Block, peer)
+}
+
+// handleTransaction handles transaction messages
+func (p *TypedProtocol) handleTransaction(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Transaction == nil {
+		return fmt.Errorf("invalid transaction message")
+	}
+	
+	p.mu.RLock()
+	handler := p.txHandler
+	p.mu.RUnlock()
+	
+	if handler == nil {
+		return fmt.Errorf("no transaction handler registered")
+	}
+	
+	return handler.HandleTransaction(msg.Payload.Transaction, peer)
+}
+
+// handleConsensus handles consensus messages
+func (p *TypedProtocol) handleConsensus(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Consensus == nil {
+		return fmt.Errorf("invalid consensus message")
+	}
+	
+	p.mu.RLock()
+	handler := p.consensusHandler
+	p.mu.RUnlock()
+	
+	if handler == nil {
+		return fmt.Errorf("no consensus handler registered")
+	}
+	
+	return handler.HandleConsensus(msg.Payload.Consensus, peer)
+}
+
+// handleSync handles sync messages
+func (p *TypedProtocol) handleSync(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Sync == nil {
+		return fmt.Errorf("invalid sync message")
+	}
+	
+	p.mu.RLock()
+	handler := p.syncHandler
+	p.mu.RUnlock()
+	
+	if handler == nil {
+		return fmt.Errorf("no sync handler registered")
+	}
+	
+	return handler.HandleSync(msg.Payload.Sync, peer)
+}
+
+// handleState handles state messages
+func (p *TypedProtocol) handleState(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.State == nil {
+		return fmt.Errorf("invalid state message")
+	}
+	
+	// Handle state queries/responses
+	p.logger.WithFields(logrus.Fields{
+		"peer":   peer.ID(),
+		"keys":   len(msg.Payload.State.Keys),
+		"height": msg.Payload.State.Height,
+	}).Debug("Received state message")
+	
+	return nil
+}
+
+// handleQuery handles query messages
+func (p *TypedProtocol) handleQuery(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Query == nil {
+		return fmt.Errorf("invalid query message")
+	}
+	
+	p.mu.RLock()
+	handler := p.queryHandler
+	p.mu.RUnlock()
+	
+	if handler == nil {
+		return fmt.Errorf("no query handler registered")
+	}
+	
+	// Process query
+	response, err := handler.HandleQuery(msg.Payload.Query, peer)
+	if err != nil {
+		response = &ResponseData{
+			RequestID: msg.ID,
+			Success:   false,
+			Error:     err.Error(),
+		}
+	}
+	
+	// Send response
+	responseMsg := &TypedMessage{
+		Type:      MessageTypeResponse,
+		ID:        generateMessageID(),
+		Sender:    p.nodeID,
+		Recipient: msg.Sender,
+		Timestamp: common.ConsensusUnix(),
+		Payload: &MessagePayload{
+			Response: response,
+		},
+	}
+	
+	return p.messageHandler.SendMessage(responseMsg, peer)
+}
+
+// handleResponse handles response messages
+func (p *TypedProtocol) handleResponse(msg *TypedMessage, peer *TypedPeer) error {
+	if msg.Payload.Response == nil {
+		return fmt.Errorf("invalid response message")
+	}
+	
+	response := msg.Payload.Response
+	
+	p.logger.WithFields(logrus.Fields{
+		"peer":       peer.ID(),
+		"request_id": response.RequestID,
+		"success":    response.Success,
+	}).Debug("Received response")
+	
+	// TODO: Match response to pending request
+	
+	return nil
+}
+
+// BroadcastBlock broadcasts a block to all peers
+func (p *TypedProtocol) BroadcastBlock(height uint64, hash, blockData []byte, compressed bool) error {
+	msg := NewBlockMessage(height, hash, blockData, compressed)
+	msg.Sender = p.nodeID
+	
+	return p.peerManager.BroadcastMessage(msg)
+}
+
+// BroadcastTransaction broadcasts a transaction to all peers
+func (p *TypedProtocol) BroadcastTransaction(tx *types.TypedTransaction) error {
+	msg := NewTransactionMessage(tx, true)
+	msg.Sender = p.nodeID
+	
+	return p.peerManager.BroadcastMessage(msg)
+}
+
+// RequestSync requests sync from a peer
+func (p *TypedProtocol) RequestSync(peerID string, startHeight, endHeight uint64) error {
+	msg := &TypedMessage{
+		Type:      MessageTypeSync,
+		ID:        generateMessageID(),
+		Sender:    p.nodeID,
+		Recipient: peerID,
+		Timestamp: common.ConsensusUnix(),
+		Payload: &MessagePayload{
+			Sync: &SyncData{
+				Type:        SyncTypeBlocks,
+				StartHeight: startHeight,
+				EndHeight:   endHeight,
+			},
+		},
+	}
+	
+	return p.peerManager.SendMessage(peerID, msg)
+}
+
+// QueryPeer queries a peer for specific data
+func (p *TypedProtocol) QueryPeer(peerID string, queryType QueryType, params map[string]*types.Value) error {
+	msg := &TypedMessage{
+		Type:      MessageTypeQuery,
+		ID:        generateMessageID(),
+		Sender:    p.nodeID,
+		Recipient: peerID,
+		Timestamp: common.ConsensusUnix(),
+		Payload: &MessagePayload{
+			Query: &QueryData{
+				QueryType:  queryType,
+				Parameters: params,
+			},
+		},
+	}
+	
+	return p.peerManager.SendMessage(peerID, msg)
+}
+
+// UpdateHeight updates the current blockchain height
+func (p *TypedProtocol) UpdateHeight(height uint64) {
+	p.mu.Lock()
+	p.currentHeight = height
+	p.mu.Unlock()
+}
+
+// SetSyncing sets the syncing state
+func (p *TypedProtocol) SetSyncing(syncing bool) {
+	p.mu.Lock()
+	p.syncing = syncing
+	p.mu.Unlock()
+}
+
+// IsSyncing returns whether the node is currently syncing
+func (p *TypedProtocol) IsSyncing() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.syncing
+}
+
+// GetPeerCount returns the number of active peers
+func (p *TypedProtocol) GetPeerCount() int {
+	return len(p.peerManager.GetActivePeers())
+}
+
+// GetPeers returns information about all peers
+func (p *TypedProtocol) GetPeers() []*PeerInfo {
+	peers := p.peerManager.GetPeers()
+	infos := make([]*PeerInfo, 0, len(peers))
+	
+	for _, peer := range peers {
+		infos = append(infos, peer.GetInfo())
+	}
+	
+	return infos
+}
+
+// Start starts the protocol
+func (p *TypedProtocol) Start(ctx context.Context) error {
+	p.logger.Info("Starting network protocol")
+	
+	// Start periodic tasks
+	go p.maintainConnections(ctx)
+	go p.pingPeers(ctx)
+	
+	return nil
+}
+
+// maintainConnections maintains peer connections
+func (p *TypedProtocol) maintainConnections(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Log peer stats
+			stats := p.peerManager.GetStats()
+			p.logger.WithFields(logrus.Fields{
+				"active":   stats.ActivePeers,
+				"total":    stats.TotalPeers,
+				"inbound":  stats.InboundPeers,
+				"outbound": stats.OutboundPeers,
+			}).Debug("Peer statistics")
+		}
+	}
+}
+
+// pingPeers sends periodic pings to peers
+func (p *TypedProtocol) pingPeers(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			peers := p.peerManager.GetActivePeers()
+			for _, peer := range peers {
+				ping := &TypedMessage{
+					Type:      MessageTypePing,
+					ID:        generateMessageID(),
+					Sender:    p.nodeID,
+					Timestamp: common.ConsensusUnix(),
+					Payload:   &MessagePayload{},
+				}
+				
+				if err := p.messageHandler.SendMessage(ping, peer); err != nil {
+					p.logger.WithError(err).WithField("peer", peer.ID()).Debug("Failed to send ping")
+				}
+			}
+		}
+	}
+}

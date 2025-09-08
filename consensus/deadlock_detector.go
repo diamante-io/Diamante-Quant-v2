@@ -69,7 +69,7 @@ func (dd *DeadlockDetector) LockAcquired(lockName string) {
 
 	dd.activeLocks[lockName] = &lockInfo{
 		lockName:      lockName,
-		acquiredAt:    time.Now(),
+		acquiredAt:    ConsensusNow(),
 		goroutineID:   goroutineID,
 		stackTrace:    stackTrace,
 		warningLogged: false,
@@ -105,24 +105,24 @@ func (dd *DeadlockDetector) checkLocks() {
 	dd.locksMu.Lock()
 	defer dd.locksMu.Unlock()
 
-	now := time.Now()
+	now := ConsensusNow()
 	for _, lock := range dd.activeLocks {
 		heldDuration := now.Sub(lock.acquiredAt)
 
 		// Check for error threshold
 		if heldDuration > dd.errorThreshold && !lock.errorLogged {
 			dd.logger.Error("Potential deadlock detected",
-				"lockName", lock.lockName,
-				"heldFor", heldDuration.String(),
-				"goroutineID", lock.goroutineID,
-				"stackTrace", lock.stackTrace)
+				LogKeyValue{Key: "lockName", Value: lock.lockName},
+				LogKeyValue{Key: "heldFor", Value: heldDuration.String()},
+				LogKeyValue{Key: "goroutineID", Value: fmt.Sprintf("%d", lock.goroutineID)},
+				LogKeyValue{Key: "stackTrace", Value: lock.stackTrace})
 			lock.errorLogged = true
 		} else if heldDuration > dd.warningThreshold && !lock.warningLogged {
 			// Check for warning threshold
 			dd.logger.Warn("Lock held for a long time",
-				"lockName", lock.lockName,
-				"heldFor", heldDuration.String(),
-				"goroutineID", lock.goroutineID)
+				LogKeyValue{Key: "lockName", Value: lock.lockName},
+				LogKeyValue{Key: "heldFor", Value: heldDuration.String()},
+				LogKeyValue{Key: "goroutineID", Value: fmt.Sprintf("%d", lock.goroutineID)})
 			lock.warningLogged = true
 		}
 	}

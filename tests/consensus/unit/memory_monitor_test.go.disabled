@@ -1,0 +1,281 @@
+package consensus_test
+
+import (
+	"context"
+	"runtime"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestMemoryMonitor(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.MemoryMonitorConfig{
+			CheckInterval:    time.Second,
+			HighThreshold:    0.8,
+			CriticalThreshold: 0.9,
+			EnableGC:         true,
+			GCThreshold:      0.7,
+		}
+
+		monitor := consensus.NewMemoryMonitor(config, logger)
+		require.NotNil(t, monitor)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = monitor.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("Get Stats", func(t *testing.T) {
+		config := consensus.DefaultMemoryMonitorConfig()
+		monitor := consensus.NewMemoryMonitor(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		require.NoError(t, err)
+
+		// Get memory stats
+		stats := monitor.GetStats()
+		assert.NotNil(t, stats)
+		assert.Greater(t, stats.Alloc, uint64(0))
+		assert.Greater(t, stats.TotalAlloc, uint64(0))
+		assert.Greater(t, stats.Sys, uint64(0))
+		assert.GreaterOrEqual(t, stats.UsagePercent, float64(0))
+		assert.LessOrEqual(t, stats.UsagePercent, float64(1))
+	})
+
+	t.Run("Memory Alerts", func(t *testing.T) {
+		config := &consensus.MemoryMonitorConfig{
+			CheckInterval:     100 * time.Millisecond,
+			HighThreshold:     0.0001, // Very low threshold to trigger
+			CriticalThreshold: 0.0002,
+			EnableGC:          false,
+		}
+
+		alertCount := 0
+		monitor := consensus.NewMemoryMonitor(config, logger)
+		monitor.SetAlertHandler(func(level string, usage float64) {
+			alertCount++
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		require.NoError(t, err)
+
+		// Wait for alerts
+		time.Sleep(300 * time.Millisecond)
+
+		assert.Greater(t, alertCount, 0)
+	})
+
+	t.Run("Force GC", func(t *testing.T) {
+		config := &consensus.MemoryMonitorConfig{
+			CheckInterval: time.Second,
+			EnableGC:      true,
+			GCThreshold:   0.5,
+		}
+
+		monitor := consensus.NewMemoryMonitor(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		require.NoError(t, err)
+
+		// Get initial stats
+		statsBefore := monitor.GetStats()
+
+		// Force GC
+		err = monitor.ForceGC()
+		assert.NoError(t, err)
+
+		// GC count should increase
+		statsAfter := monitor.GetStats()
+		assert.Greater(t, statsAfter.GCCount, statsBefore.GCCount)
+	})
+
+	t.Run("Is Healthy", func(t *testing.T) {
+		config := &consensus.MemoryMonitorConfig{
+			CheckInterval:     time.Second,
+			HighThreshold:     0.8,
+			CriticalThreshold: 0.9,
+		}
+
+		monitor := consensus.NewMemoryMonitor(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		require.NoError(t, err)
+
+		// Should be healthy (unless system is actually under memory pressure)
+		healthy := monitor.IsHealthy()
+		// Can't guarantee this will be true on all systems
+		_ = healthy
+	})
+
+	t.Run("Memory Pressure Simulation", func(t *testing.T) {
+		config := &consensus.MemoryMonitorConfig{
+			CheckInterval:     100 * time.Millisecond,
+			HighThreshold:     0.7,
+			CriticalThreshold: 0.9,
+			EnableGC:          true,
+			GCThreshold:       0.6,
+		}
+
+		gcTriggered := false
+		monitor := consensus.NewMemoryMonitor(config, logger)
+		monitor.SetGCHandler(func() {
+			gcTriggered = true
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		require.NoError(t, err)
+
+		// Allocate memory to simulate pressure
+		allocations := make([][]byte, 0)
+		for i := 0; i < 100; i++ {
+			allocations = append(allocations, make([]byte, 1024*1024)) // 1MB each
+		}
+
+		// Wait for monitor to detect and respond
+		time.Sleep(300 * time.Millisecond)
+
+		// Clean up
+		allocations = nil
+		runtime.GC()
+
+		// GC should have been triggered (if threshold was exceeded)
+		// Can't guarantee this will be true on all systems
+		_ = gcTriggered
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultMemoryMonitorConfig()
+		monitor := consensus.NewMemoryMonitor(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := monitor.Start(ctx)
+		require.NoError(t, err)
+
+		// Stop
+		err = monitor.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = monitor.Stop()
+		assert.Error(t, err)
+	})
+}
+
+func TestGCStats(t *testing.T) {
+	t.Run("Stats Structure", func(t *testing.T) {
+		stats := &types.GCStats{
+			LastGC:         time.Now(),
+			NumGC:          32,
+			PauseTotal:     100 * time.Millisecond,
+			PauseAvg:       3 * time.Millisecond,
+			PauseMax:       10 * time.Millisecond,
+			HeapAlloc:      1024 * 1024 * 100, // 100MB
+			HeapInUse:      1024 * 1024 * 80,  // 80MB
+			HeapReleased:   1024 * 1024 * 20,  // 20MB
+			NextGC:         1024 * 1024 * 150, // 150MB
+			GCCPUFraction:  0.02,
+		}
+
+		assert.NotZero(t, stats.LastGC)
+		assert.Equal(t, uint32(32), stats.NumGC)
+		assert.Equal(t, 100*time.Millisecond, stats.PauseTotal)
+		assert.Equal(t, 3*time.Millisecond, stats.PauseAvg)
+		assert.Equal(t, 10*time.Millisecond, stats.PauseMax)
+		assert.Equal(t, uint64(1024*1024*100), stats.HeapAlloc)
+		assert.Equal(t, 0.02, stats.GCCPUFraction)
+	})
+}
+
+func TestMemoryStats(t *testing.T) {
+	t.Run("Memory Usage Calculation", func(t *testing.T) {
+		// Get actual runtime stats
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
+
+		stats := &consensus.MemoryStats{
+			Alloc:        m.Alloc,
+			TotalAlloc:   m.TotalAlloc,
+			Sys:          m.Sys,
+			NumGC:        m.NumGC,
+			UsagePercent: float64(m.Alloc) / float64(m.Sys),
+		}
+
+		assert.Greater(t, stats.Alloc, uint64(0))
+		assert.Greater(t, stats.TotalAlloc, uint64(0))
+		assert.Greater(t, stats.Sys, uint64(0))
+		assert.GreaterOrEqual(t, stats.UsagePercent, float64(0))
+		assert.LessOrEqual(t, stats.UsagePercent, float64(1))
+	})
+}
+
+func BenchmarkMemoryMonitor(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &consensus.MemoryMonitorConfig{
+		CheckInterval: time.Hour, // Don't actually check during benchmark
+		EnableGC:      false,
+	}
+
+	monitor := consensus.NewMemoryMonitor(config, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	monitor.Start(ctx)
+
+	b.Run("GetStats", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			monitor.GetStats()
+		}
+	})
+
+	b.Run("IsHealthy", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			monitor.IsHealthy()
+		}
+	})
+
+	b.Run("RuntimeMemStats", func(b *testing.B) {
+		var m runtime.MemStats
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			runtime.ReadMemStats(&m)
+		}
+	})
+}

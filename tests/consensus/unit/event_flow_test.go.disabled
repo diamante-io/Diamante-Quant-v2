@@ -1,0 +1,495 @@
+// Package consensus_test provides unit tests for the event flow manager
+package consensus_test
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/consensus/types"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestEventFlowManagerCreation tests the creation of EventFlowManager
+func TestEventFlowManagerCreation(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// EventFlowManager is created internally by HybridConsensus
+	// We can verify it's working by creating events
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 1000000)
+
+	// Activate the validator
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(t, err)
+
+	// Create an event - this uses EventFlowManager internally
+	event := hc.CreateEvent(validatorID, nil, []byte("test data"))
+	assert.NotNil(t, event, "Event should be created successfully")
+}
+
+// TestEventCreationAndTracking tests event creation and tracking
+func TestEventCreationAndTracking(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add multiple validators
+	validators := make([][32]byte, 3)
+	for i := range validators {
+		validators[i] = generateValidatorID(i)
+		hc.AddValidator(validators[i], uint64(1000000+i*100000))
+
+		// Activate validator
+		vm := hc.GetValidatorManager()
+		err = vm.ActivateValidator(validators[i])
+		require.NoError(t, err)
+	}
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	// Create events from different validators
+	events := make([]*types.Event, 0)
+	for i, validatorID := range validators {
+		data := []byte("event data " + string(rune('A'+i)))
+		event := hc.CreateEvent(validatorID, nil, data)
+		if event != nil {
+			events = append(events, event)
+		}
+	}
+
+	// Verify events were created
+	assert.Equal(t, len(validators), len(events), "Should create one event per validator")
+
+	// Check pending events
+	pendingEvents := hc.GetPendingEvents()
+	assert.NotEmpty(t, pendingEvents, "Should have pending events")
+}
+
+// TestEventFinalization tests the event finalization process
+func TestEventFinalization(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.VotingThreshold = 0.01 // Very low threshold for testing
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add a validator with high stake
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 10000000)
+
+	// Activate validator
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(t, err)
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	// Create an event
+	eventData := []byte("test event for finalization")
+	event := hc.CreateEvent(validatorID, nil, eventData)
+	require.NotNil(t, event, "Event should be created")
+
+	// Wait for potential finalization
+	time.Sleep(500 * time.Millisecond)
+
+	// Check if event was finalized
+	finalizedEvents, err := hc.GetFinalizedEvents(0, 100)
+	assert.NoError(t, err)
+	assert.NotNil(t, finalizedEvents, "Should return finalized events slice")
+}
+
+// TestConcurrentEventCreation tests concurrent event creation
+func TestConcurrentEventCreation(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add multiple validators
+	numValidators := 5
+	validators := make([][32]byte, numValidators)
+	for i := 0; i < numValidators; i++ {
+		validators[i] = generateValidatorID(i)
+		hc.AddValidator(validators[i], uint64(1000000+i*100000))
+
+		// Activate validator
+		vm := hc.GetValidatorManager()
+		err = vm.ActivateValidator(validators[i])
+		require.NoError(t, err)
+	}
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	// Create events concurrently
+	var wg sync.WaitGroup
+	eventCount := 10
+	successCount := 0
+	var mu sync.Mutex
+
+	for i := 0; i < eventCount; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+
+			validatorID := validators[idx%numValidators]
+			data := []byte("concurrent event")
+			event := hc.CreateEvent(validatorID, nil, data)
+
+			if event != nil {
+				mu.Lock()
+				successCount++
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify events were created
+	assert.Greater(t, successCount, 0, "Should create some events successfully")
+	t.Logf("Created %d/%d events concurrently", successCount, eventCount)
+}
+
+// TestEventValidation tests event validation logic
+func TestEventValidation(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Test 1: Event from non-existent validator
+	nonExistentValidator := generateValidatorID(999)
+	event := hc.CreateEvent(nonExistentValidator, nil, []byte("invalid"))
+	assert.Nil(t, event, "Should not create event for non-existent validator")
+
+	// Test 2: Event from inactive validator
+	inactiveValidator := generateValidatorID(1)
+	hc.AddValidator(inactiveValidator, 1000000)
+	// Don't activate - validator remains inactive
+
+	event = hc.CreateEvent(inactiveValidator, nil, []byte("from inactive"))
+	assert.Nil(t, event, "Should not create event for inactive validator")
+
+	// Test 3: Valid event from active validator
+	activeValidator := generateValidatorID(2)
+	hc.AddValidator(activeValidator, 1000000)
+
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(activeValidator)
+	require.NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+
+	event = hc.CreateEvent(activeValidator, nil, []byte("valid event"))
+	assert.NotNil(t, event, "Should create event for active validator")
+}
+
+// TestEventRetryMechanism tests the event retry mechanism
+func TestEventRetryMechanism(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.VotingThreshold = 0.99 // Very high threshold to prevent finalization
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 1000000)
+
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(t, err)
+
+	// Create an event that won't be finalized
+	event := hc.CreateEvent(validatorID, nil, []byte("retry test"))
+	require.NotNil(t, event)
+
+	// Wait for retry attempts
+	time.Sleep(2 * time.Second)
+
+	// Event should still be in pending
+	pendingEvents := hc.GetPendingEvents()
+	found := false
+	for _, pe := range pendingEvents {
+		if pe.ID == event.ID {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "Event should still be pending after retry attempts")
+}
+
+// TestEventBatchProcessing tests batch processing of events
+func TestEventBatchProcessing(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add multiple validators
+	numValidators := 3
+	for i := 0; i < numValidators; i++ {
+		validatorID := generateValidatorID(i)
+		hc.AddValidator(validatorID, uint64(1000000+i*100000))
+
+		vm := hc.GetValidatorManager()
+		err = vm.ActivateValidator(validatorID)
+		require.NoError(t, err)
+	}
+
+	// Create multiple events quickly
+	events := make([]*types.Event, 0)
+	for i := 0; i < 20; i++ {
+		validatorID := generateValidatorID(i % numValidators)
+		event := hc.CreateEvent(validatorID, nil, []byte("batch event"))
+		if event != nil {
+			events = append(events, event)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Wait for batch processing
+	time.Sleep(1 * time.Second)
+
+	// Check that events were processed
+	assert.NotEmpty(t, events, "Should have created events")
+	t.Logf("Created %d events for batch processing", len(events))
+}
+
+// TestEventFlowMetrics tests event flow metrics collection
+func TestEventFlowMetrics(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add validators
+	for i := 0; i < 3; i++ {
+		validatorID := generateValidatorID(i)
+		hc.AddValidator(validatorID, 1000000)
+
+		vm := hc.GetValidatorManager()
+		err = vm.ActivateValidator(validatorID)
+		require.NoError(t, err)
+	}
+
+	// Create events to generate metrics
+	for i := 0; i < 10; i++ {
+		validatorID := generateValidatorID(i % 3)
+		hc.CreateEvent(validatorID, nil, []byte("metrics test"))
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Wait for metrics collection
+	time.Sleep(1 * time.Second)
+
+	// Metrics are logged internally - we can verify by checking pending events
+	pendingEvents := hc.GetPendingEvents()
+	t.Logf("Pending events count: %d", len(pendingEvents))
+}
+
+// TestEventDeduplication tests event deduplication
+func TestEventDeduplication(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 1000000)
+
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(t, err)
+
+	// Create an event
+	event1 := hc.CreateEvent(validatorID, nil, []byte("original event"))
+	require.NotNil(t, event1)
+
+	// Try to create duplicate events
+	// Note: In practice, the system should handle duplicates gracefully
+	event2 := hc.CreateEvent(validatorID, nil, []byte("another event"))
+	assert.NotNil(t, event2, "Should create different event")
+	assert.NotEqual(t, event1.ID, event2.ID, "Events should have different IDs")
+}
+
+// TestEventTimeouts tests event finalization timeouts
+func TestEventTimeouts(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.VotingThreshold = 0.99 // High threshold to prevent finalization
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 1000000)
+
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(t, err)
+
+	// Create an event
+	startTime := time.Now()
+	event := hc.CreateEvent(validatorID, nil, []byte("timeout test"))
+	require.NotNil(t, event)
+
+	// Wait for timeout
+	time.Sleep(6 * time.Second) // Default timeout is 5 seconds
+
+	// Check that event is still pending (not finalized due to high threshold)
+	pendingEvents := hc.GetPendingEvents()
+	found := false
+	for _, pe := range pendingEvents {
+		if pe.ID == event.ID {
+			found = true
+			break
+		}
+	}
+
+	duration := time.Since(startTime)
+	t.Logf("Event remained pending after %v", duration)
+	assert.True(t, found, "Event should still be pending after timeout")
+}
+
+// BenchmarkEventFlowCreation benchmarks event creation performance
+func BenchmarkEventFlowCreation(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+
+	err := hc.Start()
+	require.NoError(b, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 10000000)
+
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(b, err)
+
+	// Wait for initialization
+	time.Sleep(100 * time.Millisecond)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		data := []byte("benchmark event data")
+		_ = hc.CreateEvent(validatorID, nil, data)
+	}
+}
+
+// BenchmarkEventFlowFinalization benchmarks event finalization performance
+func BenchmarkEventFlowFinalization(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	config.VotingThreshold = 0.01 // Low threshold for faster finalization
+	hc := consensus.NewHybridConsensusWithConfig(config)
+
+	err := hc.Start()
+	require.NoError(b, err)
+	defer hc.Stop()
+
+	// Add a validator with high stake
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 100000000)
+
+	vm := hc.GetValidatorManager()
+	err = vm.ActivateValidator(validatorID)
+	require.NoError(b, err)
+
+	// Wait for initialization
+	time.Sleep(100 * time.Millisecond)
+
+	// Pre-create events
+	events := make([]*types.Event, b.N)
+	for i := 0; i < b.N; i++ {
+		event := hc.CreateEvent(validatorID, nil, []byte("bench"))
+		if event != nil {
+			events[i] = event
+		}
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if events[i] != nil {
+			_, _ = hc.FinalizeEvent(events[i])
+		}
+	}
+}
+
+// BenchmarkEventFlowConcurrentProcessing benchmarks concurrent event processing
+func BenchmarkEventFlowConcurrentProcessing(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+
+	err := hc.Start()
+	require.NoError(b, err)
+	defer hc.Stop()
+
+	// Add multiple validators
+	numValidators := 10
+	for i := 0; i < numValidators; i++ {
+		validatorID := generateValidatorID(i)
+		hc.AddValidator(validatorID, uint64(1000000+i*100000))
+
+		vm := hc.GetValidatorManager()
+		_ = vm.ActivateValidator(validatorID)
+	}
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			validatorID := generateValidatorID(i % numValidators)
+			_ = hc.CreateEvent(validatorID, nil, []byte("concurrent"))
+			i++
+		}
+	})
+}

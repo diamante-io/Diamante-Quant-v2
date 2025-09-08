@@ -1,0 +1,233 @@
+
+package unit
+
+import (
+	"bytes"
+	"encoding/json"
+	"log"
+	"strings"
+	"testing"
+)
+
+func TestNewStructuredLogger(t *testing.T) {
+	// Test valid logger creation
+	logger, err := NewStructuredLogger("info", "json")
+	if err != nil {
+		t.Fatalf("Failed to create logger: %v", err)
+	}
+
+	if logger == nil {
+		t.Fatal("Expected logger to be created")
+	}
+
+	// Test invalid log level
+	_, err = NewStructuredLogger("invalid", "json")
+	if err == nil {
+		t.Error("Expected error for invalid log level")
+	}
+
+	// Test invalid log format
+	_, err = NewStructuredLogger("info", "invalid")
+	if err == nil {
+		t.Error("Expected error for invalid log format")
+	}
+}
+
+func TestLoggerLevels(t *testing.T) {
+	var buf bytes.Buffer
+
+	// Create logger with debug level
+	logger, err := NewStructuredLogger("debug", "json")
+	if err != nil {
+		t.Fatalf("Failed to create logger: %v", err)
+	}
+
+	// Redirect logger output to buffer
+	structLogger := logger.(*StructuredLogger)
+	structLogger.logger = log.New(&buf, "", 0)
+
+	// Test all log levels
+	logger.Debug("debug message", "key", "value")
+	logger.Info("info message", "key", "value")
+	logger.Warn("warn message", "key", "value")
+	logger.Error("error message", "key", "value")
+
+	output := buf.String()
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+
+	if len(lines) != 4 {
+		t.Errorf("Expected 4 log lines, got %d", len(lines))
+	}
+
+	// Verify each line is valid JSON
+	for i, line := range lines {
+		var entry LogEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Errorf("Line %d is not valid JSON: %v", i+1, err)
+		}
+	}
+}
+
+func TestLoggerFiltering(t *testing.T) {
+	var buf bytes.Buffer
+
+	// Create logger with error level (should filter out debug, info, warn)
+	logger, err := NewStructuredLogger("error", "json")
+	if err != nil {
+		t.Fatalf("Failed to create logger: %v", err)
+	}
+
+	// Redirect logger output to buffer
+	structLogger := logger.(*StructuredLogger)
+	structLogger.logger = log.New(&buf, "", 0)
+
+	// Test all log levels
+	logger.Debug("debug message")
+	logger.Info("info message")
+	logger.Warn("warn message")
+	logger.Error("error message")
+
+	output := buf.String()
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+
+	// Should only have error message
+	if len(lines) != 1 || lines[0] == "" {
+		t.Errorf("Expected 1 log line for error level, got: %q", output)
+	}
+
+	var entry LogEntry
+	if err := json.Unmarshal([]byte(lines[0]), &entry); err != nil {
+		t.Errorf("Error log line is not valid JSON: %v", err)
+	}
+
+	if entry.Level != "ERROR" {
+		t.Errorf("Expected ERROR level, got %s", entry.Level)
+	}
+
+	if entry.Message != "error message" {
+		t.Errorf("Expected 'error message', got %s", entry.Message)
+	}
+}
+
+func TestTextFormat(t *testing.T) {
+	var buf bytes.Buffer
+
+	// Create logger with text format
+	logger, err := NewStructuredLogger("info", "text")
+	if err != nil {
+		t.Fatalf("Failed to create logger: %v", err)
+	}
+
+	// Redirect logger output to buffer
+	structLogger := logger.(*StructuredLogger)
+	structLogger.logger = log.New(&buf, "", 0)
+
+	logger.Info("test message", "key1", "value1", "key2", "value2")
+
+	output := buf.String()
+
+	// Should contain timestamp, level, message, and fields
+	if !strings.Contains(output, "INFO") {
+		t.Error("Expected INFO level in text output")
+	}
+
+	if !strings.Contains(output, "test message") {
+		t.Error("Expected message in text output")
+	}
+
+	if !strings.Contains(output, "key1=value1") {
+		t.Error("Expected key1=value1 in text output")
+	}
+
+	if !strings.Contains(output, "key2=value2") {
+		t.Error("Expected key2=value2 in text output")
+	}
+}
+
+func TestLogEntryFields(t *testing.T) {
+	var buf bytes.Buffer
+
+	logger, err := NewStructuredLogger("info", "json")
+	if err != nil {
+		t.Fatalf("Failed to create logger: %v", err)
+	}
+
+	// Redirect logger output to buffer
+	structLogger := logger.(*StructuredLogger)
+	structLogger.logger = log.New(&buf, "", 0)
+
+	// Test with key-value pairs
+	logger.Info("test message", "string_key", "string_value", "int_key", 42, "bool_key", true)
+
+	output := buf.String()
+	var entry LogEntry
+	if err := json.Unmarshal([]byte(output), &entry); err != nil {
+		t.Fatalf("Failed to unmarshal log entry: %v", err)
+	}
+
+	// Verify fields
+	if entry.Fields["string_key"] != "string_value" {
+		t.Errorf("Expected string_value, got %v", entry.Fields["string_key"])
+	}
+
+	if entry.Fields["int_key"] != float64(42) { // JSON numbers are float64
+		t.Errorf("Expected 42, got %v", entry.Fields["int_key"])
+	}
+
+	if entry.Fields["bool_key"] != true {
+		t.Errorf("Expected true, got %v", entry.Fields["bool_key"])
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected LogLevel
+		hasError bool
+	}{
+		{"debug", LogLevelDebug, false},
+		{"info", LogLevelInfo, false},
+		{"warn", LogLevelWarn, false},
+		{"warning", LogLevelWarn, false},
+		{"error", LogLevelError, false},
+		{"invalid", LogLevelInfo, true},
+	}
+
+	for _, test := range tests {
+		result, err := parseLogLevel(test.input)
+		if test.hasError && err == nil {
+			t.Errorf("Expected error for input %s", test.input)
+		}
+		if !test.hasError && err != nil {
+			t.Errorf("Unexpected error for input %s: %v", test.input, err)
+		}
+		if !test.hasError && result != test.expected {
+			t.Errorf("Expected %v for input %s, got %v", test.expected, test.input, result)
+		}
+	}
+}
+
+func TestParseLogFormat(t *testing.T) {
+	tests := []struct {
+		input    string
+		expected LogFormat
+		hasError bool
+	}{
+		{"json", LogFormatJSON, false},
+		{"text", LogFormatText, false},
+		{"invalid", LogFormatJSON, true},
+	}
+
+	for _, test := range tests {
+		result, err := parseLogFormat(test.input)
+		if test.hasError && err == nil {
+			t.Errorf("Expected error for input %s", test.input)
+		}
+		if !test.hasError && err != nil {
+			t.Errorf("Unexpected error for input %s: %v", test.input, err)
+		}
+		if !test.hasError && result != test.expected {
+			t.Errorf("Expected %v for input %s, got %v", test.expected, test.input, result)
+		}
+	}
+}

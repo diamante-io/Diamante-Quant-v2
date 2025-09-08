@@ -1,9 +1,10 @@
 package network
 
 import (
-	"log"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // Discovery interface defines peer discovery logic.
@@ -21,15 +22,22 @@ type BasicDiscovery struct {
 	stopChan     chan struct{}
 	pollInterval time.Duration
 	nm           *NetworkManager
+	logger       *logrus.Entry
 }
 
 // NewBasicDiscovery creates a new BasicDiscovery instance.
 func NewBasicDiscovery(initialSeeds []string, poll time.Duration, nm *NetworkManager) *BasicDiscovery {
+	logger := logrus.New()
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp: true,
+	})
+
 	return &BasicDiscovery{
 		knownPeers:   initialSeeds,
 		stopChan:     make(chan struct{}),
 		pollInterval: poll,
 		nm:           nm,
+		logger:       logger.WithField("component", "BasicDiscovery"),
 	}
 }
 
@@ -61,7 +69,7 @@ func (bd *BasicDiscovery) runDiscovery() {
 	for {
 		select {
 		case <-bd.stopChan:
-			log.Println("BasicDiscovery stopping")
+			bd.logger.Info("BasicDiscovery stopping")
 			return
 		case <-ticker.C:
 			bd.discoverPeers()
@@ -82,7 +90,13 @@ func (bd *BasicDiscovery) discoverPeers() {
 		if nm == nil || seed == nm.localAddr {
 			continue
 		}
-		log.Printf("Discovery: Attempting to dial seed %s\n", seed)
-		_ = nm.DialPeer(seed)
+		bd.logger.WithField("seed", seed).Debug("Discovery: Attempting to dial seed")
+		if err := nm.DialPeer(seed); err != nil {
+			bd.logger.WithFields(logrus.Fields{
+				"seed":  seed,
+				"error": err,
+			}).Error("Discovery: Failed to dial seed")
+			// Continue with other seeds instead of failing completely
+		}
 	}
 }

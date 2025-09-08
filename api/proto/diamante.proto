@@ -1,0 +1,395 @@
+syntax = "proto3";
+
+package diamante.api;
+
+option go_package = "diamante/api/proto";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/empty.proto";
+
+// Diamante gRPC API service
+service DiamanteBChainService {
+  // Transaction operations
+  rpc SubmitTransaction(SubmitTransactionRequest) returns (SubmitTransactionResponse);
+  rpc GetTransaction(GetTransactionRequest) returns (Transaction);
+  rpc GetTransactions(GetTransactionsRequest) returns (GetTransactionsResponse);
+  rpc GetTransactionStatus(GetTransactionStatusRequest) returns (TransactionStatus);
+
+  // Block operations
+  rpc GetBlock(GetBlockRequest) returns (Block) {
+    option (google.api.http) = {
+      get: "/v1/blocks/{block_id}"
+    };
+  }
+  
+  rpc GetBlocks(GetBlocksRequest) returns (GetBlocksResponse) {
+    option (google.api.http) = {
+      get: "/v1/blocks"
+    };
+  }
+  
+  rpc GetLatestBlock(google.protobuf.Empty) returns (Block) {
+    option (google.api.http) = {
+      get: "/v1/blocks/latest"
+    };
+  }
+
+  // Account operations
+  rpc GetAccount(GetAccountRequest) returns (Account) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}"
+    };
+  }
+  
+  rpc GetAccountBalance(GetAccountBalanceRequest) returns (AccountBalance) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}/balance"
+    };
+  }
+  
+  rpc GetAccountTransactions(GetAccountTransactionsRequest) returns (GetAccountTransactionsResponse) {
+    option (google.api.http) = {
+      get: "/v1/accounts/{account_id}/transactions"
+    };
+  }
+
+  // Wallet operations
+  rpc CreateWallet(CreateWalletRequest) returns (Wallet) {
+    option (google.api.http) = {
+      post: "/v1/wallets"
+      body: "*"
+    };
+  }
+  
+  rpc GetWallet(GetWalletRequest) returns (Wallet) {
+    option (google.api.http) = {
+      get: "/v1/wallets/{wallet_id}"
+    };
+  }
+  
+  rpc SignTransaction(SignTransactionRequest) returns (SignTransactionResponse) {
+    option (google.api.http) = {
+      post: "/v1/wallets/{wallet_id}/sign"
+      body: "*"
+    };
+  }
+
+  // Smart Contract operations
+  rpc DeployContract(DeployContractRequest) returns (DeployContractResponse) {
+    option (google.api.http) = {
+      post: "/v1/contracts"
+      body: "*"
+    };
+  }
+  
+  rpc InvokeContract(InvokeContractRequest) returns (InvokeContractResponse) {
+    option (google.api.http) = {
+      post: "/v1/contracts/{contract_id}/invoke"
+      body: "*"
+    };
+  }
+  
+  rpc GetContract(GetContractRequest) returns (Contract) {
+    option (google.api.http) = {
+      get: "/v1/contracts/{contract_id}"
+    };
+  }
+
+  // Network operations
+  rpc GetNetworkInfo(google.protobuf.Empty) returns (NetworkInfo) {
+    option (google.api.http) = {
+      get: "/v1/network/info"
+    };
+  }
+  
+  rpc GetPeers(google.protobuf.Empty) returns (GetPeersResponse) {
+    option (google.api.http) = {
+      get: "/v1/network/peers"
+    };
+  }
+  
+  rpc GetNodeHealth(google.protobuf.Empty) returns (NodeHealth) {
+    option (google.api.http) = {
+      get: "/v1/health"
+    };
+  }
+
+  // Consensus operations
+  rpc GetConsensusInfo(google.protobuf.Empty) returns (ConsensusInfo) {
+    option (google.api.http) = {
+      get: "/v1/consensus/info"
+    };
+  }
+  
+  rpc GetValidators(google.protobuf.Empty) returns (GetValidatorsResponse) {
+    option (google.api.http) = {
+      get: "/v1/consensus/validators"
+    };
+  }
+}
+
+// Message definitions
+
+message Transaction {
+  string id = 1;
+  string from = 2;
+  string to = 3;
+  double amount = 4;
+  double fee = 5;
+  string data = 6;
+  string signature = 7;
+  google.protobuf.Timestamp timestamp = 8;
+  uint64 block_height = 9;
+  TransactionStatus status = 10;
+}
+
+message TransactionStatus {
+  enum Status {
+    PENDING = 0;
+    CONFIRMED = 1;
+    FAILED = 2;
+    REJECTED = 3;
+  }
+  Status status = 1;
+  string message = 2;
+  uint64 confirmations = 3;
+  google.protobuf.Timestamp confirmed_at = 4;
+}
+
+message Block {
+  string id = 1;
+  uint64 height = 2;
+  string previous_hash = 3;
+  string merkle_root = 4;
+  google.protobuf.Timestamp timestamp = 5;
+  string validator = 6;
+  repeated Transaction transactions = 7;
+  string signature = 8;
+  uint64 size = 9;
+  uint64 transaction_count = 10;
+}
+
+message Account {
+  string id = 1;
+  string public_key = 2;
+  double balance = 3;
+  uint64 nonce = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message AccountBalance {
+  string account_id = 1;
+  double available_balance = 2;
+  double pending_balance = 3;
+  double total_balance = 4;
+  google.protobuf.Timestamp last_updated = 5;
+}
+
+message Wallet {
+  string id = 1;
+  string public_key = 2;
+  string address = 3;
+  google.protobuf.Timestamp created_at = 4;
+  bool is_active = 5;
+}
+
+message Contract {
+  string id = 1;
+  string owner = 2;
+  string code = 3;
+  string abi = 4;
+  string runtime = 5; // "wasm", "evm", "native"
+  google.protobuf.Timestamp deployed_at = 6;
+  string version = 7;
+  bool is_active = 8;
+}
+
+message NetworkInfo {
+  string network_id = 1;
+  string chain_id = 2;
+  uint64 latest_block_height = 3;
+  uint64 total_transactions = 4;
+  uint32 peer_count = 5;
+  string version = 6;
+  google.protobuf.Timestamp started_at = 7;
+}
+
+message Peer {
+  string id = 1;
+  string address = 2;
+  string version = 3;
+  uint64 latest_block = 4;
+  bool is_validator = 5;
+  google.protobuf.Timestamp connected_at = 6;
+}
+
+message NodeHealth {
+  enum HealthStatus {
+    HEALTHY = 0;
+    DEGRADED = 1;
+    UNHEALTHY = 2;
+  }
+  HealthStatus status = 1;
+  string message = 2;
+  double cpu_usage = 3;
+  double memory_usage = 4;
+  double disk_usage = 5;
+  uint32 active_connections = 6;
+  google.protobuf.Timestamp last_check = 7;
+}
+
+message ConsensusInfo {
+  string consensus_type = 1;
+  uint64 current_round = 2;
+  uint64 current_step = 3;
+  string current_proposer = 4;
+  uint32 validator_count = 5;
+  double participation_rate = 6;
+}
+
+message Validator {
+  string id = 1;
+  string public_key = 2;
+  string address = 3;
+  double voting_power = 4;
+  bool is_active = 5;
+  uint64 blocks_proposed = 6;
+  google.protobuf.Timestamp joined_at = 7;
+}
+
+// Request/Response messages
+
+message SubmitTransactionRequest {
+  string from = 1;
+  string to = 2;
+  double amount = 3;
+  double fee = 4;
+  string data = 5;
+  string signature = 6;
+}
+
+message SubmitTransactionResponse {
+  string transaction_id = 1;
+  TransactionStatus status = 2;
+  string message = 3;
+}
+
+message GetTransactionRequest {
+  string transaction_id = 1;
+}
+
+message GetTransactionsRequest {
+  string address = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+  string status = 4;
+}
+
+message GetTransactionsResponse {
+  repeated Transaction transactions = 1;
+  uint32 total_count = 2;
+  bool has_more = 3;
+}
+
+message GetTransactionStatusRequest {
+  string transaction_id = 1;
+}
+
+message GetBlockRequest {
+  string block_id = 1;
+}
+
+message GetBlocksRequest {
+  uint64 start_height = 1;
+  uint64 end_height = 2;
+  uint32 limit = 3;
+  uint32 offset = 4;
+}
+
+message GetBlocksResponse {
+  repeated Block blocks = 1;
+  uint32 total_count = 2;
+  bool has_more = 3;
+}
+
+message GetAccountRequest {
+  string account_id = 1;
+}
+
+message GetAccountBalanceRequest {
+  string account_id = 1;
+}
+
+message GetAccountTransactionsRequest {
+  string account_id = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+message GetAccountTransactionsResponse {
+  repeated Transaction transactions = 1;
+  uint32 total_count = 2;
+  bool has_more = 3;
+}
+
+message CreateWalletRequest {
+  string passphrase = 1;
+  map<string, string> metadata = 2;
+}
+
+message GetWalletRequest {
+  string wallet_id = 1;
+}
+
+message SignTransactionRequest {
+  string wallet_id = 1;
+  string transaction_data = 2;
+  string passphrase = 3;
+}
+
+message SignTransactionResponse {
+  string signed_transaction = 1;
+  string signature = 2;
+}
+
+message DeployContractRequest {
+  string owner = 1;
+  string code = 2;
+  string abi = 3;
+  string runtime = 4;
+  map<string, string> parameters = 5;
+}
+
+message DeployContractResponse {
+  string contract_id = 1;
+  string transaction_id = 2;
+  string address = 3;
+}
+
+message InvokeContractRequest {
+  string contract_id = 1;
+  string method = 2;
+  repeated string parameters = 3;
+  string caller = 4;
+}
+
+message InvokeContractResponse {
+  string transaction_id = 1;
+  string result = 2;
+  double gas_used = 3;
+}
+
+message GetContractRequest {
+  string contract_id = 1;
+}
+
+message GetPeersResponse {
+  repeated Peer peers = 1;
+  uint32 total_count = 2;
+}
+
+message GetValidatorsResponse {
+  repeated Validator validators = 1;
+  uint32 total_count = 2;
+}

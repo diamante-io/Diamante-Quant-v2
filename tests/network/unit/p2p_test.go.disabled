@@ -1,0 +1,668 @@
+
+package network_test
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/network"
+	"diamante/network/p2p"
+	"diamante/common"
+	"diamante/crypto"
+	"github.com/sirupsen/logrus"
+)
+
+// Helper function to create test crypto manager
+func createTestCryptoManager(t *testing.T) *crypto.CryptoManager {
+	logger := createTestLogger()
+	cm, err := crypto.NewCryptoManager(crypto.KyberLevel768, crypto.DilithiumLevel3, logger)
+	if err != nil {
+		t.Fatalf("Failed to create crypto manager: %v", err)
+	}
+	return cm
+}
+
+// Helper function to create test logger
+func createTestLogger() *logrus.Logger {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+	return logger
+}
+
+// TestP2PNodeBasicOperations tests basic P2P node operations
+func TestP2PNodeBasicOperations(t *testing.T) {
+	t.Run("node_creation_and_start", func(t *testing.T) {
+		config := createTestP2PConfig(t, 8001)
+		cm := createTestCryptoManager(t)
+		logger := createTestLogger()
+		node, err := p2p.NewNode(config, cm, logger)
+		if err != nil {
+			t.Fatalf("Failed to create P2P node: %v", err)
+		}
+		defer node.Stop()
+
+		err = node.Start()
+		if err != nil {
+			t.Fatalf("Failed to start P2P node: %v", err)
+		}
+
+		// Verify node is running
+		if !node.IsStarted() {
+			t.Errorf("Node should be running after start")
+		}
+
+		// Verify node info is set
+		nodeInfo := node.GetNodeInfo()
+		if nodeInfo == nil {
+			t.Errorf("Node info should be set")
+		}
+		if nodeInfo.ID == "" {
+			t.Errorf("Node ID should be set")
+		}
+		if nodeInfo.Address == "" {
+			t.Errorf("Node address should be set")
+		}
+	})
+
+	t.Run("node_stop", func(t *testing.T) {
+		config := createTestP2PConfig(t, 8002)
+		cm := createTestCryptoManager(t)
+		logger := createTestLogger()
+		node, err := p2p.NewNode(config, cm, logger)
+		if err != nil {
+			t.Fatalf("Failed to create P2P node: %v", err)
+		}
+
+		err = node.Start()
+		if err != nil {
+			t.Fatalf("Failed to start P2P node: %v", err)
+		}
+
+		// Verify node is running
+		if !node.IsStarted() {
+			t.Fatalf("Node should be running")
+		}
+
+		// Stop node
+		err = node.Stop()
+		if err != nil {
+			t.Errorf("Failed to stop node: %v", err)
+		}
+
+		// Verify node is stopped
+		if node.IsStarted() {
+			t.Errorf("Node should not be running after stop")
+		}
+	})
+}
+
+// TestP2PPeerConnection tests peer connection functionality
+func TestP2PPeerConnection(t *testing.T) {
+	t.Run("two_node_connection", func(t *testing.T) {
+		// Create two nodes
+		config1 := createTestP2PConfig(t, 8003)
+		config2 := createTestP2PConfig(t, 8004)
+		
+		cm := createTestCryptoManager(t)
+		logger := createTestLogger()
+		
+		node1, err := p2p.NewNode(config1, cm, logger)
+		if err != nil {
+			t.Fatalf("Failed to create node1: %v", err)
+		}
+		defer node1.Stop()
+
+		node2, err := p2p.NewNode(config2, cm, logger)
+		if err != nil {
+			t.Fatalf("Failed to create node2: %v", err)
+		}
+		defer node2.Stop()
+
+		// Start both nodes
+		err = node1.Start()
+		if err != nil {
+			t.Fatalf("Failed to start node1: %v", err)
+		}
+
+		err = node2.Start()
+		if err != nil {
+			t.Fatalf("Failed to start node2: %v", err)
+		}
+
+		// Connect node2 to node1
+		node1Addr := fmt.Sprintf("localhost:%d", 8003)
+		err = node2.ConnectToPeer(node1Addr)
+		if err != nil {
+			t.Fatalf("Failed to connect node2 to node1: %v", err)
+		}
+
+		// Wait for connection to establish
+		time.Sleep(2 * time.Second)
+
+		// Verify connection
+		peers1 := node1.GetPeers()
+		peers2 := node2.GetPeers()
+
+		if len(peers1) == 0 {
+			t.Errorf("Node1 should have at least one peer")
+		}
+		if len(peers2) == 0 {
+			t.Errorf("Node2 should have at least one peer")
+		}
+
+		// Verify bidirectional connection
+		node1ID := node1.GetNodeID()
+		node2ID := node2.GetNodeID()
+
+		found1 := false
+		for _, peer := range peers2 {
+			if peer.GetID() == node1ID {
+				found1 = true
+				break
+			}
+		}
+
+		found2 := false
+		for _, peer := range peers1 {
+			if peer.GetID() == node2ID {
+				found2 = true
+				break
+			}
+		}
+
+		if !found1 {
+			t.Errorf("Node2 should be connected to node1")
+		}
+		if !found2 {
+			t.Errorf("Node1 should be connected to node2")
+		}
+	})
+
+	t.Run("multiple_peer_connections", func(t *testing.T) {
+		numNodes := 5
+		nodes := make([]*p2p.Node, numNodes)
+		
+		// Create nodes
+		for i := 0; i < numNodes; i++ {
+			config := createTestP2PConfig(t, 8010+i)
+			node, err := p2p.NewNode(config)
+			if err != nil {
+				t.Fatalf("Failed to create node %d: %v", i, err)
+			}
+			nodes[i] = node
+			defer node.Stop()
+		}
+
+		ctx := context.Background()
+
+		// Start all nodes
+		for i, node := range nodes {
+			err := node.Start(ctx)
+			if err != nil {
+				t.Fatalf("Failed to start node %d: %v", i, err)
+			}
+		}
+
+		// Connect nodes in a chain (0->1->2->3->4)
+		for i := 1; i < numNodes; i++ {
+			peerAddr := fmt.Sprintf("localhost:%d", 8010+i-1)
+			err := nodes[i].ConnectToPeer(peerAddr)
+			if err != nil {
+				t.Fatalf("Failed to connect node %d to node %d: %v", i, i-1, err)
+			}
+		}
+
+		// Wait for connections
+		time.Sleep(3 * time.Second)
+
+		// Verify connections
+		for i, node := range nodes {
+			peers := node.GetPeers()
+			expectedPeers := 0
+			
+			if i > 0 {
+				expectedPeers++ // Connected to previous node
+			}
+			if i < numNodes-1 {
+				expectedPeers++ // Next node connected to this one
+			}
+
+			if len(peers) < expectedPeers {
+				t.Errorf("Node %d has %d peers, expected at least %d", 
+					i, len(peers), expectedPeers)
+			}
+		}
+	})
+}
+
+// TestP2PMessagePassing tests message passing between peers
+func TestP2PMessagePassing(t *testing.T) {
+	t.Run("direct_message_passing", func(t *testing.T) {
+		// Create two connected nodes
+		node1, node2 := createConnectedNodes(t, 8020, 8021)
+		defer node1.Stop()
+		defer node2.Stop()
+
+		// Set up message handlers
+		messages1 := make(chan *network.Message, 10)
+		messages2 := make(chan *network.Message, 10)
+
+		node1.SetMessageHandler(func(msg *network.Message) {
+			messages1 <- msg
+		})
+
+		node2.SetMessageHandler(func(msg *network.Message) {
+			messages2 <- msg
+		})
+
+		// Send message from node1 to node2
+		testMsg := &network.Message{
+			Type: "test",
+			Payload: &network.GenericPayload{
+				DataType: "test_data",
+				Data: &dtypes.GenericPayloadData{
+					Fields: map[string]*dtypes.Value{
+						"message": dtypes.StringToValue("hello from node1"),
+						"number":  dtypes.Uint64ToValue(42),
+					},
+				},
+			},
+		}
+
+		err := node1.BroadcastMessage(testMsg)
+		if err != nil {
+			t.Fatalf("Failed to broadcast message: %v", err)
+		}
+
+		// Verify message received
+		select {
+		case receivedMsg := <-messages2:
+			if receivedMsg.Type != testMsg.Type {
+				t.Errorf("Message type mismatch: got %s, want %s", 
+					receivedMsg.Type, testMsg.Type)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("Message not received within timeout")
+		}
+
+		// Send response from node2 to node1
+		responseMsg := &network.Message{
+			Type: "response",
+			Payload: &network.GenericPayload{
+				DataType: "response_data",
+				Data: &dtypes.GenericPayloadData{
+					Fields: map[string]*dtypes.Value{
+						"response": dtypes.StringToValue("hello from node2"),
+					},
+				},
+			},
+		}
+
+		err = node2.BroadcastMessage(responseMsg)
+		if err != nil {
+			t.Fatalf("Failed to broadcast response: %v", err)
+		}
+
+		// Verify response received
+		select {
+		case receivedMsg := <-messages1:
+			if receivedMsg.Type != responseMsg.Type {
+				t.Errorf("Response type mismatch: got %s, want %s", 
+					receivedMsg.Type, responseMsg.Type)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("Response not received within timeout")
+		}
+	})
+
+	t.Run("broadcast_to_multiple_peers", func(t *testing.T) {
+		// Create a network with one broadcaster and multiple receivers
+		broadcaster, err := p2p.NewNode(createTestP2PConfig(t, 8030))
+		if err != nil {
+			t.Fatalf("Failed to create broadcaster: %v", err)
+		}
+		defer broadcaster.Stop()
+
+		numReceivers := 3
+		receivers := make([]*p2p.Node, numReceivers)
+		messageChannels := make([]chan *network.Message, numReceivers)
+
+		for i := 0; i < numReceivers; i++ {
+			config := createTestP2PConfig(t, 8031+i)
+			receivers[i], err = p2p.NewNode(config)
+			if err != nil {
+				t.Fatalf("Failed to create receiver %d: %v", i, err)
+			}
+			defer receivers[i].Stop()
+
+			messageChannels[i] = make(chan *network.Message, 10)
+			
+			// Set message handler
+			func(ch chan *network.Message) {
+				receivers[i].SetMessageHandler(func(msg *network.Message) {
+					ch <- msg
+				})
+			}(messageChannels[i])
+		}
+
+		ctx := context.Background()
+
+		// Start all nodes
+		err = broadcaster.Start(ctx)
+		if err != nil {
+			t.Fatalf("Failed to start broadcaster: %v", err)
+		}
+
+		for i, receiver := range receivers {
+			err = receiver.Start(ctx)
+			if err != nil {
+				t.Fatalf("Failed to start receiver %d: %v", i, err)
+			}
+
+			// Connect to broadcaster
+			broadcasterAddr := "localhost:8030"
+			err = receiver.ConnectToPeer(broadcasterAddr)
+			if err != nil {
+				t.Fatalf("Failed to connect receiver %d: %v", i, err)
+			}
+		}
+
+		// Wait for connections
+		time.Sleep(2 * time.Second)
+
+		// Broadcast message
+		broadcastMsg := &network.Message{
+			Type: "broadcast",
+			Payload: &network.GenericPayload{
+				DataType: "broadcast_data",
+				Data: &dtypes.GenericPayloadData{
+					Fields: map[string]*dtypes.Value{
+						"message": dtypes.StringToValue("broadcast to all"),
+						"timestamp": dtypes.Uint64ToValue(uint64(time.Now().Unix())),
+					},
+				},
+			},
+		}
+
+		err = broadcaster.BroadcastMessage(broadcastMsg)
+		if err != nil {
+			t.Fatalf("Failed to broadcast message: %v", err)
+		}
+
+		// Verify all receivers got the message
+		for i := 0; i < numReceivers; i++ {
+			select {
+			case receivedMsg := <-messageChannels[i]:
+				if receivedMsg.Type != broadcastMsg.Type {
+					t.Errorf("Receiver %d got wrong message type: %s", i, receivedMsg.Type)
+				}
+			case <-time.After(5 * time.Second):
+				t.Errorf("Receiver %d didn't receive broadcast message", i)
+			}
+		}
+	})
+}
+
+// TestP2PNetworkResilience tests network resilience and recovery
+func TestP2PNetworkResilience(t *testing.T) {
+	t.Run("node_failure_and_recovery", func(t *testing.T) {
+		// Create 3 connected nodes
+		nodes := make([]*p2p.Node, 3)
+		for i := 0; i < 3; i++ {
+			config := createTestP2PConfig(t, 8040+i)
+			node, err := p2p.NewNode(config)
+			if err != nil {
+				t.Fatalf("Failed to create node %d: %v", i, err)
+			}
+			nodes[i] = node
+			defer node.Stop()
+		}
+
+		ctx := context.Background()
+
+		// Start all nodes
+		for i, node := range nodes {
+			err := node.Start(ctx)
+			if err != nil {
+				t.Fatalf("Failed to start node %d: %v", i, err)
+			}
+		}
+
+		// Connect nodes: 0 <-> 1 <-> 2
+		err := nodes[1].ConnectToPeer("localhost:8040")
+		if err != nil {
+			t.Fatalf("Failed to connect node 1 to node 0: %v", err)
+		}
+
+		err = nodes[2].ConnectToPeer("localhost:8041")
+		if err != nil {
+			t.Fatalf("Failed to connect node 2 to node 1: %v", err)
+		}
+
+		time.Sleep(2 * time.Second)
+
+		// Verify initial connectivity
+		if len(nodes[0].GetPeers()) == 0 || len(nodes[2].GetPeers()) == 0 {
+			t.Fatalf("Initial connectivity failed")
+		}
+
+		// Simulate node 1 failure
+		err = nodes[1].Stop()
+		if err != nil {
+			t.Errorf("Failed to stop node 1: %v", err)
+		}
+
+		time.Sleep(2 * time.Second)
+
+		// Verify nodes 0 and 2 detect disconnection
+		// (This would depend on the specific P2P implementation)
+
+		// Restart node 1
+		newConfig := createTestP2PConfig(t, 8041)
+		newNode1, err := p2p.NewNode(newConfig)
+		if err != nil {
+			t.Fatalf("Failed to create new node 1: %v", err)
+		}
+		defer newNode1.Stop()
+
+		err = newNode1.Start(ctx)
+		if err != nil {
+			t.Fatalf("Failed to restart node 1: %v", err)
+		}
+
+		// Reconnect
+		err = newNode1.ConnectToPeer("localhost:8040")
+		if err != nil {
+			t.Errorf("Failed to reconnect to node 0: %v", err)
+		}
+
+		err = nodes[2].ConnectToPeer("localhost:8041")
+		if err != nil {
+			t.Errorf("Failed to reconnect node 2 to node 1: %v", err)
+		}
+
+		time.Sleep(2 * time.Second)
+
+		// Verify recovery
+		if len(newNode1.GetPeers()) == 0 {
+			t.Errorf("Node 1 failed to recover connections")
+		}
+	})
+
+	t.Run("partition_tolerance", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("Skipping partition tolerance test in short mode")
+		}
+
+		// Create a larger network to test partition tolerance
+		numNodes := 6
+		nodes := make([]*p2p.Node, numNodes)
+
+		for i := 0; i < numNodes; i++ {
+			config := createTestP2PConfig(t, 8050+i)
+			node, err := p2p.NewNode(config)
+			if err != nil {
+				t.Fatalf("Failed to create node %d: %v", i, err)
+			}
+			nodes[i] = node
+			defer node.Stop()
+		}
+
+		ctx := context.Background()
+
+		// Start all nodes
+		for i, node := range nodes {
+			err := node.Start(ctx)
+			if err != nil {
+				t.Fatalf("Failed to start node %d: %v", i, err)
+			}
+		}
+
+		// Create connections to form a mesh network
+		for i := 0; i < numNodes; i++ {
+			for j := i + 1; j < numNodes && j < i+3; j++ {
+				peerAddr := fmt.Sprintf("localhost:%d", 8050+j)
+				err := nodes[i].ConnectToPeer(peerAddr)
+				if err != nil {
+					t.Logf("Warning: Failed to connect node %d to %d: %v", i, j, err)
+				}
+			}
+		}
+
+		time.Sleep(5 * time.Second)
+
+		// Verify initial mesh connectivity
+		totalConnections := 0
+		for i, node := range nodes {
+			peers := node.GetPeers()
+			totalConnections += len(peers)
+			t.Logf("Node %d has %d peers", i, len(peers))
+		}
+
+		if totalConnections == 0 {
+			t.Fatalf("No connections established in mesh network")
+		}
+
+		t.Logf("Total connections in network: %d", totalConnections/2) // Each connection counted twice
+	})
+}
+
+// TestP2PMessageValidation tests message validation and security
+func TestP2PMessageValidation(t *testing.T) {
+	t.Run("reject_invalid_messages", func(t *testing.T) {
+		node1, node2 := createConnectedNodes(t, 8060, 8061)
+		defer node1.Stop()
+		defer node2.Stop()
+
+		invalidMessages := make(chan *network.Message, 10)
+		validMessages := make(chan *network.Message, 10)
+
+		// Set up validation handler
+		node2.SetMessageHandler(func(msg *network.Message) {
+			if msg.Type == "" {
+				invalidMessages <- msg
+			} else {
+				validMessages <- msg
+			}
+		})
+
+		// Test cases for message validation
+		testMessages := []*network.Message{
+			{
+				Type: "valid_message",
+				Payload: &network.GenericPayload{
+					DataType: "test",
+					Data: &dtypes.GenericPayloadData{
+						Fields: map[string]*dtypes.Value{
+							"data": dtypes.StringToValue("valid"),
+						},
+					},
+				},
+			},
+			{
+				Type: "", // Invalid: empty type
+				Payload: &network.GenericPayload{
+					DataType: "test",
+				},
+			},
+			{
+				Type:    "valid_but_nil_payload",
+				Payload: nil, // Invalid: nil payload
+			},
+		}
+
+		for i, msg := range testMessages {
+			err := node1.BroadcastMessage(msg)
+			// Some messages might be rejected at send time
+			if err != nil {
+				t.Logf("Message %d rejected at send: %v", i, err)
+				continue
+			}
+
+			// Wait for message processing
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Check results
+		select {
+		case <-validMessages:
+			t.Logf("Valid message received correctly")
+		case <-time.After(1 * time.Second):
+			t.Errorf("Valid message not received")
+		}
+	})
+}
+
+// Helper functions
+
+func createTestP2PConfig(t *testing.T, port int) *p2p.NodeConfig {
+	return &p2p.NodeConfig{
+		ListenAddress:    fmt.Sprintf("localhost:%d", port),
+		MaxPeers:         10,
+		HandshakeTimeout: 10 * time.Second,
+		EnableTLS:        false, // Disable for testing
+		NodeID:           fmt.Sprintf("test_node_%d", port),
+	}
+}
+
+func createConnectedNodes(t *testing.T, port1, port2 int) (*p2p.Node, *p2p.Node) {
+	config1 := createTestP2PConfig(t, port1)
+	config2 := createTestP2PConfig(t, port2)
+
+	node1, err := p2p.NewNode(config1)
+	if err != nil {
+		t.Fatalf("Failed to create node1: %v", err)
+	}
+
+	node2, err := p2p.NewNode(config2)
+	if err != nil {
+		t.Fatalf("Failed to create node2: %v", err)
+	}
+
+	ctx := context.Background()
+
+	err = node1.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start node1: %v", err)
+	}
+
+	err = node2.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start node2: %v", err)
+	}
+
+	// Connect nodes
+	node1Addr := fmt.Sprintf("localhost:%d", port1)
+	err = node2.ConnectToPeer(node1Addr)
+	if err != nil {
+		t.Fatalf("Failed to connect nodes: %v", err)
+	}
+
+	// Wait for connection
+	time.Sleep(1 * time.Second)
+
+	return node1, node2
+}

@@ -1,6 +1,6 @@
-// consensus/diamantefinality/finality/gossip.go
+// consensus/diamantefinality/gossip.go
 
-package finality
+package diamantefinality
 
 import (
 	"context"

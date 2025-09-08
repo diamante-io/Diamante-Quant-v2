@@ -1,6 +1,6 @@
-// consensus/diamantefinality/finality/voting.go
+// consensus/diamantefinality/voting.go
 
-package finality
+package diamantefinality
 
 import (
 	"diamante/consensus/types"
@@ -15,7 +15,7 @@ import (
 
 var (
 	// ErrInvalidThreshold indicates an invalid voting threshold
-	ErrInvalidThreshold = errors.New("invalid voting threshold: must be between 0.0 and 1.0")
+	ErrInvalidThreshold = errors.New("invalid voting threshold: must be between 0 and 100")
 
 	// ErrNilDAG indicates the DAG reference is nil
 	ErrNilDAG = errors.New("nil DAG reference in VirtualVoting")
@@ -29,8 +29,8 @@ var (
 // up to an event created by that validator. If enough stake "has seen" the event,
 // it is considered voted for finality.
 type VirtualVoting struct {
-	dag       *DAG    // Reference to the DAG
-	threshold float64 // Fraction of total stake required for a successful vote
+	dag       *DAG   // Reference to the DAG
+	threshold uint32 // Percentage of total stake required for a successful vote (0-100)
 	mu        sync.RWMutex
 	logger    *log.Logger // Logger for structured logging
 }
@@ -43,7 +43,7 @@ func NewVirtualVoting(dag *DAG) *VirtualVoting {
 
 	return &VirtualVoting{
 		dag:       dag,
-		threshold: 0.66,
+		threshold: 66, // 66% as integer percentage
 		logger:    logger,
 	}
 }
@@ -55,30 +55,30 @@ func (v *VirtualVoting) SetLogger(logger *log.Logger) {
 	v.logger = logger
 }
 
-// SetThreshold updates the fraction of total stake needed for an event to pass the vote.
-// Returns an error if threshold is invalid (outside 0.0-1.0 range).
+// SetThreshold updates the percentage of total stake needed for an event to pass the vote.
+// Returns an error if threshold is invalid (outside 0-100 range).
 func (v *VirtualVoting) SetThreshold(threshold float64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 
 	// Add validation but handle error internally
-	if threshold <= 0 || threshold > 1.0 {
+	if threshold <= 0 || threshold > 100 {
 		// Log the error instead of returning it
 		if v.logger != nil {
-			v.logger.Printf("Invalid threshold value: %v (must be between 0 and 1)", threshold)
+			v.logger.Printf("Invalid threshold value: %v (must be between 0 and 100)", threshold)
 		}
 		// Use a default value or keep current value
 		return
 	}
 
-	v.threshold = threshold
+	v.threshold = uint32(threshold)
 	if v.logger != nil {
-		v.logger.Printf("Threshold updated to %v", threshold)
+		v.logger.Printf("Threshold updated to %v%%", threshold)
 	}
 }
 
 // GetThreshold returns the current voting threshold
-func (v *VirtualVoting) GetThreshold() float64 {
+func (v *VirtualVoting) GetThreshold() uint32 {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 	return v.threshold
@@ -118,11 +118,12 @@ func (v *VirtualVoting) Vote(event *types.Event) bool {
 		return false
 	}
 
-	requiredStake := float64(totalStake) * threshold
-	accumulatedStake := float64(0)
+	// Use integer arithmetic: requiredStake = (totalStake * threshold) / 100
+	requiredStake := (totalStake * uint64(threshold)) / 100
+	accumulatedStake := uint64(0)
 
 	// Performance optimization: if threshold is 0, vote always passes
-	if threshold <= 0.0 {
+	if threshold == 0 {
 		if v.logger != nil {
 			v.logger.Printf("Vote always passes: threshold is %v", threshold)
 		}
@@ -146,7 +147,7 @@ func (v *VirtualVoting) Vote(event *types.Event) bool {
 	// First check the creator's own stake (optimization)
 	creatorStake, err := v.dag.GetNodeStake(event.Creator)
 	if err == nil {
-		accumulatedStake += float64(creatorStake)
+		accumulatedStake += creatorStake
 		nodeVotes[event.Creator] = true
 		nodeStakes[event.Creator] = creatorStake
 
@@ -180,7 +181,7 @@ func (v *VirtualVoting) Vote(event *types.Event) bool {
 			}
 
 			nodeStakes[nodeID] = stake
-			accumulatedStake += float64(stake)
+			accumulatedStake += stake
 
 			if accumulatedStake >= requiredStake {
 				// Before returning success, check for suspicious voting patterns
@@ -216,10 +217,10 @@ func (v *VirtualVoting) detectSuspiciousVoting(event *types.Event, votes map[[32
 
 	// Check for unusual voting patterns where validators with similar stake amounts
 	// vote the same way (potential collusion)
-	sameVoteSamples := make(map[bool]float64)
+	sameVoteSamples := make(map[bool]uint64)
 	for nodeID, vote := range votes {
 		stake := stakes[nodeID]
-		sameVoteSamples[vote] += float64(stake)
+		sameVoteSamples[vote] += stake
 	}
 
 	// If all votes are the same, that's suspicious with many validators
@@ -243,12 +244,14 @@ func (v *VirtualVoting) detectSuspiciousVoting(event *types.Event, votes map[[32
 	// High inequality might suggest centralization or Sybil attacks
 	gini := calculateGiniCoefficient(stakeValues)
 
-	// A very high Gini coefficient (close to 1) suggests high stake concentration
-	return gini > 0.9
+	// A very high Gini coefficient (close to 1000) suggests high stake concentration
+	// Using fixed point: 0.9 = 900/1000
+	return gini > 900
 }
 
 // Calculate Gini coefficient to measure inequality in stake distribution
-func calculateGiniCoefficient(values []uint64) float64 {
+// Returns fixed-point result scaled by 1000 (0.9 = 900)
+func calculateGiniCoefficient(values []uint64) uint64 {
 	n := len(values)
 	if n <= 1 {
 		return 0
@@ -271,10 +274,20 @@ func calculateGiniCoefficient(values []uint64) float64 {
 	for _, v := range values {
 		sum += v
 	}
-	mean := float64(sum) / float64(n)
 
-	// Gini coefficient
-	return float64(sumAbsDiff) / (2 * float64(n*n) * mean)
+	// Calculate Gini coefficient using fixed-point arithmetic
+	// Gini = sumAbsDiff / (2 * n * n * mean)
+	// Scale by 1000 to get fixed-point result
+	if sum == 0 {
+		return 0
+	}
+
+	denominator := 2 * uint64(n*n) * sum / uint64(n) // 2 * n * n * mean
+	if denominator == 0 {
+		return 0
+	}
+
+	return (sumAbsDiff * 1000) / denominator
 }
 
 // HasSeen checks if validatorID has created an ancestor event of 'event' in the DAG.
@@ -370,13 +383,13 @@ func (v *VirtualVoting) GetConsensusEvents(height uint64) []*types.Event {
 	return consensusEvents
 }
 
-// GetState serializes the current threshold (float64) into JSON.
+// GetState serializes the current threshold (uint32) into JSON.
 func (v *VirtualVoting) GetState() ([]byte, error) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
 	state := struct {
-		Threshold float64 `json:"threshold"`
+		Threshold uint32 `json:"threshold"`
 	}{
 		Threshold: v.threshold,
 	}
@@ -392,7 +405,7 @@ func (v *VirtualVoting) GetState() ([]byte, error) {
 	return data, nil
 }
 
-// RestoreState loads a threshold float64 from JSON into this VirtualVoting instance.
+// RestoreState loads a threshold uint32 from JSON into this VirtualVoting instance.
 func (v *VirtualVoting) RestoreState(stateData []byte) error {
 	// Safety check
 	if len(stateData) == 0 {
@@ -400,7 +413,7 @@ func (v *VirtualVoting) RestoreState(stateData []byte) error {
 	}
 
 	var state struct {
-		Threshold float64 `json:"threshold"`
+		Threshold uint32 `json:"threshold"`
 	}
 
 	if err := json.Unmarshal(stateData, &state); err != nil {
@@ -411,7 +424,7 @@ func (v *VirtualVoting) RestoreState(stateData []byte) error {
 	}
 
 	// Validate threshold
-	if state.Threshold <= 0.0 || state.Threshold > 1.0 {
+	if state.Threshold == 0 || state.Threshold > 100 {
 		return ErrInvalidThreshold
 	}
 
@@ -420,7 +433,7 @@ func (v *VirtualVoting) RestoreState(stateData []byte) error {
 	v.threshold = state.Threshold
 
 	if v.logger != nil {
-		v.logger.Printf("Threshold restored to %v", state.Threshold)
+		v.logger.Printf("Threshold restored to %v%%", state.Threshold)
 	}
 
 	return nil
@@ -435,7 +448,7 @@ func (v *VirtualVoting) Validate() error {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
 
-	if v.threshold <= 0.0 || v.threshold > 1.0 {
+	if v.threshold == 0 || v.threshold > 100 {
 		return ErrInvalidThreshold
 	}
 

@@ -1,6 +1,6 @@
-// consensus/diamantefinality/finality/finalize.go
+// consensus/diamantefinality/finalize.go
 
-package finality
+package diamantefinality
 
 import (
 	"diamante/consensus/types"

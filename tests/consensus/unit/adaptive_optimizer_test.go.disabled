@@ -1,0 +1,268 @@
+package consensus_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAdaptiveOptimizer(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.AdaptiveOptimizerConfig{
+			OptimizationInterval:   time.Second,
+			MetricsWindowSize:      100,
+			OptimizationThreshold:  0.1,
+			EnableAutoOptimization: true,
+		}
+
+		optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+		require.NotNil(t, optimizer)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := optimizer.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = optimizer.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("Record Metrics", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveOptimizerConfig()
+		optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := optimizer.Start(ctx)
+		require.NoError(t, err)
+
+		// Record some metrics
+		for i := 0; i < 10; i++ {
+			optimizer.RecordTransactionLatency(time.Duration(i) * time.Millisecond)
+			optimizer.RecordBlockTime(time.Duration(i*100) * time.Millisecond)
+			optimizer.RecordResourceUsage(0.5 + float64(i)*0.01)
+		}
+
+		// Get stats
+		stats := optimizer.GetStats()
+		assert.NotNil(t, stats)
+		assert.Greater(t, stats.MetricsRecorded, uint64(0))
+		assert.Greater(t, stats.WindowSize, 0)
+	})
+
+	t.Run("Optimization Decision", func(t *testing.T) {
+		config := &consensus.AdaptiveOptimizerConfig{
+			OptimizationInterval:   100 * time.Millisecond,
+			MetricsWindowSize:      10,
+			OptimizationThreshold:  0.1,
+			EnableAutoOptimization: true,
+		}
+
+		optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := optimizer.Start(ctx)
+		require.NoError(t, err)
+
+		// Record metrics that should trigger optimization
+		for i := 0; i < 20; i++ {
+			optimizer.RecordTransactionLatency(time.Duration(100+i*10) * time.Millisecond)
+			optimizer.RecordBlockTime(time.Duration(1000+i*100) * time.Millisecond)
+			optimizer.RecordResourceUsage(0.8 + float64(i)*0.01)
+		}
+
+		// Wait for optimization
+		time.Sleep(200 * time.Millisecond)
+
+		stats := optimizer.GetStats()
+		assert.Greater(t, stats.OptimizationsTriggered, uint64(0))
+	})
+
+	t.Run("Get Recommendations", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveOptimizerConfig()
+		optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := optimizer.Start(ctx)
+		require.NoError(t, err)
+
+		// Record varied metrics
+		for i := 0; i < 50; i++ {
+			if i%2 == 0 {
+				optimizer.RecordTransactionLatency(50 * time.Millisecond)
+			} else {
+				optimizer.RecordTransactionLatency(150 * time.Millisecond)
+			}
+			optimizer.RecordBlockTime(time.Duration(500+i*10) * time.Millisecond)
+			optimizer.RecordResourceUsage(0.3 + float64(i%10)*0.05)
+		}
+
+		recommendations := optimizer.GetRecommendations()
+		assert.NotNil(t, recommendations)
+		assert.NotEmpty(t, recommendations)
+
+		// Check recommendation structure
+		for _, rec := range recommendations {
+			assert.NotEmpty(t, rec.Parameter)
+			assert.NotEmpty(t, rec.Reason)
+			assert.True(t, rec.Priority >= 1 && rec.Priority <= 3)
+		}
+	})
+
+	t.Run("Manual Trigger", func(t *testing.T) {
+		config := &consensus.AdaptiveOptimizerConfig{
+			OptimizationInterval:   time.Hour, // Long interval
+			MetricsWindowSize:      100,
+			OptimizationThreshold:  0.1,
+			EnableAutoOptimization: false,
+		}
+
+		optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := optimizer.Start(ctx)
+		require.NoError(t, err)
+
+		// Record metrics
+		for i := 0; i < 10; i++ {
+			optimizer.RecordTransactionLatency(100 * time.Millisecond)
+		}
+
+		// Manually trigger optimization
+		optimizer.TriggerOptimization()
+
+		// Check it was triggered
+		stats := optimizer.GetStats()
+		assert.Equal(t, uint64(1), stats.OptimizationsTriggered)
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveOptimizerConfig()
+		optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := optimizer.Start(ctx)
+		require.NoError(t, err)
+
+		// Record some metrics
+		optimizer.RecordTransactionLatency(50 * time.Millisecond)
+
+		// Stop
+		err = optimizer.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = optimizer.Stop()
+		assert.Error(t, err)
+	})
+}
+
+func TestAdaptiveOptimizerStats(t *testing.T) {
+	t.Run("Stats Structure", func(t *testing.T) {
+		stats := &types.AdaptiveOptimizerStats{
+			LastOptimization:       time.Now(),
+			OptimizationsTriggered: 10,
+			MetricsRecorded:        1000,
+			WindowSize:             100,
+			CurrentMetrics: types.OptimizationMetrics{
+				AvgTransactionLatency: 50 * time.Millisecond,
+				AvgBlockTime:          500 * time.Millisecond,
+				AvgResourceUsage:      0.65,
+				ThroughputTPS:         1000,
+			},
+		}
+
+		assert.Equal(t, uint64(10), stats.OptimizationsTriggered)
+		assert.Equal(t, uint64(1000), stats.MetricsRecorded)
+		assert.Equal(t, 100, stats.WindowSize)
+		assert.Equal(t, 50*time.Millisecond, stats.CurrentMetrics.AvgTransactionLatency)
+		assert.Equal(t, float64(1000), stats.CurrentMetrics.ThroughputTPS)
+	})
+}
+
+func TestOptimizationRecommendation(t *testing.T) {
+	t.Run("Recommendation Fields", func(t *testing.T) {
+		rec := consensus.OptimizationRecommendation{
+			Parameter:    "block_size",
+			CurrentValue: "1000",
+			Recommended:  "2000",
+			Reason:       "High transaction volume detected",
+			Impact:       "Increase throughput by 50%",
+			Priority:     2,
+		}
+
+		assert.Equal(t, "block_size", rec.Parameter)
+		assert.Equal(t, "1000", rec.CurrentValue)
+		assert.Equal(t, "2000", rec.Recommended)
+		assert.NotEmpty(t, rec.Reason)
+		assert.NotEmpty(t, rec.Impact)
+		assert.Equal(t, 2, rec.Priority)
+	})
+}
+
+func BenchmarkAdaptiveOptimizer(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := consensus.DefaultAdaptiveOptimizerConfig()
+	optimizer := consensus.NewAdaptiveOptimizer(config, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	optimizer.Start(ctx)
+
+	b.Run("RecordTransactionLatency", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			optimizer.RecordTransactionLatency(time.Duration(i%100) * time.Millisecond)
+		}
+	})
+
+	b.Run("RecordBlockTime", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			optimizer.RecordBlockTime(time.Duration(i%1000) * time.Millisecond)
+		}
+	})
+
+	b.Run("RecordResourceUsage", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			optimizer.RecordResourceUsage(float64(i%100) / 100.0)
+		}
+	})
+
+	b.Run("GetRecommendations", func(b *testing.B) {
+		// Pre-populate with metrics
+		for i := 0; i < 1000; i++ {
+			optimizer.RecordTransactionLatency(time.Duration(i%100) * time.Millisecond)
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			optimizer.GetRecommendations()
+		}
+	})
+}

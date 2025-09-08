@@ -1,0 +1,522 @@
+// Package optimization provides typed memory pool implementations
+package optimization
+
+import (
+	"fmt"
+	"sync"
+	"time"
+	
+	"diamante/consensus"
+	"diamante/types"
+	"github.com/sirupsen/logrus"
+)
+
+// PoolableObject interface for objects that can be pooled
+type PoolableObject interface {
+	// Reset prepares the object for reuse
+	Reset()
+	
+	// Validate checks if the object is valid for reuse
+	Validate() bool
+	
+	// GetSize returns the size of the object in bytes
+	GetSize() uint64
+}
+
+// TypedMemoryPool is a generic memory pool for typed objects
+type TypedMemoryPool[T PoolableObject] struct {
+	// Configuration
+	config *types.MemoryPoolConfig
+	logger *logrus.Logger
+	
+	// Pool state
+	pool      chan T
+	allocated uint64
+	inUse     uint64
+	mu        sync.RWMutex
+	
+	// Factory function
+	factory func() T
+	
+	// Statistics
+	stats *types.MemoryPoolStats
+}
+
+// NewTypedMemoryPool creates a new typed memory pool
+func NewTypedMemoryPool[T PoolableObject](config *types.MemoryPoolConfig, factory func() T, logger *logrus.Logger) *TypedMemoryPool[T] {
+	if logger == nil {
+		logger = logrus.New()
+	}
+	
+	poolSize := config.MaxSize / config.BlockSize
+	if poolSize == 0 {
+		poolSize = 100 // Default pool size
+	}
+	
+	pool := &TypedMemoryPool[T]{
+		config:  config,
+		logger:  logger,
+		pool:    make(chan T, poolSize),
+		factory: factory,
+		stats: &types.MemoryPoolStats{
+			TotalSize:     config.MaxSize,
+			UsedSize:      0,
+			FreeSize:      config.MaxSize,
+			ItemCount:     0,
+			Allocations:   0,
+			Deallocations: 0,
+			Compactions:   0,
+		},
+	}
+	
+	// Pre-allocate some objects
+	initialSize := int(poolSize / 4) // Pre-allocate 25%
+	for i := 0; i < initialSize; i++ {
+		obj := factory()
+		pool.pool <- obj
+		pool.allocated++
+	}
+	
+	return pool
+}
+
+// Get retrieves an object from the pool
+func (p *TypedMemoryPool[T]) Get() (T, error) {
+	select {
+	case obj := <-p.pool:
+		// Got object from pool
+		if obj.Validate() {
+			p.mu.Lock()
+			p.inUse++
+			p.stats.Allocations++
+			p.updateStats()
+			p.mu.Unlock()
+			
+			return obj, nil
+		}
+		// Object invalid, create new one
+		p.logger.Debug("Invalid object in pool, creating new one")
+		
+	default:
+		// Pool empty, check if we can allocate more
+		p.mu.RLock()
+		canAllocate := p.stats.UsedSize < p.config.MaxSize
+		p.mu.RUnlock()
+		
+		if !canAllocate {
+			var zero T
+			return zero, fmt.Errorf("memory pool exhausted")
+		}
+	}
+	
+	// Create new object
+	obj := p.factory()
+	
+	p.mu.Lock()
+	p.allocated++
+	p.inUse++
+	p.stats.Allocations++
+	p.updateStats()
+	p.mu.Unlock()
+	
+	return obj, nil
+}
+
+// Put returns an object to the pool
+func (p *TypedMemoryPool[T]) Put(obj T) {
+	if obj == nil {
+		return
+	}
+	
+	// Reset the object
+	obj.Reset()
+	
+	// Validate before returning to pool
+	if !obj.Validate() {
+		p.logger.Debug("Object failed validation, not returning to pool")
+		p.mu.Lock()
+		p.inUse--
+		p.allocated--
+		p.updateStats()
+		p.mu.Unlock()
+		return
+	}
+	
+	select {
+	case p.pool <- obj:
+		// Successfully returned to pool
+		p.mu.Lock()
+		p.inUse--
+		p.stats.Deallocations++
+		p.updateStats()
+		p.mu.Unlock()
+		
+	default:
+		// Pool full, discard object
+		p.logger.Debug("Pool full, discarding object")
+		p.mu.Lock()
+		p.inUse--
+		p.allocated--
+		p.updateStats()
+		p.mu.Unlock()
+	}
+}
+
+// GetStats returns pool statistics
+func (p *TypedMemoryPool[T]) GetStats() *types.MemoryPoolStats {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	stats := *p.stats
+	return &stats
+}
+
+// Compact performs pool compaction
+func (p *TypedMemoryPool[T]) Compact() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	// Remove excess objects from pool
+	targetSize := int(p.config.MaxSize/p.config.BlockSize) / 2
+	removed := 0
+	
+	for len(p.pool) > targetSize {
+		select {
+		case <-p.pool:
+			p.allocated--
+			removed++
+		default:
+			break
+		}
+	}
+	
+	if removed > 0 {
+		p.stats.Compactions++
+		p.updateStats()
+		p.logger.WithField("removed", removed).Debug("Compacted memory pool")
+	}
+}
+
+// updateStats updates pool statistics
+func (p *TypedMemoryPool[T]) updateStats() {
+	// Calculate sizes
+	p.stats.ItemCount = p.allocated
+	p.stats.UsedSize = p.inUse * p.config.BlockSize
+	p.stats.FreeSize = p.config.MaxSize - p.stats.UsedSize
+	
+	// Calculate fragmentation ratio
+	if p.allocated > 0 {
+		p.stats.FragmentationRatio = float64(p.allocated-p.inUse) / float64(p.allocated)
+	}
+}
+
+// Specific pool implementations for common types
+
+// StorageValuePool is a pool for StorageValue objects
+type StorageValuePool struct {
+	*TypedMemoryPool[*PoolableStorageValue]
+}
+
+// PoolableStorageValue wraps StorageValue with poolable interface
+type PoolableStorageValue struct {
+	*types.StorageValue
+	size uint64
+}
+
+// Reset prepares the storage value for reuse
+func (v *PoolableStorageValue) Reset() {
+	v.StorageValue = &types.StorageValue{
+		Key:      nil,
+		Data:     nil,
+		Metadata: nil,
+	}
+}
+
+// Validate checks if the storage value is valid
+func (v *PoolableStorageValue) Validate() bool {
+	return v.StorageValue != nil
+}
+
+// GetSize returns the size of the storage value
+func (v *PoolableStorageValue) GetSize() uint64 {
+	if v.size == 0 && v.StorageValue != nil && v.StorageValue.Data != nil {
+		v.size = uint64(len(v.StorageValue.Data))
+	}
+	return v.size
+}
+
+// NewStorageValuePool creates a pool for storage values
+func NewStorageValuePool(config *types.MemoryPoolConfig, logger *logrus.Logger) *StorageValuePool {
+	factory := func() *PoolableStorageValue {
+		return &PoolableStorageValue{
+			StorageValue: &types.StorageValue{},
+		}
+	}
+	
+	return &StorageValuePool{
+		TypedMemoryPool: NewTypedMemoryPool(config, factory, logger),
+	}
+}
+
+// CacheEntryPool is a pool for cache entries
+type CacheEntryPool struct {
+	*TypedMemoryPool[*PoolableCacheEntry]
+}
+
+// PoolableCacheEntry wraps CacheEntry with poolable interface
+type PoolableCacheEntry struct {
+	*types.CacheEntry
+}
+
+// Reset prepares the cache entry for reuse
+func (e *PoolableCacheEntry) Reset() {
+	e.CacheEntry = &types.CacheEntry{
+		Key:       "",
+		Value:     nil,
+		EntryType: 0,
+		Timestamp: 0,
+		TTL:       0,
+		Height:    0,
+	}
+}
+
+// Validate checks if the cache entry is valid
+func (e *PoolableCacheEntry) Validate() bool {
+	return e.CacheEntry != nil
+}
+
+// GetSize returns the size of the cache entry
+func (e *PoolableCacheEntry) GetSize() uint64 {
+	if e.CacheEntry != nil && e.CacheEntry.Value != nil {
+		return uint64(len(e.CacheEntry.Value))
+	}
+	return 0
+}
+
+// NewCacheEntryPool creates a pool for cache entries
+func NewCacheEntryPool(config *types.MemoryPoolConfig, logger *logrus.Logger) *CacheEntryPool {
+	factory := func() *PoolableCacheEntry {
+		return &PoolableCacheEntry{
+			CacheEntry: &types.CacheEntry{},
+		}
+	}
+	
+	return &CacheEntryPool{
+		TypedMemoryPool: NewTypedMemoryPool(config, factory, logger),
+	}
+}
+
+// ConnectionPool manages database connections
+type ConnectionPool[T any] struct {
+	// Configuration
+	maxSize      int
+	minSize      int
+	idleTimeout  time.Duration
+	logger       *logrus.Logger
+	
+	// Pool state
+	connections  chan *PooledConnection[T]
+	activeCount  int32
+	mu           sync.RWMutex
+	
+	// Factory and validator
+	factory   func() (T, error)
+	validator func(T) bool
+	closer    func(T) error
+}
+
+// PooledConnection wraps a connection with metadata
+type PooledConnection[T any] struct {
+	conn      T
+	createdAt time.Time
+	lastUsed  time.Time
+	useCount  uint64
+}
+
+// NewConnectionPool creates a new connection pool
+func NewConnectionPool[T any](
+	minSize, maxSize int,
+	idleTimeout time.Duration,
+	factory func() (T, error),
+	validator func(T) bool,
+	closer func(T) error,
+	logger *logrus.Logger,
+) (*ConnectionPool[T], error) {
+	if logger == nil {
+		logger = logrus.New()
+	}
+	
+	pool := &ConnectionPool[T]{
+		maxSize:     maxSize,
+		minSize:     minSize,
+		idleTimeout: idleTimeout,
+		logger:      logger,
+		connections: make(chan *PooledConnection[T], maxSize),
+		factory:     factory,
+		validator:   validator,
+		closer:      closer,
+	}
+	
+	// Pre-create minimum connections
+	for i := 0; i < minSize; i++ {
+		conn, err := factory()
+		if err != nil {
+			return nil, fmt.Errorf("failed to create initial connection: %w", err)
+		}
+		
+		pooledConn := &PooledConnection[T]{
+			conn:      conn,
+			createdAt: consensus.ConsensusNow(),
+			lastUsed:  consensus.ConsensusNow(),
+			useCount:  0,
+		}
+		
+		pool.connections <- pooledConn
+		pool.activeCount++
+	}
+	
+	// Start idle connection reaper
+	go pool.reapIdleConnections()
+	
+	return pool, nil
+}
+
+// Get retrieves a connection from the pool
+func (p *ConnectionPool[T]) Get() (T, error) {
+	select {
+	case pooledConn := <-p.connections:
+		// Validate connection
+		if p.validator(pooledConn.conn) {
+			pooledConn.lastUsed = consensus.ConsensusNow()
+			pooledConn.useCount++
+			return pooledConn.conn, nil
+		}
+		
+		// Connection invalid, close it
+		if err := p.closer(pooledConn.conn); err != nil {
+			p.logger.WithError(err).Error("Failed to close invalid connection")
+		}
+		
+		p.mu.Lock()
+		p.activeCount--
+		p.mu.Unlock()
+		
+	default:
+		// No connections available
+		p.mu.RLock()
+		canCreate := int(p.activeCount) < p.maxSize
+		p.mu.RUnlock()
+		
+		if !canCreate {
+			var zero T
+			return zero, fmt.Errorf("connection pool exhausted")
+		}
+	}
+	
+	// Create new connection
+	conn, err := p.factory()
+	if err != nil {
+		var zero T
+		return zero, fmt.Errorf("failed to create connection: %w", err)
+	}
+	
+	p.mu.Lock()
+	p.activeCount++
+	p.mu.Unlock()
+	
+	return conn, nil
+}
+
+// Put returns a connection to the pool
+func (p *ConnectionPool[T]) Put(conn T) {
+	if !p.validator(conn) {
+		// Invalid connection, close it
+		if err := p.closer(conn); err != nil {
+			p.logger.WithError(err).Error("Failed to close invalid connection")
+		}
+		
+		p.mu.Lock()
+		p.activeCount--
+		p.mu.Unlock()
+		return
+	}
+	
+	pooledConn := &PooledConnection[T]{
+		conn:     conn,
+		lastUsed: consensus.ConsensusNow(),
+	}
+	
+	select {
+	case p.connections <- pooledConn:
+		// Successfully returned to pool
+	default:
+		// Pool full, close connection
+		if err := p.closer(conn); err != nil {
+			p.logger.WithError(err).Error("Failed to close excess connection")
+		}
+		
+		p.mu.Lock()
+		p.activeCount--
+		p.mu.Unlock()
+	}
+}
+
+// reapIdleConnections removes idle connections
+func (p *ConnectionPool[T]) reapIdleConnections() {
+	ticker := time.NewTicker(p.idleTimeout / 2)
+	defer ticker.Stop()
+	
+	for range ticker.C {
+		p.mu.RLock()
+		shouldReap := int(p.activeCount) > p.minSize
+		p.mu.RUnlock()
+		
+		if !shouldReap {
+			continue
+		}
+		
+		// Check for idle connections
+		now := consensus.ConsensusNow()
+		var toReap []*PooledConnection[T]
+		
+		// Temporarily collect connections
+		var active []*PooledConnection[T]
+		timeout := time.After(100 * time.Millisecond)
+		
+	collect:
+		for {
+			select {
+			case conn := <-p.connections:
+				if now.Sub(conn.lastUsed) > p.idleTimeout {
+					toReap = append(toReap, conn)
+				} else {
+					active = append(active, conn)
+				}
+			case <-timeout:
+				break collect
+			default:
+				break collect
+			}
+		}
+		
+		// Return active connections
+		for _, conn := range active {
+			p.connections <- conn
+		}
+		
+		// Close idle connections
+		for _, conn := range toReap {
+			if err := p.closer(conn.conn); err != nil {
+				p.logger.WithError(err).Error("Failed to close idle connection")
+			}
+			
+			p.mu.Lock()
+			p.activeCount--
+			p.mu.Unlock()
+		}
+		
+		if len(toReap) > 0 {
+			p.logger.WithField("count", len(toReap)).Debug("Reaped idle connections")
+		}
+	}
+}

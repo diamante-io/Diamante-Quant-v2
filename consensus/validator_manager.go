@@ -3,13 +3,16 @@
 package consensus
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
+	"sort"
 	"sync"
 	"time"
 
 	"diamante/consensus/types"
+	dtypes "diamante/types"
 )
 
 // ValidatorStatus represents the current status of a validator
@@ -108,13 +111,14 @@ func (vm *ValidatorManager) AddValidator(id [32]byte, stake uint64) error {
 	}
 
 	// Create new validator info with more detailed initialization
+	consensusTime := ConsensusNow()
 	validator := &ValidatorInfo{
 		ID:             id,
 		Stake:          stake,
 		Status:         ValidatorStatusInactive, // Start as inactive
 		Performance:    1.0,                     // Start with perfect performance
-		LastRewardTime: time.Now(),
-		JoinTime:       time.Now(),
+		LastRewardTime: consensusTime,
+		JoinTime:       consensusTime,
 	}
 
 	// Add to validators map
@@ -129,10 +133,10 @@ func (vm *ValidatorManager) AddValidator(id [32]byte, stake uint64) error {
 	vm.updateActiveValidators()
 
 	vm.hc.logger.Info("Validator added",
-		"id", fmt.Sprintf("%x", id),
-		"stake", stake,
-		"totalValidators", len(vm.validators),
-		"activeValidators", len(vm.activeValidators))
+		ValidatorIDField(id),
+		IntField("stake", int(stake)),
+		IntField("totalValidators", len(vm.validators)),
+		IntField("activeValidators", len(vm.activeValidators)))
 
 	return nil
 }
@@ -186,9 +190,9 @@ func (vm *ValidatorManager) UpdateStake(id [32]byte, newStake uint64) error {
 	vm.updateActiveValidators()
 
 	vm.hc.logger.Info("Validator stake updated",
-		"id", fmt.Sprintf("%x", id),
-		"oldStake", oldStake,
-		"newStake", newStake)
+		ValidatorIDField(id),
+		IntField("oldStake", int(oldStake)),
+		IntField("newStake", int(newStake)))
 
 	return nil
 }
@@ -240,8 +244,8 @@ func (vm *ValidatorManager) ActivateValidator(id [32]byte) error {
 	vm.updateActiveValidators()
 
 	vm.hc.logger.Info("Validator activated",
-		"id", fmt.Sprintf("%x", id),
-		"activeValidators", len(vm.activeValidators))
+		ValidatorIDField(id),
+		IntField("activeValidators", len(vm.activeValidators)))
 
 	return nil
 }
@@ -273,8 +277,8 @@ func (vm *ValidatorManager) DeactivateValidator(id [32]byte) error {
 	vm.updateActiveValidators()
 
 	vm.hc.logger.Info("Validator deactivated",
-		"id", fmt.Sprintf("%x", id),
-		"activeValidators", len(vm.activeValidators))
+		ValidatorIDField(id),
+		IntField("activeValidators", len(vm.activeValidators)))
 
 	return nil
 }
@@ -325,12 +329,12 @@ func (vm *ValidatorManager) SlashValidator(id [32]byte, slashAmount uint64, reas
 	vm.updateActiveValidators()
 
 	vm.hc.logger.Info("Validator slashed",
-		"id", fmt.Sprintf("%x", id),
-		"slashAmount", slashAmount,
-		"oldStake", oldStake,
-		"newStake", validator.Stake,
-		"reason", reason,
-		"misbehaviorCount", validator.MisbehaviorCount)
+		ValidatorIDField(id),
+		IntField("slashAmount", int(slashAmount)),
+		IntField("oldStake", int(oldStake)),
+		IntField("newStake", int(validator.Stake)),
+		LogField{Key: "reason", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(reason))},
+		IntField("misbehaviorCount", int(validator.MisbehaviorCount)))
 
 	return nil
 }
@@ -363,10 +367,10 @@ func (vm *ValidatorManager) JailValidator(id [32]byte, reason string) error {
 	vm.updateActiveValidators()
 
 	vm.hc.logger.Info("Validator jailed",
-		"id", fmt.Sprintf("%x", id),
-		"reason", reason,
-		"misbehaviorCount", validator.MisbehaviorCount,
-		"activeValidators", len(vm.activeValidators))
+		ValidatorIDField(id),
+		LogField{Key: "reason", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(reason))},
+		IntField("misbehaviorCount", int(validator.MisbehaviorCount)),
+		IntField("activeValidators", len(vm.activeValidators)))
 
 	return nil
 }
@@ -400,8 +404,8 @@ func (vm *ValidatorManager) UnjailValidator(id [32]byte) error {
 	validator.Status = ValidatorStatusInactive
 
 	vm.hc.logger.Info("Validator unjailed",
-		"id", fmt.Sprintf("%x", id),
-		"misbehaviorCount", validator.MisbehaviorCount)
+		ValidatorIDField(id),
+		IntField("misbehaviorCount", int(validator.MisbehaviorCount)))
 
 	return nil
 }
@@ -432,10 +436,10 @@ func (vm *ValidatorManager) RewardBlockProduction(id [32]byte, blockHeight uint6
 	vm.hc.dpos.RewardValidator(id)
 
 	vm.hc.logger.Info("Validator rewarded for block production",
-		"id", fmt.Sprintf("%x", id),
-		"blockHeight", blockHeight,
-		"blocksProduced", validator.BlocksProduced,
-		"performance", validator.Performance)
+		ValidatorIDField(id),
+		BlockHeightField(blockHeight),
+		IntField("blocksProduced", int(validator.BlocksProduced)),
+		Float64Field("performance", validator.Performance))
 
 	return nil
 }
@@ -463,10 +467,10 @@ func (vm *ValidatorManager) RewardEventFinalization(id [32]byte, eventHeight uin
 	vm.updateValidatorPerformance(validator)
 
 	vm.hc.logger.Info("Validator rewarded for event finalization",
-		"id", fmt.Sprintf("%x", id),
-		"eventHeight", eventHeight,
-		"eventsFinalized", validator.EventsFinalized,
-		"performance", validator.Performance)
+		ValidatorIDField(id),
+		BlockHeightField(eventHeight),
+		IntField("eventsFinalized", int(validator.EventsFinalized)),
+		Float64Field("performance", validator.Performance))
 
 	return nil
 }
@@ -477,8 +481,8 @@ func (vm *ValidatorManager) updateValidatorPerformance(validator *ValidatorInfo)
 	defer vm.performanceMu.Unlock()
 
 	// Calculate time since last update
-	now := time.Now()
-	hoursSinceLastUpdate := now.Sub(validator.LastRewardTime).Hours()
+	consensusTime := ConsensusNow()
+	hoursSinceLastUpdate := consensusTime.Sub(validator.LastRewardTime).Hours()
 
 	// Apply time-based decay
 	if hoursSinceLastUpdate > 0 {
@@ -493,7 +497,7 @@ func (vm *ValidatorManager) updateValidatorPerformance(validator *ValidatorInfo)
 	validator.Performance = math.Max(vm.minPerformance, math.Min(validator.Performance, vm.maxPerformance))
 
 	// Update last reward time
-	validator.LastRewardTime = now
+	validator.LastRewardTime = consensusTime
 }
 
 // updateActiveValidators updates the list of active validators
@@ -502,8 +506,21 @@ func (vm *ValidatorManager) updateActiveValidators() {
 	vm.activeValidators = nil
 	vm.activeTotalStake = 0
 
-	// Add active validators to the list
-	for _, validator := range vm.validators {
+	// IMPORTANT: Sort validator IDs first to ensure deterministic iteration order
+	// This prevents different nodes from building different active validator lists
+	var validatorIDs [][32]byte
+	for id := range vm.validators {
+		validatorIDs = append(validatorIDs, id)
+	}
+
+	// Sort validator IDs deterministically
+	sort.Slice(validatorIDs, func(i, j int) bool {
+		return bytes.Compare(validatorIDs[i][:], validatorIDs[j][:]) < 0
+	})
+
+	// Add active validators to the list in deterministic order
+	for _, id := range validatorIDs {
+		validator := vm.validators[id]
 		if validator.Status == ValidatorStatusActive {
 			vm.activeValidators = append(vm.activeValidators, validator)
 			vm.activeTotalStake += validator.Stake
@@ -530,10 +547,25 @@ func (vm *ValidatorManager) updateActiveValidators() {
 func sortValidatorsByScore(validators []*ValidatorInfo) {
 	for i := 0; i < len(validators); i++ {
 		for j := i + 1; j < len(validators); j++ {
-			scoreI := float64(validators[i].Stake) * validators[i].Performance
-			scoreJ := float64(validators[j].Stake) * validators[j].Performance
-			if scoreJ > scoreI {
+			// Use fixed-point math for deterministic scoring
+			stakeI := NewFixedPointFromUint64(validators[i].Stake, DefaultPrecision)
+			perfI := NewFixedPointFromRatio(uint64(validators[i].Performance*1000000), 1000000, DefaultPrecision)
+			scoreI := stakeI.Mul(perfI)
+
+			stakeJ := NewFixedPointFromUint64(validators[j].Stake, DefaultPrecision)
+			perfJ := NewFixedPointFromRatio(uint64(validators[j].Performance*1000000), 1000000, DefaultPrecision)
+			scoreJ := stakeJ.Mul(perfJ)
+
+			// Compare scores first
+			cmp := scoreJ.Compare(scoreI)
+			if cmp > 0 {
 				validators[i], validators[j] = validators[j], validators[i]
+			} else if cmp == 0 {
+				// If scores are equal, use validator ID as deterministic tie-breaker
+				// This ensures the same ordering across all nodes
+				if bytes.Compare(validators[j].ID[:], validators[i].ID[:]) < 0 {
+					validators[i], validators[j] = validators[j], validators[i]
+				}
 			}
 		}
 	}
@@ -569,11 +601,11 @@ func (vm *ValidatorManager) ProcessEpoch(blockHeight uint64) error {
 	vm.lastRewardHeight = blockHeight
 
 	vm.hc.logger.Info("Processed validator epoch",
-		"blockHeight", blockHeight,
-		"epoch", epoch,
-		"activeValidators", len(vm.activeValidators),
-		"totalStake", vm.totalStake,
-		"activeTotalStake", vm.activeTotalStake)
+		BlockHeightField(blockHeight),
+		IntField("epoch", int(epoch)),
+		IntField("activeValidators", len(vm.activeValidators)),
+		IntField("totalStake", int(vm.totalStake)),
+		IntField("activeTotalStake", int(vm.activeTotalStake)))
 
 	return nil
 }
@@ -590,18 +622,26 @@ func (vm *ValidatorManager) distributeEpochRewards(epoch uint64) {
 
 	// Distribute rewards to active validators
 	for _, validator := range vm.activeValidators {
-		// Calculate reward based on stake proportion and performance
-		stakeRatio := float64(validator.Stake) / float64(vm.activeTotalStake)
+		// Calculate reward based on stake proportion and performance using fixed-point math
+		stakeRatio := NewFixedPointFromRatio(validator.Stake, vm.activeTotalStake, DefaultPrecision)
 
 		// Calculate block production component
-		blockComponent := vm.blockRewardWeight * stakeRatio * float64(validator.BlocksProduced)
+		blockRewardWeightFP := NewFixedPointFromRatio(uint64(vm.blockRewardWeight*1000000), 1000000, DefaultPrecision)
+		blockComponentFP := blockRewardWeightFP.Mul(stakeRatio).MulUint64(uint64(validator.BlocksProduced))
 
 		// Calculate event finalization component
-		eventComponent := vm.eventRewardWeight * stakeRatio * float64(validator.EventsFinalized)
+		eventRewardWeightFP := NewFixedPointFromRatio(uint64(vm.eventRewardWeight*1000000), 1000000, DefaultPrecision)
+		eventComponentFP := eventRewardWeightFP.Mul(stakeRatio).MulUint64(uint64(validator.EventsFinalized))
 
 		// Calculate total reward for this validator (proportion of total epoch reward)
-		validatorRewardRatio := (blockComponent + eventComponent) / float64(len(vm.activeValidators))
-		reward := uint64(float64(totalReward) * validatorRewardRatio)
+		totalComponentFP := blockComponentFP.Add(eventComponentFP)
+		activeValidatorCountFP := NewFixedPointFromUint64(uint64(len(vm.activeValidators)), DefaultPrecision)
+		validatorRewardRatioFP := totalComponentFP.Div(activeValidatorCountFP)
+
+		// Calculate final reward amount
+		totalRewardFP := NewFixedPointFromUint64(totalReward, DefaultPrecision)
+		rewardFP := totalRewardFP.Mul(validatorRewardRatioFP)
+		reward := rewardFP.ToUint64()
 
 		// Apply reward
 		oldStake := validator.Stake
@@ -614,11 +654,11 @@ func (vm *ValidatorManager) distributeEpochRewards(epoch uint64) {
 		validator.EventsFinalized = 0
 
 		vm.hc.logger.Info("Epoch reward distributed",
-			"validator", fmt.Sprintf("%x", validator.ID),
-			"oldStake", oldStake,
-			"reward", reward,
-			"newStake", validator.Stake,
-			"performance", validator.Performance)
+			ValidatorIDField(validator.ID),
+			IntField("oldStake", int(oldStake)),
+			IntField("reward", int(reward)),
+			IntField("newStake", int(validator.Stake)),
+			Float64Field("performance", validator.Performance))
 	}
 }
 
@@ -627,10 +667,10 @@ func (vm *ValidatorManager) decayAllValidatorPerformance() {
 	vm.performanceMu.Lock()
 	defer vm.performanceMu.Unlock()
 
-	now := time.Now()
+	consensusTime := ConsensusNow()
 	for _, validator := range vm.validators {
 		// Calculate time since last update
-		hoursSinceLastUpdate := now.Sub(validator.LastRewardTime).Hours()
+		hoursSinceLastUpdate := consensusTime.Sub(validator.LastRewardTime).Hours()
 
 		// Apply time-based decay
 		if hoursSinceLastUpdate > 0 {
@@ -641,12 +681,12 @@ func (vm *ValidatorManager) decayAllValidatorPerformance() {
 			// Clamp performance to valid range
 			validator.Performance = math.Max(vm.minPerformance, math.Min(validator.Performance, vm.maxPerformance))
 
-			validator.LastRewardTime = now
+			validator.LastRewardTime = consensusTime
 
 			vm.hc.logger.Info("Validator performance decayed",
-				"validator", fmt.Sprintf("%x", validator.ID),
-				"oldPerformance", oldPerformance,
-				"newPerformance", validator.Performance)
+				ValidatorIDField(validator.ID),
+				Float64Field("oldPerformance", oldPerformance),
+				Float64Field("newPerformance", validator.Performance))
 		}
 	}
 }
@@ -708,7 +748,39 @@ func (vm *ValidatorManager) GetActiveTotalStake() uint64 {
 
 // GetNextValidator returns the next validator for block production
 func (vm *ValidatorManager) GetNextValidator(blockNumber uint64, lastBlockHash [32]byte) *types.Validator {
-	// Delegate to DPoS for now
+	// Check if single-node mode is enabled
+	if vm.hc != nil && vm.hc.singleNodeMode {
+		// In single-node mode, always return the current validator
+		vm.validatorsMu.RLock()
+		defer vm.validatorsMu.RUnlock()
+
+		// Get the current validator ID
+		currentID := vm.hc.GetCurrentValidatorIDBytes()
+		if currentID == nil {
+			vm.hc.logger.Error("No current validator ID configured in single-node mode")
+			return nil
+		}
+
+		// Find and return the current validator
+		if validator, exists := vm.validators[*currentID]; exists {
+			vm.hc.logger.Info("Single-node mode: returning current validator",
+				LogField{Key: "validatorID", Value: dtypes.NewValue(dtypes.ValueTypeBytes, currentID[:])},
+				BlockHeightField(blockNumber))
+			return &types.Validator{
+				ID:    validator.ID,
+				Stake: validator.Stake,
+			}
+		}
+
+		// If not found in validator set, create a temporary validator
+		vm.hc.logger.Warn("Current validator not in validator set, creating temporary validator for single-node mode")
+		return &types.Validator{
+			ID:    *currentID,
+			Stake: 100000, // Default stake
+		}
+	}
+
+	// Normal mode: delegate to DPoS
 	return vm.hc.dpos.GetNextValidator(blockNumber, lastBlockHash)
 }
 
@@ -765,8 +837,17 @@ func (vm *ValidatorManager) GetState() ([]byte, error) {
 		LastRewardHeight:     vm.lastRewardHeight,
 	}
 
-	// Add validators
-	for id, validator := range vm.validators {
+	// Add validators - sort by ID for deterministic iteration
+	var validatorIDs [][32]byte
+	for id := range vm.validators {
+		validatorIDs = append(validatorIDs, id)
+	}
+	sort.Slice(validatorIDs, func(i, j int) bool {
+		return bytes.Compare(validatorIDs[i][:], validatorIDs[j][:]) < 0
+	})
+
+	for _, id := range validatorIDs {
+		validator := vm.validators[id]
 		idStr := fmt.Sprintf("%x", id)
 		s.Validators[idStr] = validatorState{
 			ID:               idStr,
@@ -839,9 +920,16 @@ func (vm *ValidatorManager) RestoreState(data []byte) error {
 		).WithContext("error", err.Error())
 	}
 
-	// Restore validators
+	// Restore validators - sort keys for deterministic iteration
 	vm.validators = make(map[[32]byte]*ValidatorInfo)
-	for idStr, valState := range s.Validators {
+	var validatorKeys []string
+	for idStr := range s.Validators {
+		validatorKeys = append(validatorKeys, idStr)
+	}
+	sort.Strings(validatorKeys)
+
+	for _, idStr := range validatorKeys {
+		valState := s.Validators[idStr]
 		var id [32]byte
 		if _, err := fmt.Sscanf(idStr, "%x", &id); err != nil {
 			return NewConsensusError(
@@ -894,18 +982,34 @@ func (vm *ValidatorManager) RestoreState(data []byte) error {
 	return nil
 }
 
-// calculateEpochReward calculates the total reward for an epoch
-// This is a placeholder implementation that can be replaced with a more sophisticated model
+// calculateEpochReward calculates the total reward for an epoch.
+//
+// The production formula halves the reward every `halvingPeriod` epochs
+// but never drops below `minEpochReward` to maintain an incentive floor.
+// This mirrors how many Proof-of-Stake networks gradually reduce
+// issuance over time while keeping a minimum payout.
 func calculateEpochReward(epoch uint64) uint64 {
-	// Base reward
-	baseReward := uint64(1000000)
+	const (
+		baseEpochReward = uint64(1_000_000) // starting reward per epoch
+		halvingPeriod   = uint64(100)       // epochs between reward halvings
+		minEpochReward  = uint64(1_000)     // minimum reward floor
+	)
 
-	// Decay factor (reduces rewards over time)
-	decayFactor := 1.0
-	if epoch > 0 {
-		decayFactor = math.Pow(0.9999, float64(epoch))
+	// Determine how many halvings have occurred
+	halvings := epoch / halvingPeriod
+
+	// Use fixed-point math to calculate reward after halvings
+	// Start with base reward
+	reward := baseEpochReward
+
+	// Apply halvings by dividing by 2 for each halving
+	for i := uint64(0); i < halvings && reward > minEpochReward; i++ {
+		reward = reward / 2
+		if reward < minEpochReward {
+			reward = minEpochReward
+			break
+		}
 	}
 
-	// Calculate final reward
-	return uint64(float64(baseReward) * decayFactor)
+	return reward
 }

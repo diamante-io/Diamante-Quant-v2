@@ -1,0 +1,486 @@
+// Package runtime provides tests for production readiness features
+package runtime
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestProductionFeatures tests all production readiness enhancements
+func TestProductionFeatures(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	// Create a production-ready registry
+	registry := createProductionRegistry(t, logger)
+
+	t.Run("metrics integration", func(t *testing.T) {
+		// Register a runtime
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test-metrics", healthy: true}
+		}
+
+		err := registry.RegisterRuntime("test-metrics", factory)
+		assert.NoError(t, err)
+
+		// Verify metrics were updated
+		assert.NotNil(t, registry.metrics)
+
+		// Perform operations to generate metrics
+		_, err = registry.GetRuntimeFactory("test-metrics")
+		assert.NoError(t, err)
+
+		registry.HasCapability("test-metrics", CapabilitySmartContracts)
+
+		// Cleanup
+		err = registry.UnregisterRuntime("test-metrics")
+		assert.NoError(t, err)
+	})
+
+	t.Run("circuit breaker protection", func(t *testing.T) {
+		// Register a runtime
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test-cb", healthy: false}
+		}
+
+		err := registry.RegisterRuntime("test-cb", factory)
+		assert.NoError(t, err)
+
+		// Simulate failures to trigger circuit breaker
+		runtime, _ := registry.CreateRuntime("test-cb")
+
+		// Perform multiple health checks that will fail
+		for i := 0; i < 6; i++ {
+			_ = registry.HealthCheck("test-cb", runtime)
+		}
+
+		// Circuit should now be open
+		breaker := registry.circuitBreakers.GetBreaker("test-cb")
+		assert.Equal(t, CircuitOpen, breaker.GetState())
+
+		// Cleanup
+		_ = registry.UnregisterRuntime("test-cb")
+	})
+
+	t.Run("config schema validation", func(t *testing.T) {
+		// Test EVM config validation
+		validEVMConfig := map[string]interface{}{
+			"blockHeight": uint64(0),
+			"chainId":     "1337",
+			"gasLimit":    uint64(30000000),
+		}
+
+		err := registry.configValidator.ValidateConfig(RuntimeTypeEVM, validEVMConfig)
+		assert.NoError(t, err)
+
+		// Test invalid config
+		invalidEVMConfig := map[string]interface{}{
+			"blockHeight": "not a number", // Should be integer
+			"chainId":     "1337",
+			"gasLimit":    uint64(30000000),
+		}
+
+		err = registry.configValidator.ValidateConfig(RuntimeTypeEVM, invalidEVMConfig)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "expected integer")
+	})
+
+	t.Run("audit logging", func(t *testing.T) {
+		// Ensure audit logger is initialized
+		assert.NotNil(t, registry.auditLogger)
+
+		// Perform operations that generate audit logs
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test-audit", healthy: true}
+		}
+
+		err := registry.RegisterRuntime("test-audit", factory)
+		assert.NoError(t, err)
+
+		// Query audit logs
+		criteria := AuditQueryCriteria{
+			Actions: []AuditAction{AuditActionRegisterRuntime},
+		}
+
+		_, err = registry.auditLogger.Query(criteria)
+		assert.NoError(t, err)
+		// Note: Entries might be empty due to buffering
+
+		// Cleanup
+		_ = registry.UnregisterRuntime("test-audit")
+	})
+
+	t.Run("lifecycle hooks", func(t *testing.T) {
+		// Track hook executions
+		hookExecuted := false
+
+		// Register a custom hook
+		err := registry.lifecycleManager.RegisterHook(
+			"test-lifecycle",
+			StagePreRegister,
+			NamedHook{
+				Name:     "TestHook",
+				Priority: 50,
+				Timeout:  1 * time.Second,
+				Hook: func(ctx context.Context, runtime Runtime, metadata interface{}) error {
+					hookExecuted = true
+					return nil
+				},
+			},
+		)
+		assert.NoError(t, err)
+
+		// Register runtime (should trigger hook)
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test-lifecycle", healthy: true}
+		}
+
+		err = registry.RegisterRuntime("test-lifecycle", factory)
+		assert.NoError(t, err)
+
+		// Verify hook was executed
+		assert.True(t, hookExecuted)
+
+		// Cleanup
+		_ = registry.UnregisterRuntime("test-lifecycle")
+	})
+
+	t.Run("full integration", func(t *testing.T) {
+		// Test all features working together
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test-full", healthy: true}
+		}
+
+		// Register with full production features
+		err := registry.RegisterRuntime("test-full", factory)
+		assert.NoError(t, err)
+
+		// Register metadata
+		metadata := RuntimeMetadata{
+			Name:    "Full Test Runtime",
+			Version: "1.0.0",
+			Capabilities: []RuntimeCapability{
+				CapabilitySmartContracts,
+				CapabilityStateManagement,
+			},
+		}
+		err = registry.RegisterMetadata("test-full", metadata)
+		assert.NoError(t, err)
+
+		// Validate config
+		config := RuntimeConfig{
+			ChainID:         "test-chain",
+			LedgerAPI:       &mockLedgerAPI{},
+			StateStore:      &mockStateStore{},
+			RuntimeSpecific: map[string]interface{}{
+				// Runtime-specific config would go here
+			},
+		}
+
+		err = registry.ValidateConfig("test-full", config)
+		assert.NoError(t, err)
+
+		// Create runtime instance
+		runtime, err := registry.CreateRuntime("test-full")
+		assert.NoError(t, err)
+		assert.NotNil(t, runtime)
+
+		// Health check
+		err = registry.HealthCheck("test-full", runtime)
+		assert.NoError(t, err)
+
+		// Get stats
+		stats := registry.GetRegistryStats()
+		assert.Equal(t, 1, stats["total_runtimes"])
+		assert.Equal(t, 1, stats["total_metadata"])
+
+		// Cleanup
+		err = registry.UnregisterRuntime("test-full")
+		assert.NoError(t, err)
+	})
+}
+
+// createProductionRegistry creates a registry with all production features
+func createProductionRegistry(t *testing.T, logger *logrus.Logger) *RuntimeRegistry {
+	// Create audit logger with test-friendly config
+	auditLogger, err := NewAuditLogger(AuditLoggerConfig{
+		LogDir:        t.TempDir(), // Use temp dir for tests
+		BufferSize:    100,
+		FlushSize:     10,
+		FlushInterval: 1 * time.Second,
+		Retention:     24 * time.Hour,
+	})
+	require.NoError(t, err)
+
+	// Create registry with all production features
+	registry := &RuntimeRegistry{
+		runtimes:        make(map[RuntimeType]RuntimeFactory),
+		metadata:        make(map[RuntimeType]RuntimeMetadata),
+		capabilities:    make(map[RuntimeType]map[RuntimeCapability]bool),
+		initOrder:       make([]RuntimeType, 0),
+		validationRules: make(map[RuntimeType]ValidationRule),
+		healthChecks:    make(map[RuntimeType]HealthCheckFunc),
+		logger:          logger,
+
+		// Production enhancements
+		metrics: NewRegistryMetrics(),
+		circuitBreakers: NewRuntimeCircuitBreakers(CircuitBreakerConfig{
+			MaxFailures:      5,
+			ResetTimeout:     1 * time.Second, // Short for tests
+			HalfOpenRequests: 3,
+		}),
+		configValidator:  NewConfigValidator(),
+		auditLogger:      auditLogger,
+		lifecycleManager: NewLifecycleManager(logger, auditLogger),
+	}
+
+	// Register config schemas
+	registry.configValidator.RegisterSchema(RuntimeTypeEVM, CreateEVMConfigSchema())
+	registry.configValidator.RegisterSchema(RuntimeTypeNative, CreateNativeConfigSchema())
+	registry.configValidator.RegisterSchema(RuntimeTypeChaincode, CreateChaincodeConfigSchema())
+
+	// Register global lifecycle hooks
+	registry.lifecycleManager.RegisterGlobalHook(StagePreInitialize, NewHealthCheckHook())
+	registry.lifecycleManager.RegisterGlobalHook(StagePostRegister, NewMetricsHook(registry.metrics))
+
+	return registry
+}
+
+// TestCircuitBreakerResilience tests circuit breaker recovery
+func TestCircuitBreakerResilience(t *testing.T) {
+	config := CircuitBreakerConfig{
+		MaxFailures:      3,
+		ResetTimeout:     100 * time.Millisecond,
+		HalfOpenRequests: 2,
+	}
+
+	cb := NewCircuitBreaker("test", config)
+
+	// Cause failures to open circuit
+	for i := 0; i < 3; i++ {
+		err := cb.Call(func() error {
+			return assert.AnError
+		})
+		assert.Error(t, err)
+	}
+
+	// Circuit should be open
+	assert.Equal(t, CircuitOpen, cb.GetState())
+
+	// Calls should be rejected
+	err := cb.Call(func() error {
+		return nil
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "circuit breaker is open")
+
+	// Wait for reset timeout
+	time.Sleep(150 * time.Millisecond)
+
+	// Circuit should transition to half-open
+	successCount := 0
+	for i := 0; i < 2; i++ {
+		err := cb.Call(func() error {
+			successCount++
+			return nil
+		})
+		assert.NoError(t, err)
+	}
+
+	// Circuit should be closed after successful calls
+	assert.Equal(t, CircuitClosed, cb.GetState())
+	assert.Equal(t, 2, successCount)
+}
+
+// TestConfigValidationEdgeCases tests config validation edge cases
+func TestConfigValidationEdgeCases(t *testing.T) {
+	validator := NewConfigValidator()
+
+	// Register a complex schema
+	schema := &ConfigSchema{
+		Name:    "Complex Runtime",
+		Version: "1.0.0",
+		Properties: map[string]PropertyDefinition{
+			"nested": {
+				Type:     TypeObject,
+				Required: true,
+				Properties: map[string]PropertyDefinition{
+					"field1": {
+						Type:     TypeString,
+						Required: true,
+						Pattern:  "^[A-Z]+$",
+					},
+					"field2": {
+						Type:     TypeInteger,
+						Required: true,
+						MinValue: func() *float64 { v := 10.0; return &v }(),
+						MaxValue: func() *float64 { v := 100.0; return &v }(),
+					},
+				},
+			},
+			"array": {
+				Type: TypeArray,
+				Items: &PropertyDefinition{
+					Type:      TypeString,
+					MinLength: func() *int { v := 3; return &v }(),
+				},
+			},
+		},
+	}
+
+	err := validator.RegisterSchema("complex", schema)
+	assert.NoError(t, err)
+
+	// Test valid config
+	validConfig := map[string]interface{}{
+		"nested": map[string]interface{}{
+			"field1": "HELLO",
+			"field2": 50,
+		},
+		"array": []interface{}{"abc", "def", "ghi"},
+	}
+
+	err = validator.ValidateConfig("complex", validConfig)
+	assert.NoError(t, err)
+
+	// Test various invalid configs
+	tests := []struct {
+		name   string
+		config map[string]interface{}
+		errMsg string
+	}{
+		{
+			name: "missing required field",
+			config: map[string]interface{}{
+				"array": []interface{}{"abc"},
+			},
+			errMsg: "required field is missing",
+		},
+		{
+			name: "invalid pattern",
+			config: map[string]interface{}{
+				"nested": map[string]interface{}{
+					"field1": "lowercase",
+					"field2": 50,
+				},
+			},
+			errMsg: "does not match pattern",
+		},
+		{
+			name: "out of range",
+			config: map[string]interface{}{
+				"nested": map[string]interface{}{
+					"field1": "HELLO",
+					"field2": 200,
+				},
+			},
+			errMsg: "must not exceed",
+		},
+		{
+			name: "array item too short",
+			config: map[string]interface{}{
+				"nested": map[string]interface{}{
+					"field1": "HELLO",
+					"field2": 50,
+				},
+				"array": []interface{}{"ab"},
+			},
+			errMsg: "string length must be at least",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validator.ValidateConfig("complex", tt.config)
+			assert.Error(t, err)
+			assert.Contains(t, err.Error(), tt.errMsg)
+		})
+	}
+}
+
+// TestAuditLogRetention tests audit log retention
+func TestAuditLogRetention(t *testing.T) {
+	// This test is conceptual since we can't easily test file cleanup
+	// in a unit test environment
+
+	logDir := t.TempDir()
+
+	config := AuditLoggerConfig{
+		LogDir:        logDir,
+		BufferSize:    10,
+		FlushSize:     5,
+		FlushInterval: 100 * time.Millisecond,
+		Retention:     1 * time.Second, // Very short for testing
+	}
+
+	auditLogger, err := NewAuditLogger(config)
+	require.NoError(t, err)
+	defer auditLogger.Close()
+
+	// Log some entries
+	for i := 0; i < 10; i++ {
+		auditLogger.LogEntry(AuditEntry{
+			Action:   AuditActionRegisterRuntime,
+			Severity: AuditSeverityInfo,
+			Success:  true,
+		})
+	}
+
+	// Force flush
+	time.Sleep(200 * time.Millisecond)
+}
+
+// TestLifecycleHookPriority tests hook execution order
+func TestLifecycleHookPriority(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	manager := NewLifecycleManager(logger, nil)
+
+	executionOrder := []string{}
+
+	// Register hooks with different priorities
+	hooks := []struct {
+		name     string
+		priority int
+	}{
+		{"third", 30},
+		{"first", 10},
+		{"second", 20},
+	}
+
+	for _, h := range hooks {
+		hookName := h.name // Capture in closure
+		err := manager.RegisterHook(
+			"test",
+			StagePreStart,
+			NamedHook{
+				Name:     hookName,
+				Priority: h.priority,
+				Hook: func(ctx context.Context, runtime Runtime, metadata interface{}) error {
+					executionOrder = append(executionOrder, hookName)
+					return nil
+				},
+			},
+		)
+		assert.NoError(t, err)
+	}
+
+	// Execute hooks
+	runtime := &mockRuntime{runtimeType: "test", healthy: true}
+	results := manager.ExecuteHooks(context.Background(), runtime, StagePreStart, nil)
+
+	// Verify execution order
+	assert.Equal(t, 3, len(results))
+	assert.Equal(t, []string{"first", "second", "third"}, executionOrder)
+
+	// Verify all succeeded
+	for _, result := range results {
+		assert.True(t, result.Success)
+	}
+}

@@ -1,0 +1,520 @@
+// Package consensus_test provides unit tests for the validator manager
+package consensus_test
+
+import (
+	"encoding/hex"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestValidatorManagerCreation tests the creation of ValidatorManager
+func TestValidatorManagerCreation(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm, "ValidatorManager should not be nil")
+
+	// Verify initial state
+	validators := vm.GetValidators()
+	assert.NotNil(t, validators, "Validators list should not be nil")
+
+	activeValidators := vm.GetActiveValidators()
+	assert.NotNil(t, activeValidators, "Active validators list should not be nil")
+}
+
+// TestAddValidatorViaManager tests adding validators through ValidatorManager
+func TestAddValidatorViaManager(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Generate test validators
+	validator1 := generateValidatorID(1)
+	validator2 := generateValidatorID(2)
+	validator3 := generateValidatorID(3)
+
+	// Add validators with different stakes
+	stakes := []struct {
+		id    [32]byte
+		stake uint64
+	}{
+		{validator1, 1000000},
+		{validator2, 2000000},
+		{validator3, 3000000},
+	}
+
+	for _, v := range stakes {
+		err := vm.AddValidator(v.id, v.stake)
+		assert.NoError(t, err, "Adding validator should not error")
+	}
+
+	// Verify all validators were added
+	validators := vm.GetValidators()
+	assert.GreaterOrEqual(t, len(validators), len(stakes), "Should have all validators")
+
+	// Verify stakes are correct
+	for _, expected := range stakes {
+		found := false
+		for _, v := range validators {
+			if v.ID == expected.id {
+				found = true
+				assert.Equal(t, expected.stake, v.Stake, "Stake should match")
+				break
+			}
+		}
+		assert.True(t, found, "Validator should be found")
+	}
+}
+
+// TestUpdateStakeViaManager tests updating validator stake through ValidatorManager
+func TestUpdateStakeViaManager(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	initialStake := uint64(1000000)
+	err := vm.AddValidator(validatorID, initialStake)
+	require.NoError(t, err)
+
+	// Update stake
+	newStake := uint64(5000000)
+	err = vm.UpdateStake(validatorID, newStake)
+	assert.NoError(t, err, "Updating stake should not error")
+
+	// Verify stake was updated
+	validators := vm.GetValidators()
+	found := false
+	for _, v := range validators {
+		if v.ID == validatorID {
+			found = true
+			assert.Equal(t, newStake, v.Stake, "Stake should be updated")
+			break
+		}
+	}
+	assert.True(t, found, "Validator should be found after update")
+}
+
+// TestIsActiveValidator tests checking if a validator is active
+func TestIsActiveValidator(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add validators with different stakes
+	activeValidator := generateValidatorID(1)
+	inactiveValidator := generateValidatorID(2)
+	nonExistentValidator := generateValidatorID(999)
+
+	// Add active validator with high stake
+	err := vm.AddValidator(activeValidator, 10000000)
+	require.NoError(t, err)
+
+	// Activate the high stake validator
+	err = vm.ActivateValidator(activeValidator)
+	require.NoError(t, err)
+
+	// Add inactive validator with low stake
+	err = vm.AddValidator(inactiveValidator, 100)
+	require.NoError(t, err)
+
+	// Check active status
+	assert.True(t, vm.IsActiveValidator(activeValidator), "High stake validator should be active")
+
+	// Non-existent validator should not be active
+	assert.False(t, vm.IsActiveValidator(nonExistentValidator), "Non-existent validator should not be active")
+}
+
+// TestGetTotalStake tests calculating total stake
+func TestGetTotalStake(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add validators with known stakes
+	stakes := []uint64{1000000, 2000000, 3000000, 4000000}
+	expectedTotal := uint64(0)
+
+	for i, stake := range stakes {
+		validatorID := generateValidatorID(i)
+		err := vm.AddValidator(validatorID, stake)
+		require.NoError(t, err)
+		expectedTotal += stake
+	}
+
+	// Get total stake
+	totalStake := vm.GetTotalStake()
+	assert.Equal(t, expectedTotal, totalStake, "Total stake should match sum of individual stakes")
+}
+
+// TestGetNextValidator tests validator selection for block production
+func TestGetNextValidator(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add multiple validators
+	validators := make([][32]byte, 5)
+	for i := range validators {
+		validators[i] = generateValidatorID(i)
+		err := vm.AddValidator(validators[i], uint64(1000000+i*500000))
+		require.NoError(t, err)
+	}
+
+	// Test getting next validator for different block numbers
+	var lastBlockHash [32]byte
+	copy(lastBlockHash[:], []byte("genesis"))
+
+	selectedValidators := make(map[[32]byte]int)
+
+	// Get validators for multiple blocks
+	for blockNum := uint64(1); blockNum <= 20; blockNum++ {
+		validator := vm.GetNextValidator(blockNum, lastBlockHash)
+		require.NotNil(t, validator, "Should return a validator")
+
+		// Count selections
+		selectedValidators[validator.ID]++
+
+		// Update last block hash for next iteration
+		copy(lastBlockHash[:], []byte(hex.EncodeToString(validator.ID[:])))
+	}
+
+	// Verify that multiple validators were selected (rotation working)
+	assert.Greater(t, len(selectedValidators), 1, "Should rotate between validators")
+
+	// Verify higher stake validators are selected more often
+	// (This is a probabilistic test, might need adjustment)
+	t.Logf("Validator selection distribution: %+v", selectedValidators)
+}
+
+// TestProcessEpoch tests epoch processing
+func TestProcessEpoch(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.DPoSEpoch = 10 // Small epoch for testing
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add validators
+	for i := 0; i < 5; i++ {
+		validatorID := generateValidatorID(i)
+		err := vm.AddValidator(validatorID, uint64(1000000+i*100000))
+		require.NoError(t, err)
+
+		// Activate validator
+		err = vm.ActivateValidator(validatorID)
+		require.NoError(t, err)
+	}
+
+	// Process blocks up to epoch boundary
+	for blockNum := uint64(1); blockNum <= config.DPoSEpoch; blockNum++ {
+		err := vm.ProcessEpoch(blockNum)
+		assert.NoError(t, err, "ProcessEpoch should not error")
+	}
+
+	// Verify epoch was processed (validators should still be active)
+	activeValidators := vm.GetActiveValidators()
+	assert.NotEmpty(t, activeValidators, "Should have active validators after epoch")
+}
+
+// TestRewardValidators tests validator reward mechanisms
+func TestRewardValidators(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	initialStake := uint64(1000000)
+	err := vm.AddValidator(validatorID, initialStake)
+	require.NoError(t, err)
+
+	// Test block production reward
+	blockNumber := uint64(100)
+	err = vm.RewardBlockProduction(validatorID, blockNumber)
+	assert.NoError(t, err, "RewardBlockProduction should not error")
+
+	// Test event finalization reward
+	eventHeight := uint64(50)
+	err = vm.RewardEventFinalization(validatorID, eventHeight)
+	assert.NoError(t, err, "RewardEventFinalization should not error")
+
+	// Note: Actual reward amounts depend on implementation details
+	// This test verifies the methods don't error
+}
+
+// TestValidatorStateManagement tests state save and restore
+func TestValidatorStateManagement(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add validators
+	validators := make([][32]byte, 3)
+	stakes := []uint64{1000000, 2000000, 3000000}
+
+	for i := range validators {
+		validators[i] = generateValidatorID(i)
+		err := vm.AddValidator(validators[i], stakes[i])
+		require.NoError(t, err)
+
+		// Activate validator
+		err = vm.ActivateValidator(validators[i])
+		require.NoError(t, err)
+	}
+
+	// Get current state
+	state, err := vm.GetState()
+	require.NoError(t, err, "GetState should not error")
+	require.NotEmpty(t, state, "State should not be empty")
+
+	// Create a new ValidatorManager and restore state
+	newHC := consensus.NewHybridConsensusWithConfig(config)
+	newVM := newHC.GetValidatorManager()
+
+	err = newVM.RestoreState(state)
+	assert.NoError(t, err, "RestoreState should not error")
+
+	// Verify validators were restored
+	restoredValidators := newVM.GetValidators()
+	assert.Equal(t, len(validators), len(restoredValidators), "Should restore all validators")
+
+	// Verify stakes were restored correctly
+	for i, v := range validators {
+		found := false
+		for _, restored := range restoredValidators {
+			if restored.ID == v {
+				found = true
+				assert.Equal(t, stakes[i], restored.Stake, "Restored stake should match")
+				break
+			}
+		}
+		assert.True(t, found, "Validator should be restored")
+	}
+}
+
+// TestConcurrentValidatorOperations tests thread safety
+func TestConcurrentValidatorOperations(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Run concurrent operations
+	done := make(chan bool, 4)
+
+	// Goroutine 1: Add validators
+	go func() {
+		for i := 0; i < 10; i++ {
+			validatorID := generateValidatorID(i)
+			_ = vm.AddValidator(validatorID, uint64(1000000+i*100000))
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 2: Update stakes
+	go func() {
+		time.Sleep(10 * time.Millisecond) // Let some validators be added first
+		for i := 0; i < 5; i++ {
+			validatorID := generateValidatorID(i)
+			_ = vm.UpdateStake(validatorID, uint64(2000000+i*200000))
+			time.Sleep(10 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 3: Get validators
+	go func() {
+		for i := 0; i < 20; i++ {
+			validators := vm.GetValidators()
+			assert.NotNil(t, validators)
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 4: Check active status
+	go func() {
+		for i := 0; i < 20; i++ {
+			validatorID := generateValidatorID(i % 10)
+			_ = vm.IsActiveValidator(validatorID)
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Wait for all goroutines
+	for i := 0; i < 4; i++ {
+		select {
+		case <-done:
+			// Success
+		case <-time.After(5 * time.Second):
+			t.Fatal("Concurrent operations timed out")
+		}
+	}
+}
+
+// TestValidatorRotation tests validator rotation logic
+func TestValidatorRotation(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.DPoSSetSize = 3 // Small set size for testing rotation
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add more validators than set size
+	validators := make([][32]byte, 6)
+	for i := range validators {
+		validators[i] = generateValidatorID(i)
+		// Give different stakes to ensure deterministic selection
+		stake := uint64(1000000 * (len(validators) - i))
+		err := vm.AddValidator(validators[i], stake)
+		require.NoError(t, err)
+	}
+
+	// Get active validators
+	activeValidators := vm.GetActiveValidators()
+	assert.LessOrEqual(t, len(activeValidators), config.DPoSSetSize,
+		"Active validators should not exceed set size")
+
+	// Verify highest stake validators are active
+	// (This assumes the implementation selects by stake)
+	t.Logf("Active validators count: %d", len(activeValidators))
+}
+
+// TestValidatorSlashing tests validator slashing (if implemented)
+func TestValidatorSlashing(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	initialStake := uint64(1000000)
+	err := vm.AddValidator(validatorID, initialStake)
+	require.NoError(t, err)
+
+	// Test slashing (if the method exists)
+	// This is a placeholder - actual implementation may vary
+	t.Log("Slashing test placeholder - implement when slashing is available")
+}
+
+// BenchmarkAddValidator benchmarks validator addition
+func BenchmarkAddValidator(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	vm := hc.GetValidatorManager()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		validatorID := generateValidatorID(i)
+		_ = vm.AddValidator(validatorID, uint64(1000000+i*1000))
+	}
+}
+
+// BenchmarkGetNextValidator benchmarks validator selection
+func BenchmarkGetNextValidator(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	vm := hc.GetValidatorManager()
+
+	// Add validators
+	for i := 0; i < 100; i++ {
+		validatorID := generateValidatorID(i)
+		_ = vm.AddValidator(validatorID, uint64(1000000+i*10000))
+	}
+
+	var lastBlockHash [32]byte
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = vm.GetNextValidator(uint64(i), lastBlockHash)
+	}
+}
+
+// BenchmarkGetAllValidators benchmarks retrieving all validators
+func BenchmarkGetAllValidators(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	vm := hc.GetValidatorManager()
+
+	// Add many validators
+	for i := 0; i < 1000; i++ {
+		validatorID := generateValidatorID(i)
+		_ = vm.AddValidator(validatorID, uint64(1000000+i*1000))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = vm.GetValidators()
+	}
+}
+
+// TestValidatorMetrics tests validator performance metrics
+func TestValidatorMetrics(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	vm := hc.GetValidatorManager()
+	require.NotNil(t, vm)
+
+	// Add validators and simulate activity
+	validators := make([][32]byte, 3)
+	for i := range validators {
+		validators[i] = generateValidatorID(i)
+		err := vm.AddValidator(validators[i], uint64(1000000+i*500000))
+		require.NoError(t, err)
+	}
+
+	// Simulate block production and event finalization
+	for i := 0; i < 10; i++ {
+		validatorIdx := i % len(validators)
+		_ = vm.RewardBlockProduction(validators[validatorIdx], uint64(i+1))
+		_ = vm.RewardEventFinalization(validators[validatorIdx], uint64(i+1))
+	}
+
+	// Get metrics (if available)
+	// This is a placeholder for when metrics are implemented
+	t.Log("Metrics test placeholder - implement when metrics are available")
+}
+
+// Helper functions are defined in common_test.go

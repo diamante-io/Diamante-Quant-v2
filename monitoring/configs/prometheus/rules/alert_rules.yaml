@@ -1,0 +1,35 @@
+groups:
+- name: diamante.rules
+  rules:
+  - alert: NodeDown
+    expr: up == 0
+    for: 1m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Node is down"
+      description: "{{ $labels.instance }} is not reporting metrics"
+  - alert: ConsensusStall
+    expr: increase(diamante_block_height[5m]) == 0
+    for: 5m
+    labels:
+      severity: critical
+    annotations:
+      summary: "Consensus stalled"
+      description: "Block height has not increased for 5 minutes"
+  - alert: HighCPU
+    expr: diamante_cpu_usage_percent > 90
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High CPU usage"
+      description: "CPU usage exceeds 90%"
+  - alert: HighMemory
+    expr: diamante_memory_usage_bytes > 0.9 * node_memory_MemTotal_bytes
+    for: 2m
+    labels:
+      severity: warning
+    annotations:
+      summary: "High memory usage"
+      description: "Memory usage exceeds 90%"

@@ -1,0 +1,38 @@
+{
+  "suite_name": "Diamante Performance Benchmarks",
+  "output_dir": "./benchmark-results",
+  "enable_profiling": false,
+  "iterations": 10000,
+  "warmup_runs": 1000,
+  "timeout": "10m",
+  "parallel": false,
+  "benchmark_configs": {
+    "transaction": {
+      "pool_size": 50000,
+      "worker_count": 20,
+      "transaction_size": 512,
+      "batch_size": 500,
+      "simulate_failures": true,
+      "failure_rate": 0.01
+    },
+    "consensus": {
+      "validator_count": 100,
+      "block_size": 2097152,
+      "transactions_per_block": 5000,
+      "network_latency": "20ms",
+      "byzantine_nodes": 10,
+      "consensus_timeout": "10s"
+    },
+    "storage": {
+      "storage_type": "memory",
+      "data_size": 4096,
+      "key_prefix": "bench",
+      "read_write_ratio": 0.7,
+      "query_complexity": 100,
+      "batch_size": 1000,
+      "concurrent_ops": 50
+    }
+  },
+  "run_only": [],
+  "skip_benchmarks": []
+}

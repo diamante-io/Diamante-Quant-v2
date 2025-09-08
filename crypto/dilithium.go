@@ -1,4 +1,5 @@
-// dilithium.go
+// Package crypto provides post-quantum secure cryptographic operations including
+// Dilithium digital signatures and Kyber key encapsulation mechanisms.
 package crypto
 
 import (
@@ -10,7 +11,8 @@ import (
 	"sync"
 	"time"
 
-	// Circl sign
+	"diamante/common"
+
 	"github.com/cloudflare/circl/sign"
 	"github.com/cloudflare/circl/sign/dilithium/mode2"
 	"github.com/cloudflare/circl/sign/dilithium/mode3"
@@ -18,28 +20,50 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+// Dilithium security levels.
+const (
+	// DilithiumLevel2 provides NIST Level 2 security (roughly AES-128 equivalent).
+	DilithiumLevel2 = 2
+
+	// DilithiumLevel3 provides NIST Level 3 security (roughly AES-192 equivalent).
+	DilithiumLevel3 = 3
+
+	// DilithiumLevel5 provides NIST Level 5 security (roughly AES-256 equivalent).
+	DilithiumLevel5 = 5
+
+	// DilithiumKeyGenTestSize is the size of test messages for key generation.
+	DilithiumKeyGenTestSize = 32
+
+	// DilithiumKeySize2 is the approximate size for mode 2.
+	DilithiumKeySize2 = 2420
+
+	// DilithiumKeySize3 is the approximate size for mode 3.
+	DilithiumKeySize3 = 3293
+
+	// DilithiumKeySize5 is the approximate size for mode 5.
+	DilithiumKeySize5 = 4595
+
+	// Dilithium3 key sizes (exact values from NIST specification)
+	Dilithium3PublicKeySize  = 1952
+	Dilithium3PrivateKeySize = 4000
+	Dilithium3SignatureSize  = 3293
+)
+
 var (
-	// ErrInvalidDilithiumScheme indicates an invalid or unsupported Dilithium scheme
+	// ErrInvalidDilithiumScheme indicates an invalid or unsupported Dilithium scheme.
 	ErrInvalidDilithiumScheme = errors.New("invalid or unsupported Dilithium scheme")
 
-	// ErrDilithiumKeyGenFailed indicates a failure during key generation
+	// ErrDilithiumKeyGenFailed indicates a failure during key generation.
 	ErrDilithiumKeyGenFailed = errors.New("dilithium key generation failed")
 
-	// ErrDilithiumSignFailed indicates a failure during signing
+	// ErrDilithiumSignFailed indicates a failure during signing.
 	ErrDilithiumSignFailed = errors.New("dilithium signing failed")
 
-	// ErrDilithiumPublicKeyRecover indicates a failure to recover public key from private key
+	// ErrDilithiumPublicKeyRecover indicates a failure to recover public key from private key.
 	ErrDilithiumPublicKeyRecover = errors.New("failed to recover Dilithium public key")
 )
 
-// We define constants for recognized Dilithium levels.
-const (
-	DilithiumLevel2 = 2 // NIST security level 2
-	DilithiumLevel3 = 3 // NIST security level 3
-	DilithiumLevel5 = 5 // NIST security level 5
-)
-
-// dilithiumStats tracks performance metrics for Dilithium operations
+// dilithiumStats tracks performance metrics for Dilithium operations.
 type dilithiumStats struct {
 	mu                sync.RWMutex
 	keyGenCount       uint64
@@ -52,22 +76,33 @@ type dilithiumStats struct {
 }
 
 var stats = dilithiumStats{
-	lastOperationTime: time.Now(),
+	lastOperationTime: common.ConsensusNow().UTC(), // Use consensus time for deterministic behavior
 }
 
-// GetDilithiumStats returns performance statistics
-func GetDilithiumStats() map[string]interface{} {
+// DilithiumStatsInfo represents performance statistics for Dilithium operations.
+type DilithiumStatsInfo struct {
+	KeyGenerations    uint64    `json:"keyGenerations"`
+	Signatures        uint64    `json:"signatures"`
+	Verifications     uint64    `json:"verifications"`
+	AvgKeyGenTime     string    `json:"avgKeyGenTime"`
+	AvgSignTime       string    `json:"avgSignTime"`
+	AvgVerifyTime     string    `json:"avgVerifyTime"`
+	LastOperationTime time.Time `json:"lastOperationTime"`
+}
+
+// GetDilithiumStats returns performance statistics.
+func GetDilithiumStats() *DilithiumStatsInfo {
 	stats.mu.RLock()
 	defer stats.mu.RUnlock()
 
-	return map[string]interface{}{
-		"keyGenerations":    stats.keyGenCount,
-		"signatures":        stats.signCount,
-		"verifications":     stats.verifyCount,
-		"avgKeyGenTime":     stats.avgKeyGenTime.String(),
-		"avgSignTime":       stats.avgSignTime.String(),
-		"avgVerifyTime":     stats.avgVerifyTime.String(),
-		"lastOperationTime": stats.lastOperationTime,
+	return &DilithiumStatsInfo{
+		KeyGenerations:    stats.keyGenCount,
+		Signatures:        stats.signCount,
+		Verifications:     stats.verifyCount,
+		AvgKeyGenTime:     stats.avgKeyGenTime.String(),
+		AvgSignTime:       stats.avgSignTime.String(),
+		AvgVerifyTime:     stats.avgVerifyTime.String(),
+		LastOperationTime: stats.lastOperationTime,
 	}
 }
 
@@ -81,7 +116,7 @@ type DilithiumKeyPairSerialized struct {
 // SerializeDilithiumKeyPair converts a DilithiumKeyPair into its serializable form.
 func SerializeDilithiumKeyPair(kp *DilithiumKeyPair) (*DilithiumKeyPairSerialized, error) {
 	if kp == nil {
-		return nil, fmt.Errorf("nil DilithiumKeyPair")
+		return nil, errors.New("nil DilithiumKeyPair")
 	}
 
 	if err := kp.Validate(); err != nil {
@@ -98,7 +133,7 @@ func SerializeDilithiumKeyPair(kp *DilithiumKeyPair) (*DilithiumKeyPairSerialize
 // DeserializeDilithiumKeyPair converts the serialized form back to a DilithiumKeyPair.
 func DeserializeDilithiumKeyPair(serialized *DilithiumKeyPairSerialized) (*DilithiumKeyPair, error) {
 	if serialized == nil {
-		return nil, fmt.Errorf("nil serialized DilithiumKeyPair")
+		return nil, errors.New("nil serialized DilithiumKeyPair")
 	}
 
 	if len(serialized.PublicKey) == 0 {
@@ -154,7 +189,7 @@ type DilithiumKeyPair struct {
 	Level      int // Added security level for context
 }
 
-// Validate checks that the key pair contains valid data
+// Validate checks that the key pair contains valid data.
 func (kp *DilithiumKeyPair) Validate() error {
 	if kp == nil {
 		return errors.New("nil key pair")
@@ -176,7 +211,7 @@ func (kp *DilithiumKeyPair) Validate() error {
 	return nil
 }
 
-// GetSignatureSize returns the signature size in bytes for this key pair's level
+// GetSignatureSize returns the signature size in bytes for this key pair's level.
 func (kp *DilithiumKeyPair) GetSignatureSize() int {
 	level := kp.Level
 	if level == 0 {
@@ -186,44 +221,46 @@ func (kp *DilithiumKeyPair) GetSignatureSize() int {
 	return DilithiumSignatureSize(level)
 }
 
-// DilithiumSignatureSize returns the signature size in bytes for a given security level
+// DilithiumSignatureSize returns the signature size in bytes for a given security level.
 func DilithiumSignatureSize(level int) int {
 	switch level {
 	case DilithiumLevel2:
-		return 2420 // approximate size for mode2
+		return DilithiumKeySize2 // approximate size for mode2
 	case DilithiumLevel3:
-		return 3293 // approximate size for mode3
+		return DilithiumKeySize3 // approximate size for mode3
 	case DilithiumLevel5:
-		return 4595 // approximate size for mode5
+		return DilithiumKeySize5 // approximate size for mode5
 	default:
-		return 3293 // default to level 3
+		return DilithiumKeySize3 // default to level 3
 	}
 }
 
-// GenerateDilithiumKeyPair obtains scheme via getDilithiumScheme and calls GenerateKey().
+// GenerateDilithiumKeyPair generates a new Dilithium keypair for the given security level.
 func GenerateDilithiumKeyPair(level int) (*DilithiumKeyPair, error) {
 	if !isValidDilithiumLevel(level) {
-		return nil, fmt.Errorf("%w: %d", ErrInvalidDilithiumScheme, level)
+		return nil, fmt.Errorf("%w: %d", ErrInvalidDilithiumLevel, level)
 	}
 
-	startTime := time.Now()
+	startTime := GetTimeProvider().Now()
 
 	scheme, err := getDilithiumScheme(level)
 	if err != nil {
 		return nil, err
 	}
 
-	pub, priv, err := scheme.GenerateKey()
+	// Generate key pair
+	pubKey, privKey, err := scheme.GenerateKey()
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrDilithiumKeyGenFailed, err)
+		return nil, fmt.Errorf("%w: %w", ErrDilithiumKeyGenFailed, err)
 	}
 
-	pubBytes, err := pub.MarshalBinary()
+	// Marshal keys to bytes
+	pubKeyBytes, err := pubKey.MarshalBinary()
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal Dilithium public key: %w", err)
 	}
 
-	privBytes, err := priv.MarshalBinary()
+	privKeyBytes, err := privKey.MarshalBinary()
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal Dilithium private key: %w", err)
 	}
@@ -231,49 +268,46 @@ func GenerateDilithiumKeyPair(level int) (*DilithiumKeyPair, error) {
 	// Update stats
 	stats.mu.Lock()
 	stats.keyGenCount++
-	duration := time.Since(startTime)
-	if stats.avgKeyGenTime == 0 {
-		stats.avgKeyGenTime = duration
-	} else {
-		stats.avgKeyGenTime = (stats.avgKeyGenTime*9 + duration) / 10
-	}
-	stats.lastOperationTime = time.Now()
+	duration := GetTimeProvider().Since(startTime)
+	stats.avgKeyGenTime = (stats.avgKeyGenTime*(MetricsSmoothingFactor-1) + duration) / MetricsSmoothingFactor
+	stats.lastOperationTime = GetTimeProvider().Now()
 	stats.mu.Unlock()
 
 	// Log with a default logger if needed
 	logger := getLogger()
 	logger.WithFields(logrus.Fields{
 		"level":       level,
-		"pubKeySize":  len(pubBytes),
-		"privKeySize": len(privBytes),
+		"pubKeySize":  len(pubKeyBytes),
+		"privKeySize": len(privKeyBytes),
 		"duration":    duration,
 	}).Debug("Dilithium key pair generated")
 
 	return &DilithiumKeyPair{
-		PublicKey:  pubBytes,
-		PrivateKey: privBytes,
+		PublicKey:  pubKeyBytes,
+		PrivateKey: privKeyBytes,
 		Level:      level,
 	}, nil
 }
 
-// getLogger returns a default logger if needed
+// getLogger returns a default logger if needed.
 func getLogger() *logrus.Logger {
 	logger := logrus.New()
 	logger.SetLevel(logrus.InfoLevel)
 	return logger
 }
 
-// SignDilithium signs message with the privateKey bytes at the chosen level.
+// SignDilithium signs a message with a Dilithium private key.
 func SignDilithium(level int, privKeyBytes, message []byte) ([]byte, error) {
 	if !isValidDilithiumLevel(level) {
 		return nil, fmt.Errorf("%w: %d", ErrInvalidDilithiumScheme, level)
 	}
 
-	if len(privKeyBytes) == 0 || len(message) == 0 {
+	// Allow empty messages - signatures can sign empty messages
+	if len(privKeyBytes) == 0 {
 		return nil, ErrEmptyInput
 	}
 
-	startTime := time.Now()
+	startTime := GetTimeProvider().Now()
 
 	scheme, err := getDilithiumScheme(level)
 	if err != nil {
@@ -292,13 +326,9 @@ func SignDilithium(level int, privKeyBytes, message []byte) ([]byte, error) {
 	// Update stats
 	stats.mu.Lock()
 	stats.signCount++
-	duration := time.Since(startTime)
-	if stats.avgSignTime == 0 {
-		stats.avgSignTime = duration
-	} else {
-		stats.avgSignTime = (stats.avgSignTime*9 + duration) / 10
-	}
-	stats.lastOperationTime = time.Now()
+	duration := GetTimeProvider().Since(startTime)
+	stats.avgSignTime = (stats.avgSignTime*(MetricsSmoothingFactor-1) + duration) / MetricsSmoothingFactor
+	stats.lastOperationTime = GetTimeProvider().Now()
 	stats.mu.Unlock()
 
 	// Log with a default logger if needed
@@ -313,17 +343,18 @@ func SignDilithium(level int, privKeyBytes, message []byte) ([]byte, error) {
 	return signature, nil
 }
 
-// VerifyDilithium verifies signature under publicKey bytes at the chosen level.
+// VerifyDilithium verifies a Dilithium signature.
 func VerifyDilithium(level int, pubKeyBytes, message, signature []byte) (bool, error) {
 	if !isValidDilithiumLevel(level) {
 		return false, fmt.Errorf("%w: %d", ErrInvalidDilithiumScheme, level)
 	}
 
-	if len(pubKeyBytes) == 0 || len(message) == 0 || len(signature) == 0 {
+	// Allow empty messages but require signature and public key
+	if len(pubKeyBytes) == 0 || len(signature) == 0 {
 		return false, ErrEmptyInput
 	}
 
-	startTime := time.Now()
+	startTime := GetTimeProvider().Now()
 
 	scheme, err := getDilithiumScheme(level)
 	if err != nil {
@@ -335,19 +366,15 @@ func VerifyDilithium(level int, pubKeyBytes, message, signature []byte) (bool, e
 		return false, fmt.Errorf("failed to unmarshal Dilithium public key: %w", err)
 	}
 
-	// Third parameter (context/salt) should be nil to match signing
+	// Verify the signature
 	valid := scheme.Verify(pk, message, signature, nil)
 
 	// Update stats
 	stats.mu.Lock()
 	stats.verifyCount++
-	duration := time.Since(startTime)
-	if stats.avgVerifyTime == 0 {
-		stats.avgVerifyTime = duration
-	} else {
-		stats.avgVerifyTime = (stats.avgVerifyTime*9 + duration) / 10
-	}
-	stats.lastOperationTime = time.Now()
+	duration := GetTimeProvider().Since(startTime)
+	stats.avgVerifyTime = (stats.avgVerifyTime*(MetricsSmoothingFactor-1) + duration) / MetricsSmoothingFactor
+	stats.lastOperationTime = GetTimeProvider().Now()
 	stats.mu.Unlock()
 
 	// Log with a default logger if needed
@@ -358,7 +385,7 @@ func VerifyDilithium(level int, pubKeyBytes, message, signature []byte) (bool, e
 		"signatureSize": len(signature),
 		"valid":         valid,
 		"duration":      duration,
-	}).Debug("Dilithium signature verified")
+	}).Debug("Dilithium verification completed")
 
 	return valid, nil
 }
@@ -408,7 +435,7 @@ func (kp *DilithiumKeyPair) CryptoSigner() (crypto.Signer, error) {
 	return kp.CryptoSignerWithLevel(level)
 }
 
-// CryptoSignerWithLevel returns a crypto.Signer for the specified security level
+// CryptoSignerWithLevel returns a crypto.Signer for the specified security level.
 func (kp *DilithiumKeyPair) CryptoSignerWithLevel(level int) (crypto.Signer, error) {
 	if err := kp.Validate(); err != nil {
 		return nil, err
@@ -440,7 +467,7 @@ func VerifySignature(pubKey, data, sig []byte) (bool, error) {
 	return VerifyDilithium(defaultDilithiumLevel, pubKey, data, sig)
 }
 
-// ValidateDilithiumKeyPair verifies that a key pair can sign and verify correctly
+// ValidateDilithiumKeyPair verifies that a key pair can sign and verify correctly.
 func ValidateDilithiumKeyPair(kp *DilithiumKeyPair) error {
 	if err := kp.Validate(); err != nil {
 		return err
@@ -453,8 +480,8 @@ func ValidateDilithiumKeyPair(kp *DilithiumKeyPair) error {
 	}
 
 	// Generate test message
-	testMsg := make([]byte, 32)
-	binary.LittleEndian.PutUint64(testMsg, uint64(time.Now().UnixNano()))
+	testMsg := make([]byte, DilithiumKeyGenTestSize)
+	binary.LittleEndian.PutUint64(testMsg, uint64(GetTimeProvider().Unix()))
 
 	// Sign test message
 	sig, err := SignDilithium(level, kp.PrivateKey, testMsg)
@@ -475,7 +502,7 @@ func ValidateDilithiumKeyPair(kp *DilithiumKeyPair) error {
 	return nil
 }
 
-// GetSecurityLevel returns the NIST security level equivalent for each Dilithium level
+// GetSecurityLevel returns the NIST security level equivalent for each Dilithium level.
 func GetSecurityLevel(dilithiumLevel int) int {
 	switch dilithiumLevel {
 	case DilithiumLevel2:
@@ -489,8 +516,7 @@ func GetSecurityLevel(dilithiumLevel int) int {
 	}
 }
 
-// VerifySignatureConstantTime verifies a signature in constant time to prevent timing attacks
-// This is a more secure alternative to the regular VerifySignature function
+// This is a more secure alternative to the regular VerifySignature function.
 func VerifySignatureConstantTime(pubKey, data, sig []byte) (bool, error) {
 	valid, err := VerifyDilithium(defaultDilithiumLevel, pubKey, data, sig)
 
@@ -503,7 +529,7 @@ func VerifySignatureConstantTime(pubKey, data, sig []byte) (bool, error) {
 	return result == 1, err
 }
 
-// boolToInt converts a boolean to 1 (true) or 0 (false)
+// boolToInt converts a boolean to 1 (true) or 0 (false).
 func boolToInt(b bool) int {
 	if b {
 		return 1

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"diamante/consensus/types"
+	dtypes "diamante/types"
 )
 
 // EventFlowManager handles the flow of events from creation to finalization
@@ -102,9 +103,19 @@ func (efm *EventFlowManager) Stop() error {
 
 // CreateEvent creates a new event and starts the finalization process.
 func (efm *EventFlowManager) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []byte) (*types.Event, error) {
+	stop := efm.hc.performanceProfiler.StartOperation(OpEventCreation)
+	defer stop()
+
 	// Check if creator is an active validator
 	if !efm.hc.validatorManager.IsActiveValidator(creator) {
-		return nil, errors.New("creator is not an active validator")
+		err := errors.New("creator is not an active validator")
+		if recErr := efm.hc.recoveryManager.HandleError(
+			WrapError(err, ErrInvalidValidator, ErrorCategoryTemporary, "invalid creator"),
+		); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle invalid validator error", ErrorField(recErr))
+		}
+		return nil, err
 	}
 
 	// Check if we have too many pending events
@@ -112,14 +123,28 @@ func (efm *EventFlowManager) CreateEvent(creator [32]byte, parentIDs [][32]byte,
 	pendingCount := len(efm.pendingEvents)
 	efm.mu.RUnlock()
 	if pendingCount >= efm.maxPendingEvents {
-		return nil, fmt.Errorf("too many pending events (%d >= %d)", pendingCount, efm.maxPendingEvents)
+		err := fmt.Errorf("too many pending events (%d >= %d)", pendingCount, efm.maxPendingEvents)
+		if recErr := efm.hc.recoveryManager.HandleError(
+			WrapError(err, ErrEventRejected, ErrorCategoryTemporary, "pending queue full"),
+		); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event rejection error", ErrorField(recErr))
+		}
+		return nil, err
 	}
 
 	// Create the event using Lachesis
 	event := efm.hc.lachesis.CreateEvent(creator, parentIDs, data)
 	if event == nil {
 		efm.incrementMetric("eventCreationErrors")
-		return nil, errors.New("failed to create event")
+		err := errors.New("failed to create event")
+		if recErr := efm.hc.recoveryManager.HandleError(
+			WrapError(err, ErrEventCreationFailed, ErrorCategoryTemporary, "create event failed"),
+		); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event creation error", ErrorField(recErr))
+		}
+		return nil, err
 	}
 
 	// Add PoH information
@@ -148,6 +173,12 @@ func (efm *EventFlowManager) CreateEvent(creator [32]byte, parentIDs [][32]byte,
 			}
 
 			efm.incrementMetric("eventValidationErrors")
+			if recErr := efm.hc.recoveryManager.HandleError(
+				WrapError(err, ErrEventValidationFailed, ErrorCategoryTemporary, "event validation failed"),
+			); recErr != nil {
+				// Log recovery manager failure but continue
+				efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+			}
 			return nil, fmt.Errorf("event validation failed: %w", err)
 		}
 	}
@@ -155,7 +186,7 @@ func (efm *EventFlowManager) CreateEvent(creator [32]byte, parentIDs [][32]byte,
 	// Track the event
 	efm.mu.Lock()
 	efm.pendingEvents[event.ID] = event
-	efm.eventCreationTime[event.ID] = time.Now()
+	efm.eventCreationTime[event.ID] = ConsensusNow()
 	efm.eventsByHeight[event.Height] = append(efm.eventsByHeight[event.Height], event)
 	efm.eventRetryCount[event.ID] = 0
 	efm.mu.Unlock()
@@ -173,6 +204,9 @@ func (efm *EventFlowManager) CreateEvent(creator [32]byte, parentIDs [][32]byte,
 // finalizeEvent attempts to finalize an event with timeout.
 func (efm *EventFlowManager) finalizeEvent(event *types.Event) {
 	defer efm.finalizationWg.Done()
+
+	stop := efm.hc.performanceProfiler.StartOperation(OpEventFinalization)
+	defer stop()
 
 	// Create a context with timeout
 	ctx, cancel := context.WithTimeout(efm.ctx, efm.finalizationTimeout)
@@ -204,17 +238,28 @@ func (efm *EventFlowManager) finalizeEvent(event *types.Event) {
 
 			// Log with retry information
 			efm.hc.logger.Info("Event not finalized, keeping in pending",
-				"eventID", fmt.Sprintf("%x", event.ID),
-				"height", event.Height,
-				"retryCount", retries+1,
-				"maxRetries", efm.maxRetries)
+				EventIDField(event.ID),
+				BlockHeightField(event.Height),
+				IntField("retryCount", retries+1),
+				IntField("maxRetries", efm.maxRetries))
 
 			// If we've exceeded max retries, log a warning
 			if retries+1 >= efm.maxRetries {
 				efm.hc.logger.Warn("Event exceeded max retry attempts",
-					"eventID", fmt.Sprintf("%x", event.ID),
-					"height", event.Height,
-					"retries", retries+1)
+					EventIDField(event.ID),
+					BlockHeightField(event.Height),
+					IntField("retries", retries+1))
+				if recErr := efm.hc.recoveryManager.HandleError(
+					WrapError(fmt.Errorf("event finalization failed"),
+						ErrEventFinalizationFailed,
+						ErrorCategoryTemporary,
+						"max retries exceeded").
+						WithEventID(event.ID).
+						WithContext("height", event.Height),
+				); recErr != nil {
+					// Log recovery manager failure but continue
+					efm.hc.logger.Error("Recovery manager failed to handle max retries error", ErrorField(recErr))
+				}
 			}
 		}
 	case <-ctx.Done():
@@ -228,10 +273,19 @@ func (efm *EventFlowManager) finalizeEvent(event *types.Event) {
 		efm.mu.Unlock()
 
 		efm.hc.logger.Info("Event finalization timed out",
-			"eventID", fmt.Sprintf("%x", event.ID),
-			"height", event.Height,
-			"retryCount", retries+1,
-			"maxRetries", efm.maxRetries)
+			EventIDField(event.ID),
+			BlockHeightField(event.Height),
+			IntField("retryCount", retries+1),
+			IntField("maxRetries", efm.maxRetries))
+
+		if recErr := efm.hc.recoveryManager.HandleError(
+			WrapError(ctx.Err(), ErrEventTimeout, ErrorCategoryTemporary, "event finalization timeout").
+				WithEventID(event.ID).
+				WithContext("height", event.Height),
+		); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle timeout error", ErrorField(recErr))
+		}
 	}
 }
 
@@ -245,7 +299,7 @@ func (efm *EventFlowManager) handleFinalizedEvent(event *types.Event) {
 	// Calculate finalization time
 	creationTime, exists := efm.eventCreationTime[event.ID]
 	if exists {
-		finalizationTime = time.Since(creationTime)
+		finalizationTime = ConsensusSince(creationTime)
 		retryCount = efm.eventRetryCount[event.ID]
 	}
 
@@ -271,10 +325,10 @@ func (efm *EventFlowManager) handleFinalizedEvent(event *types.Event) {
 		efm.metricsMu.Unlock()
 
 		efm.hc.logger.Info("Event finalized",
-			"eventID", fmt.Sprintf("%x", event.ID),
-			"height", event.Height,
-			"finalizationTime", finalizationTime,
-			"retries", retryCount)
+			EventIDField(event.ID),
+			BlockHeightField(event.Height),
+			LogField{Key: "finalizationTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(finalizationTime.String()))},
+			IntField("retries", retryCount))
 	}
 
 	// Increment metrics
@@ -282,7 +336,7 @@ func (efm *EventFlowManager) handleFinalizedEvent(event *types.Event) {
 
 	// Reward the validator - do this outside of any locks to reduce contention
 	if err := efm.hc.validatorManager.RewardEventFinalization(event.Creator, event.Height); err != nil {
-		efm.hc.logger.Error("Failed to reward validator for event finalization", "error", err)
+		efm.hc.logger.Error("Failed to reward validator for event finalization", ErrorField(err))
 	}
 }
 
@@ -336,10 +390,10 @@ func (efm *EventFlowManager) adjustBatchSize() {
 		efm.metricsMu.Unlock()
 
 		efm.hc.logger.Info("Decreased batch size due to performance metrics",
-			"oldSize", currentBatchSize,
-			"newSize", newBatchSize,
-			"avgProcessingTime", avgTime,
-			"successRate", successRate)
+			IntField("oldSize", currentBatchSize),
+			IntField("newSize", newBatchSize),
+			LogField{Key: "avgProcessingTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(avgTime.String()))},
+			Float64Field("successRate", successRate))
 	} else if avgTime < 100*time.Millisecond && successRate > 0.9 {
 		// If processing is fast and success rate is high, increase batch size
 		newBatchSize := int(float64(currentBatchSize) * 1.2)
@@ -352,16 +406,19 @@ func (efm *EventFlowManager) adjustBatchSize() {
 		efm.metricsMu.Unlock()
 
 		efm.hc.logger.Info("Increased batch size due to good performance",
-			"oldSize", currentBatchSize,
-			"newSize", newBatchSize,
-			"avgProcessingTime", avgTime,
-			"successRate", successRate)
+			IntField("oldSize", currentBatchSize),
+			IntField("newSize", newBatchSize),
+			LogField{Key: "avgProcessingTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(avgTime.String()))},
+			Float64Field("successRate", successRate))
 	}
 }
 
 // processPendingEvents attempts to finalize all pending events.
 func (efm *EventFlowManager) processPendingEvents() {
-	startTime := time.Now()
+	stopOp := efm.hc.performanceProfiler.StartOperation(OpEventBatchProcess)
+	defer stopOp()
+
+	startTime := ConsensusNow()
 
 	// Get a copy of pending events
 	efm.mu.RLock()
@@ -406,9 +463,9 @@ func (efm *EventFlowManager) processPendingEvents() {
 
 			if retries >= efm.maxRetries {
 				efm.hc.logger.Warn("Skipping event that exceeded max retries",
-					"eventID", fmt.Sprintf("%x", event.ID),
-					"height", event.Height,
-					"retries", retries)
+					EventIDField(event.ID),
+					BlockHeightField(event.Height),
+					IntField("retries", retries))
 				continue
 			}
 
@@ -424,7 +481,7 @@ func (efm *EventFlowManager) processPendingEvents() {
 	}
 
 	// Update metrics
-	processingTime := time.Since(startTime)
+	processingTime := ConsensusSince(startTime)
 	successRate := 0.0
 	if totalProcessed > 0 {
 		successRate = float64(totalFinalized) / float64(totalProcessed)
@@ -444,11 +501,11 @@ func (efm *EventFlowManager) processPendingEvents() {
 	// Log detailed batch processing metrics if significant work was done
 	if totalProcessed > 0 {
 		efm.hc.logger.Info("Batch processing completed",
-			"pendingCount", len(pendingEvents),
-			"processed", totalProcessed,
-			"finalized", totalFinalized,
-			"successRate", successRate,
-			"processingTime", processingTime)
+			IntField("pendingCount", len(pendingEvents)),
+			IntField("processed", totalProcessed),
+			IntField("finalized", totalFinalized),
+			Float64Field("successRate", successRate),
+			LogField{Key: "processingTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(processingTime.String()))})
 	}
 }
 
@@ -495,22 +552,22 @@ func (efm *EventFlowManager) logMetrics() {
 
 	// Enhanced metrics logging
 	efm.hc.logger.Info("Event flow metrics",
-		"totalCreated", efm.totalEventsCreated,
-		"totalFinalized", efm.totalEventsFinalized,
-		"pendingCount", pendingCount,
-		"finalizedCount", finalizedCount,
-		"avgFinalizationTime", efm.avgFinalizationTime,
-		"maxFinalizationTime", efm.maxFinalizationTime,
-		"finalizationTimeouts", efm.finalizationTimeouts,
-		"duplicateCount", efm.eventDuplicateCount,
-		"validationErrors", efm.eventValidationErrors,
-		"propagationErrors", efm.eventPropagationErrors,
-		"eventRetries", efm.eventRetries,
-		"batchProcessingTime", efm.batchProcessingTime,
-		"lastBatchSize", efm.lastBatchSize,
-		"currentBatchSize", efm.batchSize,
-		"successRate", efm.successRate,
-		"heightDistribution", heightDistribution)
+		IntField("totalCreated", int(efm.totalEventsCreated)),
+		IntField("totalFinalized", int(efm.totalEventsFinalized)),
+		IntField("pendingCount", pendingCount),
+		IntField("finalizedCount", finalizedCount),
+		LogField{Key: "avgFinalizationTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(efm.avgFinalizationTime.String()))},
+		LogField{Key: "maxFinalizationTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(efm.maxFinalizationTime.String()))},
+		IntField("finalizationTimeouts", int(efm.finalizationTimeouts)),
+		IntField("duplicateCount", int(efm.eventDuplicateCount)),
+		IntField("validationErrors", int(efm.eventValidationErrors)),
+		IntField("propagationErrors", int(efm.eventPropagationErrors)),
+		IntField("eventRetries", int(efm.eventRetries)),
+		LogField{Key: "batchProcessingTime", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(efm.batchProcessingTime.String()))},
+		IntField("lastBatchSize", efm.lastBatchSize),
+		IntField("currentBatchSize", efm.batchSize),
+		Float64Field("successRate", efm.successRate),
+		LogField{Key: "heightDistribution", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(fmt.Sprintf("%v", heightDistribution)))})
 }
 
 // incrementMetric safely increments a metric counter.
@@ -577,7 +634,7 @@ func (efm *EventFlowManager) GetFinalizedEvents(fromHeight, toHeight uint64) ([]
 }
 
 // GetEventMetrics returns the current event flow metrics.
-func (efm *EventFlowManager) GetEventMetrics() map[string]interface{} {
+func (efm *EventFlowManager) GetEventMetrics() *dtypes.EventMetrics {
 	efm.metricsMu.RLock()
 	defer efm.metricsMu.RUnlock()
 
@@ -592,22 +649,22 @@ func (efm *EventFlowManager) GetEventMetrics() map[string]interface{} {
 	}
 	efm.mu.RUnlock()
 
-	return map[string]interface{}{
-		"totalEventsCreated":     efm.totalEventsCreated,
-		"totalEventsFinalized":   efm.totalEventsFinalized,
-		"pendingCount":           pendingCount,
-		"finalizedCount":         finalizedCount,
-		"avgFinalizationTime":    efm.avgFinalizationTime.String(),
-		"maxFinalizationTime":    efm.maxFinalizationTime.String(),
-		"finalizationTimeouts":   efm.finalizationTimeouts,
-		"eventDuplicateCount":    efm.eventDuplicateCount,
-		"eventValidationErrors":  efm.eventValidationErrors,
-		"eventPropagationErrors": efm.eventPropagationErrors,
-		"eventRetries":           efm.eventRetries,
-		"batchProcessingTime":    efm.batchProcessingTime.String(),
-		"currentBatchSize":       efm.batchSize,
-		"successRate":            efm.successRate,
-		"retryDistribution":      retryDistribution,
+	return &dtypes.EventMetrics{
+		TotalEventsCreated:     efm.totalEventsCreated,
+		TotalEventsFinalized:   efm.totalEventsFinalized,
+		PendingCount:           pendingCount,
+		FinalizedCount:         finalizedCount,
+		AvgFinalizationTime:    efm.avgFinalizationTime.String(),
+		MaxFinalizationTime:    efm.maxFinalizationTime.String(),
+		FinalizationTimeouts:   efm.finalizationTimeouts,
+		EventDuplicateCount:    efm.eventDuplicateCount,
+		EventValidationErrors:  efm.eventValidationErrors,
+		EventPropagationErrors: efm.eventPropagationErrors,
+		EventRetries:           efm.eventRetries,
+		BatchProcessingTime:    efm.batchProcessingTime.String(),
+		CurrentBatchSize:       efm.batchSize,
+		SuccessRate:            efm.successRate,
+		RetryDistribution:      retryDistribution,
 	}
 }
 
@@ -615,28 +672,41 @@ func (efm *EventFlowManager) GetEventMetrics() map[string]interface{} {
 // It checks the event's creator, PoH information, and ensures it's not a duplicate.
 // It also verifies that parent events exist and are valid.
 func (efm *EventFlowManager) ValidateEvent(event *types.Event) error {
+	stop := efm.hc.performanceProfiler.StartOperation(OpEventValidation)
+	defer stop()
+
 	if event == nil {
-		return NewConsensusError(
+		err := NewConsensusError(
 			ErrEventValidationFailed,
 			ErrorCategoryTemporary,
 			"event is nil",
 		)
+		if recErr := efm.hc.recoveryManager.HandleError(err); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+		}
+		return err
 	}
 
 	// Check if creator is an active validator
 	if !efm.hc.validatorManager.IsActiveValidator(event.Creator) {
-		return NewConsensusError(
+		err := NewConsensusError(
 			ErrInvalidValidator,
 			ErrorCategoryTemporary,
 			"creator is not an active validator",
 		).WithEventID(event.ID).
 			WithValidatorID(event.Creator).
 			WithContext("height", event.Height)
+		if recErr := efm.hc.recoveryManager.HandleError(err); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+		}
+		return err
 	}
 
 	// Verify PoH information
 	if !efm.hc.verifyPoHWithDrift(event.PoHState, event.Data, event.PoHProof, event.PoHCount) {
-		return NewConsensusError(
+		err := NewConsensusError(
 			ErrPoHVerificationFailed,
 			ErrorCategoryByzantine,
 			"PoH verification failed",
@@ -645,6 +715,11 @@ func (efm *EventFlowManager) ValidateEvent(event *types.Event) error {
 			WithContext("height", event.Height).
 			WithContext("pohCount", event.PoHCount).
 			WithContext("currentPohCount", efm.hc.poh.GetCount())
+		if recErr := efm.hc.recoveryManager.HandleError(err); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+		}
+		return err
 	}
 
 	// Check for duplicate event with improved error context
@@ -666,7 +741,7 @@ func (efm *EventFlowManager) ValidateEvent(event *types.Event) error {
 			duplicateHeight = finalizedEvent.Height
 		}
 
-		return NewConsensusError(
+		err := NewConsensusError(
 			ErrEventDuplicate,
 			ErrorCategoryTemporary,
 			fmt.Sprintf("duplicate event: %s event at height %d", duplicateInfo, duplicateHeight),
@@ -675,22 +750,32 @@ func (efm *EventFlowManager) ValidateEvent(event *types.Event) error {
 			WithContext("height", event.Height).
 			WithContext("duplicateStatus", duplicateInfo).
 			WithContext("duplicateHeight", duplicateHeight)
+		if recErr := efm.hc.recoveryManager.HandleError(err); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+		}
+		return err
 	}
 
 	// Validate timestamp
 	if event.Timestamp.IsZero() {
-		return NewConsensusError(
+		err := NewConsensusError(
 			ErrEventValidationFailed,
 			ErrorCategoryTemporary,
 			"event has zero timestamp",
 		).WithEventID(event.ID).
 			WithValidatorID(event.Creator).
 			WithContext("height", event.Height)
+		if recErr := efm.hc.recoveryManager.HandleError(err); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+		}
+		return err
 	}
 
 	// Check if timestamp is in the future (with some tolerance)
-	if event.Timestamp.After(time.Now().Add(5 * time.Second)) {
-		return NewConsensusError(
+	if event.Timestamp.After(ConsensusNow().Add(5 * time.Second)) {
+		err := NewConsensusError(
 			ErrEventValidationFailed,
 			ErrorCategoryTemporary,
 			"event timestamp is too far in the future",
@@ -698,7 +783,12 @@ func (efm *EventFlowManager) ValidateEvent(event *types.Event) error {
 			WithValidatorID(event.Creator).
 			WithContext("height", event.Height).
 			WithContext("timestamp", event.Timestamp).
-			WithContext("currentTime", time.Now())
+			WithContext("currentTime", ConsensusNow())
+		if recErr := efm.hc.recoveryManager.HandleError(err); recErr != nil {
+			// Log recovery manager failure but continue
+			efm.hc.logger.Error("Recovery manager failed to handle event validation error", ErrorField(recErr))
+		}
+		return err
 	}
 
 	// Additional validation: check parent IDs exist
@@ -721,10 +811,10 @@ func (efm *EventFlowManager) ValidateEvent(event *types.Event) error {
 		// This is not a fatal error as the parent might be in Lachesis but not in our local tracking
 		if len(missingParents) > 0 {
 			efm.hc.logger.Warn("Event references unknown parents",
-				"eventID", fmt.Sprintf("%x", event.ID),
-				"missingParents", missingParents,
-				"totalParents", len(event.ParentIDs),
-				"missingCount", len(missingParents))
+				EventIDField(event.ID),
+				BlockHeightField(event.Height),
+				IntField("totalParents", len(event.ParentIDs)),
+				IntField("missingCount", len(missingParents)))
 		}
 	}
 
@@ -765,8 +855,9 @@ func (efm *EventFlowManager) HandleNetworkPartition(events []*types.Event) error
 
 				efm.incrementMetric("eventValidationErrors")
 				efm.hc.logger.Info("Event validation failed during partition recovery",
-					"eventID", fmt.Sprintf("%x", event.ID),
-					"error", err)
+					EventIDField(event.ID),
+					BlockHeightField(event.Height),
+					ErrorField(err))
 				continue
 			}
 			validated++
@@ -775,7 +866,7 @@ func (efm *EventFlowManager) HandleNetworkPartition(events []*types.Event) error
 		// Add to pending events
 		efm.mu.Lock()
 		efm.pendingEvents[event.ID] = event
-		efm.eventCreationTime[event.ID] = time.Now()
+		efm.eventCreationTime[event.ID] = ConsensusNow()
 		efm.eventsByHeight[event.Height] = append(efm.eventsByHeight[event.Height], event)
 		efm.eventRetryCount[event.ID] = 0
 		efm.mu.Unlock()
@@ -788,10 +879,10 @@ func (efm *EventFlowManager) HandleNetworkPartition(events []*types.Event) error
 
 	// Log detailed partition recovery metrics
 	efm.hc.logger.Info("Network partition recovery completed",
-		"totalEvents", len(events),
-		"processed", processed,
-		"skipped", skipped,
-		"validated", validated)
+		IntField("totalEvents", len(events)),
+		IntField("processed", processed),
+		IntField("skipped", skipped),
+		IntField("validated", validated))
 
 	return nil
 }
@@ -850,8 +941,8 @@ func (efm *EventFlowManager) CleanupOldEvents(maxHeight uint64) int {
 	}
 
 	efm.hc.logger.Info("Cleaned up old events",
-		"maxHeight", maxHeight,
-		"removedCount", removed)
+		IntField("maxHeight", int(maxHeight)),
+		IntField("removedCount", removed))
 
 	return removed
 }
@@ -860,7 +951,7 @@ func (efm *EventFlowManager) CleanupOldEvents(maxHeight uint64) int {
 func (efm *EventFlowManager) SetFinalizationTimeout(timeout time.Duration) {
 	if timeout > 0 {
 		efm.finalizationTimeout = timeout
-		efm.hc.logger.Info("Updated finalization timeout", "timeout", timeout)
+		efm.hc.logger.Info("Updated finalization timeout", LogField{Key: "timeout", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(timeout.String()))})
 	}
 }
 
@@ -868,7 +959,7 @@ func (efm *EventFlowManager) SetFinalizationTimeout(timeout time.Duration) {
 func (efm *EventFlowManager) SetMaxPendingEvents(max int) {
 	if max > 0 {
 		efm.maxPendingEvents = max
-		efm.hc.logger.Info("Updated max pending events", "max", max)
+		efm.hc.logger.Info("Updated max pending events", IntField("max", max))
 	}
 }
 
@@ -876,27 +967,27 @@ func (efm *EventFlowManager) SetMaxPendingEvents(max int) {
 func (efm *EventFlowManager) SetBatchSize(size int) {
 	if size > 0 {
 		efm.batchSize = size
-		efm.hc.logger.Info("Updated batch size", "size", size)
+		efm.hc.logger.Info("Updated batch size", IntField("size", size))
 	}
 }
 
 // EnableDeduplication enables or disables event deduplication.
 func (efm *EventFlowManager) EnableDeduplication(enable bool) {
 	efm.enableDeduplication = enable
-	efm.hc.logger.Info("Updated deduplication setting", "enabled", enable)
+	efm.hc.logger.Info("Updated deduplication setting", BoolField("enabled", enable))
 }
 
 // EnableValidation enables or disables event validation.
 func (efm *EventFlowManager) EnableValidation(enable bool) {
 	efm.enableValidation = enable
-	efm.hc.logger.Info("Updated validation setting", "enabled", enable)
+	efm.hc.logger.Info("Updated validation setting", BoolField("enabled", enable))
 }
 
 // SetMaxRetries sets the maximum number of retry attempts for event finalization.
 func (efm *EventFlowManager) SetMaxRetries(max int) {
 	if max > 0 {
 		efm.maxRetries = max
-		efm.hc.logger.Info("Updated max retries", "max", max)
+		efm.hc.logger.Info("Updated max retries", IntField("max", max))
 	}
 }
 
@@ -909,5 +1000,5 @@ func (efm *EventFlowManager) EnableAdaptiveBatching(enable bool) {
 		go efm.adaptiveBatchSizeWorker()
 	}
 
-	efm.hc.logger.Info("Updated adaptive batching setting", "enabled", enable)
+	efm.hc.logger.Info("Updated adaptive batching setting", BoolField("enabled", enable))
 }

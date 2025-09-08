@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"sync"
 	"time"
+
+	dtypes "diamante/types"
 )
 
 // RecoveryStrategy defines the strategy to use for recovery
@@ -215,8 +217,8 @@ func (rm *RecoveryManager) HandleError(err error) error {
 	// Check if circuit breaker is active for this error code
 	if rm.isCircuitBreakerActive(cerr.Code) {
 		rm.hc.logger.Warn("Circuit breaker active, skipping recovery",
-			"errorCode", cerr.Code,
-			"errorCategory", cerr.Category)
+			LogField{Key: "errorCode", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Code.String()))},
+			LogField{Key: "errorCategory", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Category.String()))})
 		return cerr
 	}
 
@@ -231,10 +233,10 @@ func (rm *RecoveryManager) HandleError(err error) error {
 	if attempts >= rm.maxRecoveryAttempts {
 		rm.activateCircuitBreaker(cerr.Code)
 		rm.hc.logger.Warn("Max recovery attempts exceeded, activating circuit breaker",
-			"errorCode", cerr.Code,
-			"errorCategory", cerr.Category,
-			"attempts", attempts,
-			"maxAttempts", rm.maxRecoveryAttempts)
+			LogField{Key: "errorCode", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Code.String()))},
+			LogField{Key: "errorCategory", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Category.String()))},
+			IntField("attempts", attempts),
+			IntField("maxAttempts", rm.maxRecoveryAttempts))
 		return cerr
 	}
 
@@ -243,11 +245,11 @@ func (rm *RecoveryManager) HandleError(err error) error {
 
 	// Log recovery attempt
 	rm.hc.logger.Info("Attempting recovery",
-		"errorCode", cerr.Code,
-		"errorCategory", cerr.Category,
-		"strategy", strategy,
-		"attempt", attempts+1,
-		"maxAttempts", rm.maxRecoveryAttempts)
+		LogField{Key: "errorCode", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Code.String()))},
+		LogField{Key: "errorCategory", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Category.String()))},
+		LogField{Key: "strategy", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(strategy.String()))},
+		IntField("attempt", attempts+1),
+		IntField("maxAttempts", rm.maxRecoveryAttempts))
 
 	// Apply recovery strategy
 	var recoveryErr error
@@ -269,18 +271,18 @@ func (rm *RecoveryManager) HandleError(err error) error {
 	// If recovery failed, return the original error
 	if recoveryErr != nil {
 		rm.hc.logger.Error("Recovery failed",
-			"errorCode", cerr.Code,
-			"errorCategory", cerr.Category,
-			"strategy", strategy,
-			"recoveryError", recoveryErr)
+			LogField{Key: "errorCode", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Code.String()))},
+			LogField{Key: "errorCategory", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Category.String()))},
+			LogField{Key: "strategy", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(strategy.String()))},
+			LogField{Key: "recoveryError", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(recoveryErr.Error()))})
 		return cerr
 	}
 
 	// Recovery succeeded
 	rm.hc.logger.Info("Recovery succeeded",
-		"errorCode", cerr.Code,
-		"errorCategory", cerr.Category,
-		"strategy", strategy)
+		LogField{Key: "errorCode", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Code.String()))},
+		LogField{Key: "errorCategory", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Category.String()))},
+		LogField{Key: "strategy", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(strategy.String()))})
 	return nil
 }
 
@@ -290,7 +292,7 @@ func (rm *RecoveryManager) isCircuitBreakerActive(code ConsensusErrorCode) bool 
 	defer rm.mu.RUnlock()
 
 	if openTime, ok := rm.circuitBreakers[code]; ok {
-		if time.Since(openTime) < rm.circuitBreakerDuration {
+		if ConsensusSince(openTime) < rm.circuitBreakerDuration {
 			return true
 		}
 		// Circuit breaker has expired, remove it
@@ -303,7 +305,7 @@ func (rm *RecoveryManager) isCircuitBreakerActive(code ConsensusErrorCode) bool 
 func (rm *RecoveryManager) activateCircuitBreaker(code ConsensusErrorCode) {
 	rm.mu.Lock()
 	defer rm.mu.Unlock()
-	rm.circuitBreakers[code] = time.Now()
+	rm.circuitBreakers[code] = ConsensusNow()
 }
 
 // getRecoveryAttempts gets the number of recovery attempts for an error code
@@ -320,23 +322,16 @@ func (rm *RecoveryManager) incrementRecoveryAttempts(code ConsensusErrorCode) {
 	rm.recoveryAttempts[code]++
 }
 
-// resetRecoveryAttempts resets the number of recovery attempts for an error code
-func (rm *RecoveryManager) resetRecoveryAttempts(code ConsensusErrorCode) {
-	rm.mu.Lock()
-	defer rm.mu.Unlock()
-	delete(rm.recoveryAttempts, code)
-}
-
 // applyRetryStrategy applies the retry recovery strategy
-func (rm *RecoveryManager) applyRetryStrategy(cerr *ConsensusError) error {
+func (rm *RecoveryManager) applyRetryStrategy(_ *ConsensusError) error {
 	// For retry strategy, we just wait for the backoff period
 	// The actual retry will be handled by the caller
-	time.Sleep(rm.recoveryBackoff)
+	ConsensusSleep(rm.hc.ctx, rm.recoveryBackoff)
 	return nil
 }
 
 // applyCheckpointStrategy applies the checkpoint recovery strategy
-func (rm *RecoveryManager) applyCheckpointStrategy(cerr *ConsensusError) error {
+func (rm *RecoveryManager) applyCheckpointStrategy(_ *ConsensusError) error {
 	// Find the latest checkpoint
 	rm.mu.RLock()
 	lastCheckpoint := rm.hc.lastCheckpoint
@@ -351,7 +346,7 @@ func (rm *RecoveryManager) applyCheckpointStrategy(cerr *ConsensusError) error {
 }
 
 // applyResetStrategy applies the reset recovery strategy
-func (rm *RecoveryManager) applyResetStrategy(cerr *ConsensusError) error {
+func (rm *RecoveryManager) applyResetStrategy(_ *ConsensusError) error {
 	// Reset the consensus state
 	// This is a more drastic measure than checkpoint recovery
 	// It resets the consensus state to its initial state
@@ -374,14 +369,14 @@ func (rm *RecoveryManager) applyResetStrategy(cerr *ConsensusError) error {
 }
 
 // applyRestartStrategy applies the restart recovery strategy
-func (rm *RecoveryManager) applyRestartStrategy(cerr *ConsensusError) error {
+func (rm *RecoveryManager) applyRestartStrategy(_ *ConsensusError) error {
 	// Restart the consensus
 	if err := rm.hc.Stop(); err != nil {
 		return fmt.Errorf("failed to stop consensus: %w", err)
 	}
 
 	// Wait a bit before restarting
-	time.Sleep(1 * time.Second)
+	ConsensusSleep(rm.hc.ctx, 1*time.Second)
 
 	if err := rm.hc.Start(); err != nil {
 		return fmt.Errorf("failed to restart consensus: %w", err)
@@ -395,10 +390,10 @@ func (rm *RecoveryManager) applyManualStrategy(cerr *ConsensusError) error {
 	// For manual strategy, we just log the error and return
 	// Manual intervention is required
 	rm.hc.logger.Error("Manual intervention required",
-		"errorCode", cerr.Code,
-		"errorCategory", cerr.Category,
-		"message", cerr.Message,
-		"blockNumber", cerr.BlockNumber)
+		LogField{Key: "errorCode", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Code.String()))},
+		LogField{Key: "errorCategory", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Category.String()))},
+		LogField{Key: "message", Value: dtypes.NewValue(dtypes.ValueTypeString, []byte(cerr.Message))},
+		BlockHeightField(cerr.BlockNumber))
 	return fmt.Errorf("manual intervention required")
 }
 
@@ -417,18 +412,18 @@ func (rm *RecoveryManager) ResetRecoveryAttempts() {
 }
 
 // GetCircuitBreakerStatus returns the status of all circuit breakers
-func (rm *RecoveryManager) GetCircuitBreakerStatus() map[string]interface{} {
+func (rm *RecoveryManager) GetCircuitBreakerStatus() dtypes.CircuitBreakerStatuses {
 	rm.mu.RLock()
 	defer rm.mu.RUnlock()
 
-	status := make(map[string]interface{})
+	status := make(dtypes.CircuitBreakerStatuses)
 	for code, openTime := range rm.circuitBreakers {
-		timeRemaining := rm.circuitBreakerDuration - time.Since(openTime)
+		timeRemaining := rm.circuitBreakerDuration - ConsensusSince(openTime)
 		if timeRemaining > 0 {
-			status[code.String()] = map[string]interface{}{
-				"active":        true,
-				"openedAt":      openTime,
-				"timeRemaining": timeRemaining.String(),
+			status[code.String()] = &dtypes.CircuitBreakerStatus{
+				Active:        true,
+				OpenedAt:      openTime,
+				TimeRemaining: timeRemaining.String(),
 			}
 		}
 	}

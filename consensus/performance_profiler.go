@@ -182,10 +182,10 @@ func (p *PerformanceProfiler) StartOperation(opType OperationType) func() {
 		return func() {}
 	}
 
-	startTime := time.Now()
+	startTime := ConsensusNow()
 
 	return func() {
-		duration := time.Since(startTime)
+		duration := ConsensusSince(startTime)
 		p.RecordOperation(opType, duration)
 	}
 }
@@ -206,7 +206,7 @@ func (p *PerformanceProfiler) RecordOperation(opType OperationType, duration tim
 			MinDuration:     duration,
 			MaxDuration:     duration,
 			RecentDurations: make([]time.Duration, 0, p.sampleSize),
-			LastUpdated:     time.Now(),
+			LastUpdated:     ConsensusNow(),
 		}
 		p.metrics[opType] = metrics
 	}
@@ -253,7 +253,7 @@ func (p *PerformanceProfiler) RecordOperation(opType OperationType, duration tim
 		}
 	}
 
-	metrics.LastUpdated = time.Now()
+	metrics.LastUpdated = ConsensusNow()
 }
 
 // GetMetrics returns a copy of the current metrics
@@ -296,13 +296,13 @@ func (p *PerformanceProfiler) logMetrics() {
 	for _, opType := range opTypes {
 		metrics := p.metrics[opType]
 		p.logger.Info(fmt.Sprintf("  %s:", opType),
-			"count", metrics.Count,
-			"avg", metrics.AvgDuration,
-			"min", metrics.MinDuration,
-			"max", metrics.MaxDuration,
-			"p50", metrics.P50Duration,
-			"p90", metrics.P90Duration,
-			"p99", metrics.P99Duration)
+			LogKeyValue{Key: "count", Value: fmt.Sprintf("%d", metrics.Count)},
+			LogKeyValue{Key: "avg", Value: metrics.AvgDuration.String()},
+			LogKeyValue{Key: "min", Value: metrics.MinDuration.String()},
+			LogKeyValue{Key: "max", Value: metrics.MaxDuration.String()},
+			LogKeyValue{Key: "p50", Value: metrics.P50Duration.String()},
+			LogKeyValue{Key: "p90", Value: metrics.P90Duration.String()},
+			LogKeyValue{Key: "p99", Value: metrics.P99Duration.String()})
 	}
 }
 
@@ -321,16 +321,16 @@ func (p *PerformanceProfiler) detectBottlenecks() {
 	}
 
 	if len(bottlenecks) > 0 {
-		p.logger.Warn("Potential performance bottlenecks detected", "bottlenecks", bottlenecks)
+		p.logger.Warn("Potential performance bottlenecks detected", LogKeyValue{Key: "bottlenecks", Value: fmt.Sprintf("%v", bottlenecks)})
 	}
 }
 
 // takeMemoryProfile takes a memory profile
 func (p *PerformanceProfiler) takeMemoryProfile() {
 	// Create a new file for the memory profile
-	f, err := os.Create(fmt.Sprintf("mem_profile_%s.prof", time.Now().Format("20060102_150405")))
+	f, err := os.Create(fmt.Sprintf("mem_profile_%s.prof", ConsensusNow().Format("20060102_150405")))
 	if err != nil {
-		p.logger.Error("Could not create memory profile", "error", err)
+		p.logger.Error("Could not create memory profile", LogKeyValue{Key: "error", Value: err.Error()})
 		return
 	}
 	defer f.Close()
@@ -340,7 +340,7 @@ func (p *PerformanceProfiler) takeMemoryProfile() {
 
 	// Write memory profile
 	if err := pprof.WriteHeapProfile(f); err != nil {
-		p.logger.Error("Could not write memory profile", "error", err)
+		p.logger.Error("Could not write memory profile", LogKeyValue{Key: "error", Value: err.Error()})
 	}
 }
 
@@ -353,11 +353,11 @@ func (p *PerformanceProfiler) EnableCPUProfiling(enable bool) {
 		var err error
 		p.cpuProfileFile, err = os.Create("cpu_profile.prof")
 		if err != nil {
-			p.logger.Error("Could not create CPU profile", "error", err)
+			p.logger.Error("Could not create CPU profile", LogKeyValue{Key: "error", Value: err.Error()})
 			return
 		}
 		if err := pprof.StartCPUProfile(p.cpuProfileFile); err != nil {
-			p.logger.Error("Could not start CPU profile", "error", err)
+			p.logger.Error("Could not start CPU profile", LogKeyValue{Key: "error", Value: err.Error()})
 			p.cpuProfileFile.Close()
 			p.cpuProfileFile = nil
 			return
@@ -375,25 +375,25 @@ func (p *PerformanceProfiler) EnableCPUProfiling(enable bool) {
 // EnableMemoryProfiling enables or disables memory profiling
 func (p *PerformanceProfiler) EnableMemoryProfiling(enable bool) {
 	p.memProfilingEnabled = enable
-	p.logger.Info("Memory profiling", "enabled", enable)
+	p.logger.Info("Memory profiling", LogKeyValue{Key: "enabled", Value: fmt.Sprintf("%v", enable)})
 }
 
 // SetBottleneckThreshold sets the threshold for considering an operation a bottleneck
 func (p *PerformanceProfiler) SetBottleneckThreshold(threshold time.Duration) {
 	p.bottleneckThreshold = threshold
-	p.logger.Info("Bottleneck threshold updated", "threshold", threshold)
+	p.logger.Info("Bottleneck threshold updated", LogKeyValue{Key: "threshold", Value: threshold.String()})
 }
 
 // SetLogFrequency sets how often to log performance metrics
 func (p *PerformanceProfiler) SetLogFrequency(frequency time.Duration) {
 	p.logFrequency = frequency
-	p.logger.Info("Log frequency updated", "frequency", frequency)
+	p.logger.Info("Log frequency updated", LogKeyValue{Key: "frequency", Value: frequency.String()})
 }
 
 // SetSampleSize sets the number of recent durations to keep for percentile calculation
 func (p *PerformanceProfiler) SetSampleSize(size int) {
 	p.sampleSize = size
-	p.logger.Info("Sample size updated", "size", size)
+	p.logger.Info("Sample size updated", LogKeyValue{Key: "size", Value: fmt.Sprintf("%d", size)})
 }
 
 // ResetMetrics resets all performance metrics

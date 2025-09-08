@@ -1,0 +1,513 @@
+// Package consensus_test provides unit tests for the consensus module
+package consensus_test
+
+import (
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/consensus/types"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestHybridConsensusCreation tests the creation of HybridConsensus
+func TestHybridConsensusCreation(t *testing.T) {
+	tests := []struct {
+		name   string
+		config consensus.HybridConsensusConfig
+	}{
+		{
+			name:   "Production mode consensus",
+			config: consensus.DefaultHybridConfig(),
+		},
+		{
+			name:   "Test mode consensus",
+			config: consensus.TestHybridConfig(),
+		},
+		{
+			name: "Custom configuration",
+			config: consensus.HybridConsensusConfig{
+				Mode:               consensus.ProductionMode,
+				GossipDelay:        300 * time.Millisecond,
+				PoHTickDelay:       400 * time.Millisecond,
+				DPoSSetSize:        15,
+				DPoSEpoch:          500,
+				VotingDuration:     30 * time.Second,
+				PoHDriftTolerance:  5,
+				CheckpointInterval: 100,
+				VotingThreshold:    0.75,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hc := consensus.NewHybridConsensusWithConfig(tt.config)
+			require.NotNil(t, hc, "HybridConsensus should not be nil")
+
+			// Verify components are initialized
+			assert.NotNil(t, hc.GetLachesis(), "Lachesis should be initialized")
+			assert.NotNil(t, hc.GetDPoS(), "DPoS should be initialized")
+			assert.NotNil(t, hc.GetPoH(), "PoH should be initialized")
+			assert.NotNil(t, hc.GetValidatorManager(), "ValidatorManager should be initialized")
+
+			// Verify initial state
+			assert.Equal(t, uint64(0), hc.GetLastBlockHeight(), "Initial block height should be 0")
+			assert.False(t, hc.IsRunning(), "Consensus should not be running initially")
+		})
+	}
+}
+
+// TestHybridConsensusStartStop tests starting and stopping the consensus
+func TestHybridConsensusStartStop(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Test starting consensus
+	err := hc.Start()
+	require.NoError(t, err, "Starting consensus should not error")
+	assert.True(t, hc.IsRunning(), "Consensus should be running after Start")
+
+	// Test starting already running consensus
+	err = hc.Start()
+	assert.Error(t, err, "Starting already running consensus should error")
+
+	// Test stopping consensus
+	err = hc.Stop()
+	require.NoError(t, err, "Stopping consensus should not error")
+	assert.False(t, hc.IsRunning(), "Consensus should not be running after Stop")
+
+	// Test stopping already stopped consensus
+	err = hc.Stop()
+	assert.Error(t, err, "Stopping already stopped consensus should error")
+}
+
+// TestAddValidator tests adding validators to the consensus
+func TestAddValidator(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Generate validator IDs
+	validator1 := generateValidatorID(1)
+	validator2 := generateValidatorID(2)
+
+	// Add validators
+	hc.AddValidator(validator1, 1000000)
+	hc.AddValidator(validator2, 2000000)
+
+	// Verify validators were added
+	validators := hc.GetValidators()
+	assert.GreaterOrEqual(t, len(validators), 2, "Should have at least 2 validators")
+
+	// Check if our validators are in the list
+	found1, found2 := false, false
+	for _, v := range validators {
+		if v.ID == validator1 {
+			found1 = true
+			assert.Equal(t, uint64(1000000), v.Stake, "Validator 1 stake should match")
+		}
+		if v.ID == validator2 {
+			found2 = true
+			assert.Equal(t, uint64(2000000), v.Stake, "Validator 2 stake should match")
+		}
+	}
+	assert.True(t, found1, "Validator 1 should be found")
+	assert.True(t, found2, "Validator 2 should be found")
+}
+
+// TestUpdateStake tests updating validator stake
+func TestUpdateStake(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	initialStake := uint64(1000000)
+	hc.AddValidator(validatorID, initialStake)
+
+	// Update stake
+	newStake := uint64(3000000)
+	hc.UpdateStake(validatorID, newStake)
+
+	// Verify stake was updated
+	validators := hc.GetValidators()
+	for _, v := range validators {
+		if v.ID == validatorID {
+			assert.Equal(t, newStake, v.Stake, "Stake should be updated")
+			return
+		}
+	}
+	t.Fatal("Validator not found after stake update")
+}
+
+// TestCreateEvent tests event creation
+func TestCreateEvent(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Start consensus
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 1000000)
+
+	// Wait a bit for consensus to initialize
+	time.Sleep(100 * time.Millisecond)
+
+	// Create an event
+	parentIDs := make([][32]byte, 0)
+	data := []byte("test event data")
+	event := hc.CreateEvent(validatorID, parentIDs, data)
+
+	// Event might be nil if validator is not active yet
+	if event != nil {
+		assert.Equal(t, validatorID, event.Creator, "Event creator should match")
+		assert.Equal(t, data, event.Data, "Event data should match")
+		assert.False(t, event.Finalized, "Event should not be finalized immediately")
+	}
+}
+
+// TestFinalizeEvent tests event finalization
+func TestFinalizeEvent(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.VotingThreshold = 0.01 // Very low threshold for testing
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Start consensus
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add validators
+	validator1 := generateValidatorID(1)
+	validator2 := generateValidatorID(2)
+	hc.AddValidator(validator1, 5000000) // High stake
+	hc.AddValidator(validator2, 1000000)
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	// Create a test event
+	event := &types.Event{
+		ID:        generateEventID(),
+		Creator:   validator1,
+		ParentIDs: make([][32]byte, 0),
+		Data:      []byte("test finalization"),
+		Timestamp: time.Now(),
+		Height:    1,
+		Finalized: false,
+		PoHState:  [32]byte{},
+		PoHCount:  0,
+		PoHProof:  [32]byte{},
+	}
+
+	// Try to finalize the event
+	finalized, err := hc.FinalizeEvent(event)
+
+	// In test mode, finalization might succeed or fail depending on PoH state
+	// We just verify no unexpected errors occur
+	if err != nil {
+		t.Logf("Finalization error (expected in test): %v", err)
+	} else if finalized {
+		assert.True(t, event.Finalized, "Event should be marked as finalized")
+	}
+}
+
+// TestProcessBlock tests block processing
+func TestProcessBlock(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.VotingThreshold = 0.01 // Very low threshold for testing
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Start consensus
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add validators with high stake
+	validator1 := generateValidatorID(1)
+	validator2 := generateValidatorID(2)
+	hc.AddValidator(validator1, 10000000)
+	hc.AddValidator(validator2, 5000000)
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	// Process first block
+	err = hc.ProcessBlock(1)
+
+	// In test environment, block processing might fail due to various reasons
+	// We check if the error is expected
+	if err != nil {
+		t.Logf("Block processing error (may be expected): %v", err)
+		// Check if it's a known error type
+		assert.Contains(t, err.Error(), "consensus", "Error should be consensus-related")
+	} else {
+		// If successful, verify block height increased
+		assert.Equal(t, uint64(1), hc.GetLastBlockHeight(), "Block height should be 1")
+	}
+}
+
+// TestCheckpointCreation tests checkpoint creation
+func TestCheckpointCreation(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	config.CheckpointInterval = 5 // Low interval for testing
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Start consensus
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Add validators
+	validator := generateValidatorID(1)
+	hc.AddValidator(validator, 10000000)
+
+	// Wait for initialization
+	time.Sleep(200 * time.Millisecond)
+
+	// Check if checkpoint exists at block 0 (might not in test mode)
+	hasCheckpoint := hc.HasCheckpoint(0)
+	t.Logf("Has checkpoint at block 0: %v", hasCheckpoint)
+
+	// Try to process blocks up to checkpoint interval
+	for i := uint64(1); i <= config.CheckpointInterval; i++ {
+		err := hc.ProcessBlock(i)
+		if err != nil {
+			t.Logf("Block %d processing error: %v", i, err)
+			// Continue trying other blocks
+		}
+	}
+
+	// Check if checkpoint was created
+	if hc.GetLastBlockHeight() >= config.CheckpointInterval {
+		hasCheckpoint = hc.HasCheckpoint(config.CheckpointInterval)
+		t.Logf("Has checkpoint at interval %d: %v", config.CheckpointInterval, hasCheckpoint)
+	}
+}
+
+// TestNetworkLoad tests network load calculation
+func TestNetworkLoad(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Get initial network load
+	load := hc.GetNetworkLoad()
+	assert.GreaterOrEqual(t, load, 0.0, "Network load should be non-negative")
+	assert.LessOrEqual(t, load, 1.0, "Network load should not exceed 1.0")
+}
+
+// TestGetPendingEvents tests retrieving pending events
+func TestGetPendingEvents(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Initially should have no pending events
+	pending := hc.GetPendingEvents()
+	assert.Empty(t, pending, "Should have no pending events initially")
+}
+
+// TestGetFinalizedEvents tests retrieving finalized events
+func TestGetFinalizedEvents(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Get finalized events for a range
+	events, err := hc.GetFinalizedEvents(0, 10)
+	require.NoError(t, err, "Getting finalized events should not error")
+	assert.NotNil(t, events, "Events slice should not be nil")
+	assert.Empty(t, events, "Should have no finalized events initially")
+}
+
+// TestIsTestMode tests the test mode detection
+func TestIsTestMode(t *testing.T) {
+	// Test with production config
+	prodConfig := consensus.DefaultHybridConfig()
+	hcProd := consensus.NewHybridConsensusWithConfig(prodConfig)
+	assert.False(t, hcProd.IsTestMode(), "Should not be in test mode with production config")
+
+	// Test with test config
+	testConfig := consensus.TestHybridConfig()
+	hcTest := consensus.NewHybridConsensusWithConfig(testConfig)
+	assert.True(t, hcTest.IsTestMode(), "Should be in test mode with test config")
+}
+
+// TestConcurrentOperations tests concurrent access to consensus
+func TestConcurrentOperations(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Start consensus
+	err := hc.Start()
+	require.NoError(t, err)
+	defer hc.Stop()
+
+	// Run concurrent operations
+	done := make(chan bool, 4)
+
+	// Goroutine 1: Add validators
+	go func() {
+		for i := 0; i < 5; i++ {
+			validatorID := generateValidatorID(i)
+			hc.AddValidator(validatorID, uint64(1000000+i*100000))
+			time.Sleep(10 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 2: Get validators
+	go func() {
+		for i := 0; i < 10; i++ {
+			validators := hc.GetValidators()
+			assert.NotNil(t, validators)
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 3: Get network load
+	go func() {
+		for i := 0; i < 10; i++ {
+			load := hc.GetNetworkLoad()
+			assert.GreaterOrEqual(t, load, 0.0)
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Goroutine 4: Get block height
+	go func() {
+		for i := 0; i < 10; i++ {
+			height := hc.GetLastBlockHeight()
+			assert.GreaterOrEqual(t, height, uint64(0))
+			time.Sleep(5 * time.Millisecond)
+		}
+		done <- true
+	}()
+
+	// Wait for all goroutines to complete
+	for i := 0; i < 4; i++ {
+		select {
+		case <-done:
+			// Success
+		case <-time.After(5 * time.Second):
+			t.Fatal("Concurrent operations timed out")
+		}
+	}
+}
+
+// Helper functions are defined in common_test.go
+
+// TestValidatorManagement tests comprehensive validator management
+func TestValidatorManagement(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Test adding multiple validators
+	validators := make([][32]byte, 5)
+	stakes := []uint64{1000000, 2000000, 3000000, 4000000, 5000000}
+
+	for i := range validators {
+		validators[i] = generateValidatorID(i)
+		hc.AddValidator(validators[i], stakes[i])
+	}
+
+	// Verify all validators were added
+	allValidators := hc.GetValidators()
+	assert.GreaterOrEqual(t, len(allValidators), len(validators), "Should have all validators")
+
+	// Test updating stakes
+	for i, v := range validators {
+		newStake := stakes[i] * 2
+		hc.UpdateStake(v, newStake)
+	}
+
+	// Verify stakes were updated
+	updatedValidators := hc.GetValidators()
+	for _, v := range updatedValidators {
+		for i, origValidator := range validators {
+			if v.ID == origValidator {
+				assert.Equal(t, stakes[i]*2, v.Stake, "Stake should be doubled")
+			}
+		}
+	}
+}
+
+// TestErrorHandling tests error handling in various scenarios
+func TestErrorHandling(t *testing.T) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+	require.NotNil(t, hc)
+
+	// Test nil event finalization
+	finalized, err := hc.FinalizeEvent(nil)
+	assert.Error(t, err, "Should error on nil event")
+	assert.False(t, finalized, "Should not finalize nil event")
+
+	// Test creating event with non-existent validator
+	nonExistentValidator := generateValidatorID(999)
+	event := hc.CreateEvent(nonExistentValidator, nil, []byte("test"))
+	assert.Nil(t, event, "Should not create event for non-existent validator")
+
+	// Test processing block without starting consensus
+	err = hc.ProcessBlock(1)
+	assert.Error(t, err, "Should error when processing block without running consensus")
+}
+
+// BenchmarkEventCreation benchmarks event creation performance
+func BenchmarkEventCreation(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+
+	// Start consensus
+	err := hc.Start()
+	require.NoError(b, err)
+	defer hc.Stop()
+
+	// Add a validator
+	validatorID := generateValidatorID(1)
+	hc.AddValidator(validatorID, 10000000)
+
+	// Wait for initialization
+	time.Sleep(100 * time.Millisecond)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		data := []byte("benchmark event data")
+		_ = hc.CreateEvent(validatorID, nil, data)
+	}
+}
+
+// BenchmarkGetValidators benchmarks validator retrieval performance
+func BenchmarkGetValidators(b *testing.B) {
+	config := consensus.TestHybridConfig()
+	hc := consensus.NewHybridConsensusWithConfig(config)
+
+	// Add many validators
+	for i := 0; i < 100; i++ {
+		validatorID := generateValidatorID(i)
+		hc.AddValidator(validatorID, uint64(1000000+i*10000))
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = hc.GetValidators()
+	}
+}

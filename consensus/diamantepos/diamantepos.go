@@ -3,6 +3,7 @@
 package diamantepos
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"diamante/common"
 	"diamante/consensus/types"
 )
 
@@ -57,6 +59,7 @@ type DPoS struct {
 	epochDuration    uint64
 	currentEpoch     uint64
 	maxSetSize       int
+	minStake         uint64
 	slashLog         []SlashEvent
 
 	logger Logger
@@ -76,6 +79,7 @@ func NewDPoS(maxSetSize int, epochDuration uint64, logger Logger) *DPoS {
 		validators:    make(map[[32]byte]*Validator),
 		maxSetSize:    maxSetSize,
 		epochDuration: epochDuration,
+		minStake:      0,
 		logger:        logger,
 		slashLog:      make([]SlashEvent, 0),
 	}
@@ -96,7 +100,7 @@ func (d *DPoS) AddValidator(id [32]byte, stake uint64) {
 			ID:             id,
 			Stake:          stake,
 			Performance:    1.0,
-			LastUpdateTime: time.Now(),
+			LastUpdateTime: common.ConsensusNow(),
 		}
 		d.totalStake += stake
 		d.logger.Info("Validator added", "id", hex.EncodeToString(id[:]), "stake", stake)
@@ -133,25 +137,50 @@ func (d *DPoS) updateActiveValidators() {
 	d.activeValidatorsMu.Lock()
 	defer d.activeValidatorsMu.Unlock()
 
-	// Create a slice of validators to sort.
-	var sorted []*Validator
-	for _, v := range d.validators {
-		sorted = append(sorted, v)
+	// IMPORTANT: Sort validator IDs first to ensure deterministic iteration order
+	var validatorIDs [][32]byte
+	for id := range d.validators {
+		validatorIDs = append(validatorIDs, id)
 	}
-	sort.Slice(sorted, func(i, j int) bool {
-		scoreI := float64(sorted[i].Stake) * sorted[i].Performance
-		scoreJ := float64(sorted[j].Stake) * sorted[j].Performance
-		return scoreI > scoreJ
+	sort.Slice(validatorIDs, func(i, j int) bool {
+		return bytes.Compare(validatorIDs[i][:], validatorIDs[j][:]) < 0
 	})
 
-	// Select top validators up to maxSetSize.
+	// Create a slice of validators that meet the minimum stake requirement.
+	var sorted []*Validator
+	for _, id := range validatorIDs {
+		v := d.validators[id]
+		if v.Stake >= d.minStake {
+			sorted = append(sorted, v)
+		}
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		// Use fixed-point math for deterministic scoring
+		stakeI := NewFixedPointFromUint64(sorted[i].Stake, DefaultPrecision)
+		perfI := NewFixedPointFromFloat64(sorted[i].Performance, DefaultPrecision)
+		scoreI := stakeI.Mul(perfI)
+
+		stakeJ := NewFixedPointFromUint64(sorted[j].Stake, DefaultPrecision)
+		perfJ := NewFixedPointFromFloat64(sorted[j].Performance, DefaultPrecision)
+		scoreJ := stakeJ.Mul(perfJ)
+
+		cmp := scoreI.Compare(scoreJ)
+		if cmp != 0 {
+			return cmp > 0
+		}
+		// Secondary sort by validator ID for determinism when scores are equal
+		return bytes.Compare(sorted[i].ID[:], sorted[j].ID[:]) < 0
+	})
+
+	// Select top validators up to maxSetSize after filtering by minimum stake.
 	top := min(len(sorted), d.maxSetSize)
 	d.activeValidators = sorted[:top]
 
 	// Reset all validators' active status, then mark the active set.
 	d.activeTotalStake = 0
-	for _, v := range d.validators {
-		v.IsActive = false
+	// Use sorted IDs for deterministic iteration
+	for _, id := range validatorIDs {
+		d.validators[id].IsActive = false
 	}
 	for _, v := range d.activeValidators {
 		v.IsActive = true
@@ -174,10 +203,37 @@ func (d *DPoS) GetNextValidator(blockNumber uint64, lastBlockHash [32]byte) *typ
 	seed := sha256.Sum256(append(lastBlockHash[:], uint64ToBytes(blockNumber)...))
 	index := binary.BigEndian.Uint64(seed[:8]) % uint64(len(d.activeValidators))
 	selected := d.activeValidators[int(index)]
-	d.logger.Info("Next validator selected", "blockNumber", blockNumber, "validator", hex.EncodeToString(selected.ID[:]))
+	d.logger.Info("Next validator selected", "blockNumber", blockNumber, "validator", hex.EncodeToString(selected.ID[:]), "index", index, "totalActive", len(d.activeValidators))
 	return &types.Validator{
 		ID:    selected.ID,
 		Stake: selected.Stake,
+	}
+}
+
+// LogValidatorSet logs the current active validator set with their indices for debugging
+func (d *DPoS) LogValidatorSet() {
+	d.activeValidatorsMu.RLock()
+	defer d.activeValidatorsMu.RUnlock()
+
+	d.logger.Info("Active validator set snapshot", "count", len(d.activeValidators), "validator_count", len(d.activeValidators))
+	for i, v := range d.activeValidators {
+		d.logger.Info("Validator",
+			"index", i,
+			"id", hex.EncodeToString(v.ID[:]),
+			"stake", v.Stake,
+			"performance", v.Performance)
+	}
+
+	// Log initial proposer for block 1
+	if len(d.activeValidators) > 0 {
+		var zeroHash [32]byte
+		nextValidator := d.GetNextValidator(1, zeroHash)
+		if nextValidator != nil {
+			d.logger.Info("Initial proposer for block 1",
+				"proposer", hex.EncodeToString(nextValidator.ID[:]),
+				"index", 0,
+				"validator_count", len(d.activeValidators))
+		}
 	}
 }
 
@@ -202,8 +258,22 @@ func (d *DPoS) ProcessEpoch(blockNumber uint64) error {
 	defer d.validatorsMu.Unlock()
 	defer d.stakeMu.Unlock()
 
+	// Calculate epoch transition details for logging
+	oldEpoch := d.currentEpoch
 	d.currentEpoch++
-	d.logger.Info("Processing new epoch", "epoch", d.currentEpoch, "blockNumber", blockNumber)
+
+	// Calculate deterministic epoch seed and validator set hash
+	// Use block number as seed since we don't have lastBlockHash here
+	epochSeed := sha256.Sum256(append([]byte(fmt.Sprintf("epoch-%d", d.currentEpoch)), uint64ToBytes(blockNumber)...))
+	validatorSetHash := d.calculateValidatorSetHash()
+
+	d.logger.Info("EpochTransition",
+		"event", "EpochTransition",
+		"height", blockNumber,
+		"oldEpoch", oldEpoch,
+		"newEpoch", d.currentEpoch,
+		"validatorSetHash", hex.EncodeToString(validatorSetHash[:]),
+		"epochSeed", hex.EncodeToString(epochSeed[:]))
 
 	// 1) Perform slashing.
 	slashedAny, err := d.handleSlashingAndPenalties()
@@ -280,7 +350,7 @@ func (d *DPoS) handleSlashingAndPenalties() (bool, error) {
 				ValidatorID: val.ID,
 				Amount:      penalty,
 				Reason:      "Misbehavior",
-				Timestamp:   time.Now(),
+				Timestamp:   common.ConsensusNow(),
 			})
 
 			d.logger.Info("Validator slashed", "validator", hex.EncodeToString(val.ID[:]), "penalty", penalty, "oldStake", oldStake, "newStake", val.Stake)
@@ -312,8 +382,9 @@ func (d *DPoS) RewardValidator(id [32]byte) {
 	if val, exists := d.validators[id]; exists {
 		oldPerf := val.Performance
 		val.Performance = math.Min(val.Performance*1.01, 1.0)
-		val.LastUpdateTime = time.Now()
-		d.logger.Info("Validator rewarded", "validator", hex.EncodeToString(id[:]), "oldPerformance", oldPerf, "newPerformance", val.Performance)
+		val.LastUpdateTime = common.ConsensusNow()
+		val.BlocksProduced++
+		d.logger.Info("Validator rewarded", "validator", hex.EncodeToString(id[:]), "oldPerformance", oldPerf, "newPerformance", val.Performance, "blocksProduced", val.BlocksProduced)
 	} else {
 		d.logger.Error("RewardValidator: Validator not found", "id", hex.EncodeToString(id[:]))
 	}
@@ -328,7 +399,7 @@ func (d *DPoS) GetSlashLog() []SlashEvent {
 
 // updatePerformance ages each validator’s performance using a decay formula.
 func (d *DPoS) updatePerformance() {
-	now := time.Now()
+	now := common.ConsensusNow()
 	for _, val := range d.validators {
 		hoursDiff := now.Sub(val.LastUpdateTime).Hours()
 		if hoursDiff > 0 {
@@ -432,6 +503,22 @@ func (d *DPoS) SetSetSize(size int) {
 	d.updateActiveValidators()
 }
 
+// GetMinStake returns the minimum required stake for a validator to be eligible for the active set.
+func (d *DPoS) GetMinStake() uint64 {
+	d.stakeMu.RLock()
+	defer d.stakeMu.RUnlock()
+	return d.minStake
+}
+
+// SetMinStake updates the minimum stake threshold and recalculates the active validator set.
+func (d *DPoS) SetMinStake(stake uint64) {
+	d.stakeMu.Lock()
+	d.minStake = stake
+	d.stakeMu.Unlock()
+	d.logger.Info("Minimum stake updated", "newMinStake", stake)
+	d.updateActiveValidators()
+}
+
 // GetEpochDuration returns the current epoch duration (in blocks).
 func (d *DPoS) GetEpochDuration() uint64 {
 	d.epochMu.RLock()
@@ -453,10 +540,18 @@ func (d *DPoS) SetEpochDuration(duration uint64) {
 
 // GetState serializes the entire DPoS state (validators, active set, epoch info) into JSON.
 func (d *DPoS) GetState() ([]byte, error) {
-	// Copy data under locks
+	// Copy data under locks - sort keys for deterministic iteration
 	d.validatorsMu.RLock()
 	valCopy := make(map[[32]byte]*Validator, len(d.validators))
-	for k, v := range d.validators {
+	var validatorIDs [][32]byte
+	for k := range d.validators {
+		validatorIDs = append(validatorIDs, k)
+	}
+	sort.Slice(validatorIDs, func(i, j int) bool {
+		return bytes.Compare(validatorIDs[i][:], validatorIDs[j][:]) < 0
+	})
+	for _, k := range validatorIDs {
+		v := d.validators[k]
 		vc := *v
 		valCopy[k] = &vc
 	}
@@ -498,8 +593,17 @@ func (d *DPoS) GetState() ([]byte, error) {
 		MaxSetSize:      maxSize,
 	}
 
-	// Fill validators
-	for id, val := range valCopy {
+	// Fill validators - sort for deterministic iteration
+	var sortedIDs [][32]byte
+	for id := range valCopy {
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Slice(sortedIDs, func(i, j int) bool {
+		return bytes.Compare(sortedIDs[i][:], sortedIDs[j][:]) < 0
+	})
+
+	for _, id := range sortedIDs {
+		val := valCopy[id]
 		idStr := hex.EncodeToString(id[:])
 		state.Validators[idStr] = serValidator{
 			ID:               hex.EncodeToString(val.ID[:]),
@@ -552,7 +656,16 @@ func (d *DPoS) RestoreState(stateData []byte) error {
 
 	newVals := make(map[[32]byte]*Validator)
 	var total uint64
-	for idStr, valData := range st.Validators {
+
+	// Sort validator keys for deterministic iteration
+	var validatorKeys []string
+	for idStr := range st.Validators {
+		validatorKeys = append(validatorKeys, idStr)
+	}
+	sort.Strings(validatorKeys)
+
+	for _, idStr := range validatorKeys {
+		valData := st.Validators[idStr]
 		idBytes, err := hex.DecodeString(idStr)
 		if err != nil {
 			return fmt.Errorf("failed to decode validator ID %q: %v", idStr, err)
@@ -674,4 +787,31 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// calculateValidatorSetHash returns a deterministic hash of the current validator set
+func (d *DPoS) calculateValidatorSetHash() [32]byte {
+	// Sort validators by ID for deterministic ordering
+	var validatorIDs []string
+	for _, v := range d.validators {
+		validatorIDs = append(validatorIDs, hex.EncodeToString(v.ID[:]))
+	}
+	sort.Strings(validatorIDs)
+
+	// Create hash of sorted validator IDs and their stakes
+	h := sha256.New()
+	for _, id := range validatorIDs {
+		h.Write([]byte(id))
+		// Find validator and write stake
+		for _, v := range d.validators {
+			if hex.EncodeToString(v.ID[:]) == id {
+				h.Write(uint64ToBytes(v.Stake))
+				break
+			}
+		}
+	}
+
+	var result [32]byte
+	copy(result[:], h.Sum(nil))
+	return result
 }

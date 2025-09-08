@@ -1,0 +1,496 @@
+package consensus_test
+
+import (
+	"context"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// MockBatchItem implements BatchItem interface for testing
+type MockBatchItem struct {
+	ID        string
+	Size      int
+	Processed bool
+	Priority  int
+}
+
+func (m *MockBatchItem) GetID() string {
+	return m.ID
+}
+
+func (m *MockBatchItem) GetSize() int {
+	return m.Size
+}
+
+func (m *MockBatchItem) GetPriority() int {
+	return m.Priority
+}
+
+func TestBatchProcessor(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     100,
+			MaxBatchTime:     time.Second,
+			ProcessorWorkers: 2,
+			QueueSize:        1000,
+		}
+
+		processedCount := int32(0)
+		processor := func(items []consensus.BatchItem) error {
+			atomic.AddInt32(&processedCount, int32(len(items)))
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+		require.NotNil(t, bp)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = bp.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("Basic Processing", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     5,
+			MaxBatchTime:     100 * time.Millisecond,
+			ProcessorWorkers: 1,
+			QueueSize:        100,
+		}
+
+		processedItems := make([]*MockBatchItem, 0)
+		var mu sync.Mutex
+
+		processor := func(items []consensus.BatchItem) error {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, item := range items {
+				if mockItem, ok := item.(*MockBatchItem); ok {
+					mockItem.Processed = true
+					processedItems = append(processedItems, mockItem)
+				}
+			}
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Add items
+		items := make([]*MockBatchItem, 10)
+		for i := 0; i < 10; i++ {
+			items[i] = &MockBatchItem{
+				ID:   string(rune('A' + i)),
+				Size: 10,
+			}
+			err := bp.Add(items[i])
+			assert.NoError(t, err)
+		}
+
+		// Wait for processing
+		time.Sleep(200 * time.Millisecond)
+
+		// Check all items were processed
+		mu.Lock()
+		assert.Equal(t, 10, len(processedItems))
+		for _, item := range items {
+			assert.True(t, item.Processed)
+		}
+		mu.Unlock()
+	})
+
+	t.Run("Batch Size Trigger", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     3,
+			MaxBatchTime:     10 * time.Second, // Long timeout
+			ProcessorWorkers: 1,
+			QueueSize:        100,
+		}
+
+		batchSizes := make([]int, 0)
+		var mu sync.Mutex
+
+		processor := func(items []consensus.BatchItem) error {
+			mu.Lock()
+			batchSizes = append(batchSizes, len(items))
+			mu.Unlock()
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Add exactly MaxBatchSize items
+		for i := 0; i < 3; i++ {
+			item := &MockBatchItem{ID: string(rune('A' + i)), Size: 1}
+			bp.Add(item)
+		}
+
+		// Should trigger immediately
+		time.Sleep(50 * time.Millisecond)
+
+		mu.Lock()
+		assert.Equal(t, 1, len(batchSizes))
+		assert.Equal(t, 3, batchSizes[0])
+		mu.Unlock()
+	})
+
+	t.Run("Batch Time Trigger", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     100, // Large size
+			MaxBatchTime:     50 * time.Millisecond,
+			ProcessorWorkers: 1,
+			QueueSize:        100,
+		}
+
+		processTime := time.Time{}
+		var mu sync.Mutex
+
+		processor := func(items []consensus.BatchItem) error {
+			mu.Lock()
+			processTime = time.Now()
+			mu.Unlock()
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Add one item
+		startTime := time.Now()
+		item := &MockBatchItem{ID: "A", Size: 1}
+		bp.Add(item)
+
+		// Wait for time trigger
+		time.Sleep(100 * time.Millisecond)
+
+		mu.Lock()
+		assert.WithinDuration(t, startTime.Add(50*time.Millisecond), processTime, 30*time.Millisecond)
+		mu.Unlock()
+	})
+
+	t.Run("Priority Processing", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     5,
+			MaxBatchTime:     100 * time.Millisecond,
+			ProcessorWorkers: 1,
+			QueueSize:        100,
+			EnablePriority:   true,
+		}
+
+		processedOrder := make([]string, 0)
+		var mu sync.Mutex
+
+		processor := func(items []consensus.BatchItem) error {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, item := range items {
+				processedOrder = append(processedOrder, item.GetID())
+			}
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Add items with different priorities
+		items := []*MockBatchItem{
+			{ID: "low", Priority: 1},
+			{ID: "high", Priority: 10},
+			{ID: "medium", Priority: 5},
+			{ID: "highest", Priority: 15},
+			{ID: "lowest", Priority: 0},
+		}
+
+		for _, item := range items {
+			bp.Add(item)
+		}
+
+		// Wait for processing
+		time.Sleep(150 * time.Millisecond)
+
+		// Check priority order
+		mu.Lock()
+		assert.Equal(t, 5, len(processedOrder))
+		// Higher priority should be processed first
+		assert.Contains(t, processedOrder[:2], "highest")
+		assert.Contains(t, processedOrder[:2], "high")
+		mu.Unlock()
+	})
+
+	t.Run("Queue Full", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     10,
+			MaxBatchTime:     time.Second,
+			ProcessorWorkers: 1,
+			QueueSize:        5, // Small queue
+		}
+
+		// Slow processor
+		processor := func(items []consensus.BatchItem) error {
+			time.Sleep(100 * time.Millisecond)
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Fill the queue
+		errorCount := 0
+		for i := 0; i < 10; i++ {
+			item := &MockBatchItem{ID: string(rune('A' + i)), Size: 1}
+			err := bp.Add(item)
+			if err != nil {
+				errorCount++
+			}
+		}
+
+		// Should have some rejections
+		assert.Greater(t, errorCount, 0)
+	})
+
+	t.Run("Flush", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     100,
+			MaxBatchTime:     10 * time.Second,
+			ProcessorWorkers: 1,
+			QueueSize:        100,
+		}
+
+		processedCount := int32(0)
+		processor := func(items []consensus.BatchItem) error {
+			atomic.AddInt32(&processedCount, int32(len(items)))
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Add items
+		for i := 0; i < 5; i++ {
+			item := &MockBatchItem{ID: string(rune('A' + i)), Size: 1}
+			bp.Add(item)
+		}
+
+		// Flush immediately
+		err = bp.Flush()
+		assert.NoError(t, err)
+
+		// Check processed
+		assert.Equal(t, int32(5), atomic.LoadInt32(&processedCount))
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultBatchProcessorConfig()
+
+		processed := false
+		processor := func(items []consensus.BatchItem) error {
+			processed = true
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Add item
+		item := &MockBatchItem{ID: "A", Size: 1}
+		bp.Add(item)
+
+		// Stop should flush pending items
+		err = bp.Stop()
+		assert.NoError(t, err)
+		assert.True(t, processed)
+
+		// Should not stop twice
+		err = bp.Stop()
+		assert.Error(t, err)
+	})
+
+	t.Run("Concurrent Operations", func(t *testing.T) {
+		config := &consensus.BatchProcessorConfig{
+			MaxBatchSize:     10,
+			MaxBatchTime:     50 * time.Millisecond,
+			ProcessorWorkers: 4,
+			QueueSize:        1000,
+		}
+
+		processedCount := int32(0)
+		processor := func(items []consensus.BatchItem) error {
+			atomic.AddInt32(&processedCount, int32(len(items)))
+			return nil
+		}
+
+		bp := consensus.NewBatchProcessor(config, processor, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := bp.Start(ctx)
+		require.NoError(t, err)
+
+		// Concurrent additions
+		var wg sync.WaitGroup
+		itemsPerWorker := 100
+		workers := 10
+
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				for i := 0; i < itemsPerWorker; i++ {
+					item := &MockBatchItem{
+						ID:   string(rune('A'+workerID)) + string(rune('0'+i)),
+						Size: 1,
+					}
+					bp.Add(item)
+				}
+			}(w)
+		}
+
+		wg.Wait()
+
+		// Flush and verify
+		bp.Flush()
+		time.Sleep(100 * time.Millisecond)
+
+		assert.Equal(t, int32(workers*itemsPerWorker), atomic.LoadInt32(&processedCount))
+	})
+}
+
+func TestBatchProcessorStats(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	config := &consensus.BatchProcessorConfig{
+		MaxBatchSize:     5,
+		MaxBatchTime:     100 * time.Millisecond,
+		ProcessorWorkers: 1,
+		QueueSize:        100,
+		EnableStats:      true,
+	}
+
+	processedBatches := int32(0)
+	processor := func(items []consensus.BatchItem) error {
+		atomic.AddInt32(&processedBatches, 1)
+		return nil
+	}
+
+	bp := consensus.NewBatchProcessor(config, processor, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err := bp.Start(ctx)
+	require.NoError(t, err)
+
+	// Process some items
+	for i := 0; i < 15; i++ {
+		item := &MockBatchItem{ID: string(rune('A' + i)), Size: 10}
+		bp.Add(item)
+	}
+
+	// Wait for processing
+	time.Sleep(200 * time.Millisecond)
+
+	stats := bp.GetStats()
+	assert.NotNil(t, stats)
+	assert.Equal(t, uint64(15), stats.ItemsProcessed)
+	assert.Equal(t, uint64(3), stats.BatchesProcessed)
+	assert.Greater(t, stats.AvgBatchSize, float64(4))
+	assert.Greater(t, stats.AvgProcessTime, time.Duration(0))
+}
+
+func BenchmarkBatchProcessor(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &consensus.BatchProcessorConfig{
+		MaxBatchSize:     100,
+		MaxBatchTime:     10 * time.Millisecond,
+		ProcessorWorkers: 4,
+		QueueSize:        10000,
+		EnableStats:      false,
+	}
+
+	processor := func(items []consensus.BatchItem) error {
+		// Simulate processing
+		time.Sleep(time.Microsecond)
+		return nil
+	}
+
+	bp := consensus.NewBatchProcessor(config, processor, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	bp.Start(ctx)
+
+	b.Run("Add", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			item := &MockBatchItem{ID: "bench", Size: 1}
+			bp.Add(item)
+		}
+	})
+
+	b.Run("ParallelAdd", func(b *testing.B) {
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				item := &MockBatchItem{ID: "bench", Size: 1}
+				bp.Add(item)
+			}
+		})
+	})
+}

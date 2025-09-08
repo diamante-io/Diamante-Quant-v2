@@ -3,12 +3,11 @@ package common
 import (
 	"errors"
 	"sync"
-	"time"
 )
 
 const (
-	// DefaultTotalSupply is the default total supply of DIAM tokens (100 million)
-	DefaultTotalSupply = 100_000_000.0
+	// DefaultTotalSupply is the total supply of DIAM tokens (10 billion)
+	DefaultTotalSupply = 10_000_000_000.0
 
 	// DefaultInitialFunding is the default amount to fund new wallets with for testing
 	DefaultInitialFunding = 100.0
@@ -61,13 +60,21 @@ func (ts *TokenSupply) Initialize(totalSupply float64, treasuryID string) error 
 	// Create the treasury account if it doesn't exist
 	treasury := GetAccount(treasuryID)
 	if treasury == nil {
-		// Create a new account for the treasury
-		treasury = &Account{
-			ID:         treasuryID,
-			Balance:    totalSupply,
-			CreatedAt:  GetCurrentTimestamp(),
-			LastActive: GetCurrentTimestamp(),
+		// Create a 32-byte public key for the treasury account
+		publicKey := make([]byte, 32)
+		for i := 0; i < 32; i++ {
+			publicKey[i] = byte((i + 1) % 256) // Fill with pattern
 		}
+
+		// Create a new account for the treasury
+		treasury, err := NewAccount(treasuryID, publicKey)
+		if err != nil {
+			return err
+		}
+		treasury.Balance = totalSupply
+		treasury.CreatedAt = GetCurrentTimestamp()
+		treasury.LastActive = GetCurrentTimestamp()
+
 		if err := RegisterAccount(treasury); err != nil {
 			return err
 		}
@@ -135,6 +142,27 @@ func (ts *TokenSupply) MintTokens(accountID string, amount float64) error {
 		return ErrExceedsTotalSupply
 	}
 
+	// Create the target account if it doesn't exist
+	targetAccount := GetAccount(accountID)
+	if targetAccount == nil {
+		// Create a 32-byte public key for the new account
+		publicKey := make([]byte, 32)
+		for i := 0; i < 32; i++ {
+			publicKey[i] = byte((i + 10) % 256) // Different pattern from treasury
+		}
+
+		newAccount, err := NewAccount(accountID, publicKey)
+		if err != nil {
+			return err
+		}
+		newAccount.CreatedAt = GetCurrentTimestamp()
+		newAccount.LastActive = GetCurrentTimestamp()
+
+		if err := RegisterAccount(newAccount); err != nil {
+			return err
+		}
+	}
+
 	// Transfer tokens from treasury to the account
 	if err := UpdateAccountBalance(ts.treasuryID, -amount); err != nil {
 		return err
@@ -195,9 +223,4 @@ func (ts *TokenSupply) FundNewWallet(walletID string, amount float64) error {
 	}
 
 	return ts.MintTokens(walletID, amount)
-}
-
-// GetCurrentTimestamp returns the current Unix timestamp
-func GetCurrentTimestamp() int64 {
-	return time.Now().Unix()
 }

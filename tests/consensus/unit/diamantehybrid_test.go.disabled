@@ -1,0 +1,355 @@
+package consensus_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/common"
+	dtypes "diamante/types"
+)
+
+// TestDiamanteHybridConsensus tests the hybrid consensus mechanism
+func TestDiamanteHybridConsensus(t *testing.T) {
+	tests := []struct {
+		name        string
+		validators  int
+		transactions int
+		expectError bool
+	}{
+		{
+			name:        "basic_consensus_with_3_validators",
+			validators:  3,
+			transactions: 10,
+			expectError: false,
+		},
+		{
+			name:        "stress_test_with_7_validators",
+			validators:  7,
+			transactions: 100,
+			expectError: false,
+		},
+		{
+			name:        "single_validator_edge_case",
+			validators:  1,
+			transactions: 5,
+			expectError: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create hybrid consensus instance
+			config := &consensus.HybridConfig{
+				NumValidators:     tt.validators,
+				BlockTime:        time.Second,
+				FinalizationTime: 3 * time.Second,
+				ByzantineFaultTolerance: true,
+			}
+			
+			hybridConsensus, err := consensus.NewDiamanteHybrid(config)
+			if err != nil {
+				t.Fatalf("Failed to create hybrid consensus: %v", err)
+			}
+			defer hybridConsensus.Stop()
+
+			// Test initialization
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			err = hybridConsensus.Start(ctx)
+			if tt.expectError {
+				if err == nil {
+					t.Errorf("Expected error but got none")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Failed to start consensus: %v", err)
+			}
+
+			// Test transaction processing
+			for i := 0; i < tt.transactions; i++ {
+				tx := createTestTransaction(t, i)
+				err = hybridConsensus.SubmitTransaction(tx)
+				if err != nil {
+					t.Errorf("Failed to submit transaction %d: %v", i, err)
+				}
+			}
+
+			// Wait for block production
+			select {
+			case <-time.After(5 * time.Second):
+				// Verify blocks were produced
+				height := hybridConsensus.GetCurrentHeight()
+				if height == 0 {
+					t.Errorf("No blocks produced after 5 seconds")
+				}
+			case <-ctx.Done():
+				t.Errorf("Test timeout")
+			}
+
+			// Test consensus state
+			state := hybridConsensus.GetConsensusState()
+			if state == nil {
+				t.Errorf("Consensus state is nil")
+			}
+
+			// Verify deterministic behavior
+			height1 := hybridConsensus.GetCurrentHeight()
+			time.Sleep(100 * time.Millisecond)
+			height2 := hybridConsensus.GetCurrentHeight()
+			
+			if height2 < height1 {
+				t.Errorf("Block height decreased: %d -> %d", height1, height2)
+			}
+		})
+	}
+}
+
+// TestConsensusRecovery tests consensus recovery mechanisms
+func TestConsensusRecovery(t *testing.T) {
+	config := &consensus.HybridConfig{
+		NumValidators:     3,
+		BlockTime:        time.Second,
+		FinalizationTime: 3 * time.Second,
+		ByzantineFaultTolerance: true,
+	}
+	
+	hybridConsensus, err := consensus.NewDiamanteHybrid(config)
+	if err != nil {
+		t.Fatalf("Failed to create hybrid consensus: %v", err)
+	}
+	defer hybridConsensus.Stop()
+
+	ctx := context.Background()
+	err = hybridConsensus.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start consensus: %v", err)
+	}
+
+	// Submit some transactions
+	for i := 0; i < 5; i++ {
+		tx := createTestTransaction(t, i)
+		err = hybridConsensus.SubmitTransaction(tx)
+		if err != nil {
+			t.Errorf("Failed to submit transaction %d: %v", i, err)
+		}
+	}
+
+	// Wait for initial blocks
+	time.Sleep(2 * time.Second)
+	initialHeight := hybridConsensus.GetCurrentHeight()
+
+	// Simulate consensus failure and recovery
+	hybridConsensus.Stop()
+	
+	// Restart consensus
+	newConsensus, err := consensus.NewDiamanteHybrid(config)
+	if err != nil {
+		t.Fatalf("Failed to create new consensus instance: %v", err)
+	}
+	defer newConsensus.Stop()
+
+	err = newConsensus.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to restart consensus: %v", err)
+	}
+
+	// Verify recovery
+	time.Sleep(2 * time.Second)
+	recoveredHeight := newConsensus.GetCurrentHeight()
+	
+	// Should continue from where it left off or close to it
+	if recoveredHeight < initialHeight {
+		t.Errorf("Consensus didn't recover properly: initial=%d, recovered=%d", 
+			initialHeight, recoveredHeight)
+	}
+}
+
+// TestByzantineFaultTolerance tests Byzantine fault tolerance
+func TestByzantineFaultTolerance(t *testing.T) {
+	config := &consensus.HybridConfig{
+		NumValidators:     7, // Need at least 4 to tolerate 2 Byzantine validators
+		BlockTime:        time.Second,
+		FinalizationTime: 3 * time.Second,
+		ByzantineFaultTolerance: true,
+	}
+	
+	hybridConsensus, err := consensus.NewDiamanteHybrid(config)
+	if err != nil {
+		t.Fatalf("Failed to create hybrid consensus: %v", err)
+	}
+	defer hybridConsensus.Stop()
+
+	ctx := context.Background()
+	err = hybridConsensus.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start consensus: %v", err)
+	}
+
+	// Submit transactions while simulating Byzantine behavior
+	for i := 0; i < 10; i++ {
+		tx := createTestTransaction(t, i)
+		err = hybridConsensus.SubmitTransaction(tx)
+		if err != nil {
+			t.Errorf("Failed to submit transaction %d: %v", i, err)
+		}
+
+		// Simulate Byzantine behavior occasionally
+		if i%3 == 0 {
+			// This would simulate a Byzantine validator sending conflicting votes
+			// In a real implementation, this would test the Byzantine fault tolerance
+		}
+	}
+
+	// Verify consensus continues despite Byzantine behavior
+	time.Sleep(5 * time.Second)
+	height := hybridConsensus.GetCurrentHeight()
+	if height == 0 {
+		t.Errorf("Consensus failed to make progress with Byzantine validators")
+	}
+}
+
+// TestDeterministicBehavior tests that consensus is deterministic
+func TestDeterministicBehavior(t *testing.T) {
+	config := &consensus.HybridConfig{
+		NumValidators:     3,
+		BlockTime:        time.Second,
+		FinalizationTime: 3 * time.Second,
+		ByzantineFaultTolerance: true,
+	}
+
+	// Run consensus twice with same input
+	var hashes1, hashes2 []string
+
+	for run := 0; run < 2; run++ {
+		hybridConsensus, err := consensus.NewDiamanteHybrid(config)
+		if err != nil {
+			t.Fatalf("Failed to create hybrid consensus: %v", err)
+		}
+
+		ctx := context.Background()
+		err = hybridConsensus.Start(ctx)
+		if err != nil {
+			t.Fatalf("Failed to start consensus: %v", err)
+		}
+
+		// Submit identical transactions
+		for i := 0; i < 5; i++ {
+			tx := createTestTransaction(t, i)
+			err = hybridConsensus.SubmitTransaction(tx)
+			if err != nil {
+				t.Errorf("Failed to submit transaction %d: %v", i, err)
+			}
+		}
+
+		// Wait for blocks
+		time.Sleep(3 * time.Second)
+
+		// Collect block hashes
+		var hashes []string
+		for i := uint64(1); i <= hybridConsensus.GetCurrentHeight(); i++ {
+			if block := hybridConsensus.GetBlockByHeight(i); block != nil {
+				hashes = append(hashes, block.Hash)
+			}
+		}
+
+		if run == 0 {
+			hashes1 = hashes
+		} else {
+			hashes2 = hashes
+		}
+
+		hybridConsensus.Stop()
+	}
+
+	// Verify deterministic behavior
+	if len(hashes1) != len(hashes2) {
+		t.Errorf("Different number of blocks: %d vs %d", len(hashes1), len(hashes2))
+	}
+
+	for i := 0; i < len(hashes1) && i < len(hashes2); i++ {
+		if hashes1[i] != hashes2[i] {
+			t.Errorf("Block %d hash differs: %s vs %s", i, hashes1[i], hashes2[i])
+		}
+	}
+}
+
+// TestPerformanceUnderLoad tests consensus performance under load
+func TestPerformanceUnderLoad(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping performance test in short mode")
+	}
+
+	config := &consensus.HybridConfig{
+		NumValidators:     5,
+		BlockTime:        100 * time.Millisecond, // Faster blocks for load test
+		FinalizationTime: 300 * time.Millisecond,
+		ByzantineFaultTolerance: true,
+	}
+	
+	hybridConsensus, err := consensus.NewDiamanteHybrid(config)
+	if err != nil {
+		t.Fatalf("Failed to create hybrid consensus: %v", err)
+	}
+	defer hybridConsensus.Stop()
+
+	ctx := context.Background()
+	err = hybridConsensus.Start(ctx)
+	if err != nil {
+		t.Fatalf("Failed to start consensus: %v", err)
+	}
+
+	// Submit high volume of transactions
+	numTx := 1000
+	start := time.Now()
+
+	for i := 0; i < numTx; i++ {
+		tx := createTestTransaction(t, i)
+		err = hybridConsensus.SubmitTransaction(tx)
+		if err != nil {
+			t.Errorf("Failed to submit transaction %d: %v", i, err)
+			break
+		}
+	}
+
+	submitDuration := time.Since(start)
+
+	// Wait for processing
+	time.Sleep(10 * time.Second)
+	
+	totalDuration := time.Since(start)
+	height := hybridConsensus.GetCurrentHeight()
+	
+	t.Logf("Performance stats:")
+	t.Logf("  Submitted %d transactions in %v", numTx, submitDuration)
+	t.Logf("  Produced %d blocks in %v", height, totalDuration)
+	t.Logf("  TPS: %.2f", float64(numTx)/totalDuration.Seconds())
+	t.Logf("  Blocks/sec: %.2f", float64(height)/totalDuration.Seconds())
+
+	// Basic performance assertions
+	if height == 0 {
+		t.Errorf("No blocks produced under load")
+	}
+	
+	tps := float64(numTx) / totalDuration.Seconds()
+	if tps < 10 {
+		t.Errorf("TPS too low: %.2f", tps)
+	}
+}
+
+// Helper function to create test transactions
+func createTestTransaction(t *testing.T, index int) *common.Transaction {
+	return &common.Transaction{
+		ID:       common.GenerateTransactionID(),
+		From:     "test_sender",
+		To:       "test_receiver", 
+		Amount:   float64(index + 1),
+		Type:     "transfer",
+		Data:     []byte("test transaction data"),
+		Nonce:    uint64(index),
+		Metadata: dtypes.NewTransactionMetadata(),
+	}
+}

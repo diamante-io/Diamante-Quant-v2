@@ -1,0 +1,279 @@
+package consensus_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAdaptiveParameters(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.AdaptiveParametersConfig{
+			UpdateInterval:   time.Second,
+			MetricsWindow:    100,
+			MinBlockTime:     100 * time.Millisecond,
+			MaxBlockTime:     10 * time.Second,
+			MinBatchSize:     10,
+			MaxBatchSize:     1000,
+			TargetThroughput: 10000,
+		}
+
+		params := consensus.NewAdaptiveParameters(config, logger)
+		require.NotNil(t, params)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := params.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = params.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("Update Metrics", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveParametersConfig()
+		params := consensus.NewAdaptiveParameters(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := params.Start(ctx)
+		require.NoError(t, err)
+
+		// Update various metrics
+		params.UpdateBlockTime(500 * time.Millisecond)
+		params.UpdateBatchSize(100)
+		params.UpdateThroughput(5000)
+		params.UpdateNetworkLatency(50 * time.Millisecond)
+		params.UpdateResourceUsage(0.75)
+
+		// Get current parameters
+		current := params.GetCurrentParameters()
+		assert.NotNil(t, current)
+		assert.Greater(t, current.BlockTime, time.Duration(0))
+		assert.Greater(t, current.BatchSize, 0)
+	})
+
+	t.Run("Adaptive Adjustment", func(t *testing.T) {
+		config := &consensus.AdaptiveParametersConfig{
+			UpdateInterval:   100 * time.Millisecond,
+			MetricsWindow:    10,
+			MinBlockTime:     100 * time.Millisecond,
+			MaxBlockTime:     2 * time.Second,
+			MinBatchSize:     10,
+			MaxBatchSize:     500,
+			TargetThroughput: 1000,
+		}
+
+		params := consensus.NewAdaptiveParameters(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := params.Start(ctx)
+		require.NoError(t, err)
+
+		// Simulate high load
+		for i := 0; i < 20; i++ {
+			params.UpdateThroughput(500) // Below target
+			params.UpdateResourceUsage(0.9) // High usage
+			params.UpdateNetworkLatency(100 * time.Millisecond)
+		}
+
+		// Wait for adjustment
+		time.Sleep(200 * time.Millisecond)
+
+		// Parameters should adjust
+		current := params.GetCurrentParameters()
+		assert.NotNil(t, current)
+		// With low throughput and high resource usage, 
+		// system might adjust batch size or block time
+	})
+
+	t.Run("Get Metrics", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveParametersConfig()
+		params := consensus.NewAdaptiveParameters(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := params.Start(ctx)
+		require.NoError(t, err)
+
+		// Add some metrics
+		for i := 0; i < 5; i++ {
+			params.UpdateBlockTime(time.Duration(100+i*10) * time.Millisecond)
+			params.UpdateBatchSize(50 + i*10)
+			params.UpdateThroughput(float64(1000 + i*100))
+		}
+
+		metrics := params.GetMetrics()
+		assert.NotNil(t, metrics)
+		assert.Greater(t, metrics.AdjustmentsCount, uint64(0))
+		assert.NotZero(t, metrics.LastUpdate)
+	})
+
+	t.Run("Manual Override", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveParametersConfig()
+		params := consensus.NewAdaptiveParameters(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := params.Start(ctx)
+		require.NoError(t, err)
+
+		// Set manual override
+		override := &consensus.ParameterOverride{
+			BlockTime:    1 * time.Second,
+			BatchSize:    200,
+			MaxRetries:   5,
+			TimeoutScale: 1.5,
+		}
+
+		err = params.SetOverride(override)
+		assert.NoError(t, err)
+
+		// Get current should reflect override
+		current := params.GetCurrentParameters()
+		assert.Equal(t, override.BlockTime, current.BlockTime)
+		assert.Equal(t, override.BatchSize, current.BatchSize)
+
+		// Clear override
+		err = params.ClearOverride()
+		assert.NoError(t, err)
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultAdaptiveParametersConfig()
+		params := consensus.NewAdaptiveParameters(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := params.Start(ctx)
+		require.NoError(t, err)
+
+		// Stop
+		err = params.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = params.Stop()
+		assert.Error(t, err)
+	})
+}
+
+func TestConsensusParameters(t *testing.T) {
+	t.Run("Parameter Validation", func(t *testing.T) {
+		params := &consensus.ConsensusParameters{
+			BlockTime:         500 * time.Millisecond,
+			BatchSize:         100,
+			MaxRetries:        3,
+			TimeoutScale:      1.2,
+			NetworkBandwidth:  1000000, // 1MB/s
+			ComputeCapacity:   0.8,
+			StorageIOPS:       5000,
+			ValidationWorkers: 4,
+		}
+
+		assert.Equal(t, 500*time.Millisecond, params.BlockTime)
+		assert.Equal(t, 100, params.BatchSize)
+		assert.Equal(t, 3, params.MaxRetries)
+		assert.Equal(t, 1.2, params.TimeoutScale)
+		assert.Equal(t, uint64(1000000), params.NetworkBandwidth)
+		assert.Equal(t, 0.8, params.ComputeCapacity)
+		assert.Equal(t, 5000, params.StorageIOPS)
+		assert.Equal(t, 4, params.ValidationWorkers)
+	})
+}
+
+func TestAdaptiveParametersMetrics(t *testing.T) {
+	t.Run("Metrics Structure", func(t *testing.T) {
+		metrics := &types.AdaptiveParametersMetrics{
+			AdjustmentsCount:     10,
+			LastUpdate:           time.Now(),
+			AvgBlockTime:         450 * time.Millisecond,
+			AvgBatchSize:         85.5,
+			AvgThroughput:        9500.75,
+			AvgNetworkLatency:    25 * time.Millisecond,
+			AvgResourceUsage:     0.65,
+			StabilityScore:       0.95,
+			PerformanceScore:     0.88,
+			EfficiencyScore:      0.91,
+			OverridesActive:      false,
+			CurrentBlockTime:     500 * time.Millisecond,
+			CurrentBatchSize:     100,
+			WindowSize:           100,
+			MetricsCount:         1000,
+		}
+
+		assert.Equal(t, uint64(10), metrics.AdjustmentsCount)
+		assert.Equal(t, 450*time.Millisecond, metrics.AvgBlockTime)
+		assert.Equal(t, 85.5, metrics.AvgBatchSize)
+		assert.Equal(t, 9500.75, metrics.AvgThroughput)
+		assert.Equal(t, 0.95, metrics.StabilityScore)
+		assert.Equal(t, 0.88, metrics.PerformanceScore)
+		assert.Equal(t, 0.91, metrics.EfficiencyScore)
+		assert.False(t, metrics.OverridesActive)
+	})
+}
+
+func BenchmarkAdaptiveParameters(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := consensus.DefaultAdaptiveParametersConfig()
+	params := consensus.NewAdaptiveParameters(config, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	params.Start(ctx)
+
+	b.Run("UpdateBlockTime", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			params.UpdateBlockTime(time.Duration(i%1000) * time.Millisecond)
+		}
+	})
+
+	b.Run("UpdateBatchSize", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			params.UpdateBatchSize(i % 1000)
+		}
+	})
+
+	b.Run("UpdateThroughput", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			params.UpdateThroughput(float64(i % 10000))
+		}
+	})
+
+	b.Run("GetCurrentParameters", func(b *testing.B) {
+		// Pre-populate with metrics
+		for i := 0; i < 100; i++ {
+			params.UpdateBlockTime(time.Duration(i%500) * time.Millisecond)
+			params.UpdateBatchSize(i % 100)
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			params.GetCurrentParameters()
+		}
+	})
+}

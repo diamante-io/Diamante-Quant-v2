@@ -1,0 +1,314 @@
+package consensus_test
+
+import (
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestCircuitBreaker(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:        5,
+			Timeout:          time.Second,
+			ResetTimeout:     5 * time.Second,
+			HalfOpenRequests: 2,
+		}
+
+		cb := consensus.NewCircuitBreaker("test-breaker", config, logger)
+		require.NotNil(t, cb)
+
+		// Should start in closed state
+		assert.Equal(t, consensus.CircuitClosed, cb.GetState())
+	})
+
+	t.Run("Success Path", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:    3,
+			Timeout:      time.Second,
+			ResetTimeout: time.Second,
+		}
+
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Execute successful operations
+		for i := 0; i < 10; i++ {
+			err := cb.Execute(func() error {
+				return nil
+			})
+			assert.NoError(t, err)
+		}
+
+		// Should remain closed
+		assert.Equal(t, consensus.CircuitClosed, cb.GetState())
+
+		stats := cb.GetStats()
+		assert.Equal(t, uint64(10), stats.SuccessCount)
+		assert.Equal(t, uint64(0), stats.FailureCount)
+	})
+
+	t.Run("Failure Threshold", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:    3,
+			Timeout:      time.Second,
+			ResetTimeout: time.Second,
+		}
+
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Cause failures to trip the breaker
+		failureErr := assert.AnError
+		for i := 0; i < 3; i++ {
+			err := cb.Execute(func() error {
+				return failureErr
+			})
+			assert.Error(t, err)
+		}
+
+		// Should be open now
+		assert.Equal(t, consensus.CircuitOpen, cb.GetState())
+
+		// Further calls should fail immediately
+		err := cb.Execute(func() error {
+			return nil
+		})
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "circuit breaker is open")
+	})
+
+	t.Run("Half Open State", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:        2,
+			Timeout:          time.Second,
+			ResetTimeout:     100 * time.Millisecond,
+			HalfOpenRequests: 2,
+		}
+
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Trip the breaker
+		for i := 0; i < 2; i++ {
+			cb.Execute(func() error {
+				return assert.AnError
+			})
+		}
+
+		assert.Equal(t, consensus.CircuitOpen, cb.GetState())
+
+		// Wait for reset timeout
+		time.Sleep(150 * time.Millisecond)
+
+		// Should transition to half-open
+		assert.Equal(t, consensus.CircuitHalfOpen, cb.GetState())
+
+		// Successful request in half-open should close the circuit
+		err := cb.Execute(func() error {
+			return nil
+		})
+		assert.NoError(t, err)
+
+		// Another success should fully close it
+		err = cb.Execute(func() error {
+			return nil
+		})
+		assert.NoError(t, err)
+
+		assert.Equal(t, consensus.CircuitClosed, cb.GetState())
+	})
+
+	t.Run("Half Open Failure", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:        2,
+			Timeout:          time.Second,
+			ResetTimeout:     100 * time.Millisecond,
+			HalfOpenRequests: 1,
+		}
+
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Trip the breaker
+		for i := 0; i < 2; i++ {
+			cb.Execute(func() error {
+				return assert.AnError
+			})
+		}
+
+		// Wait for half-open
+		time.Sleep(150 * time.Millisecond)
+		assert.Equal(t, consensus.CircuitHalfOpen, cb.GetState())
+
+		// Failure in half-open should re-open
+		err := cb.Execute(func() error {
+			return assert.AnError
+		})
+		assert.Error(t, err)
+
+		assert.Equal(t, consensus.CircuitOpen, cb.GetState())
+	})
+
+	t.Run("Manual Control", func(t *testing.T) {
+		config := consensus.DefaultCircuitBreakerConfig()
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Manually open
+		cb.Open()
+		assert.Equal(t, consensus.CircuitOpen, cb.GetState())
+
+		// Should reject executions
+		err := cb.Execute(func() error {
+			return nil
+		})
+		assert.Error(t, err)
+
+		// Manually close
+		cb.Close()
+		assert.Equal(t, consensus.CircuitClosed, cb.GetState())
+
+		// Should allow executions
+		err = cb.Execute(func() error {
+			return nil
+		})
+		assert.NoError(t, err)
+
+		// Reset
+		cb.Reset()
+		stats := cb.GetStats()
+		assert.Equal(t, uint64(0), stats.SuccessCount)
+		assert.Equal(t, uint64(0), stats.FailureCount)
+	})
+
+	t.Run("Timeout", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:    3,
+			Timeout:      50 * time.Millisecond,
+			ResetTimeout: time.Second,
+		}
+
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Execute operation that times out
+		err := cb.Execute(func() error {
+			time.Sleep(100 * time.Millisecond)
+			return nil
+		})
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "operation timed out")
+
+		stats := cb.GetStats()
+		assert.Equal(t, uint64(1), stats.TimeoutCount)
+	})
+
+	t.Run("Concurrent Access", func(t *testing.T) {
+		config := &consensus.CircuitBreakerConfig{
+			Threshold:    10,
+			Timeout:      time.Second,
+			ResetTimeout: time.Second,
+		}
+
+		cb := consensus.NewCircuitBreaker("test", config, logger)
+
+		// Run concurrent operations
+		done := make(chan bool, 20)
+		for i := 0; i < 20; i++ {
+			go func(index int) {
+				err := cb.Execute(func() error {
+					time.Sleep(time.Millisecond)
+					if index%5 == 0 {
+						return assert.AnError
+					}
+					return nil
+				})
+				if index%5 != 0 {
+					assert.NoError(t, err)
+				}
+				done <- true
+			}(i)
+		}
+
+		// Wait for all to complete
+		for i := 0; i < 20; i++ {
+			<-done
+		}
+
+		stats := cb.GetStats()
+		assert.Greater(t, stats.SuccessCount, uint64(0))
+		assert.Greater(t, stats.FailureCount, uint64(0))
+	})
+}
+
+func TestCircuitBreakerStatus(t *testing.T) {
+	t.Run("Status Fields", func(t *testing.T) {
+		status := &types.CircuitBreakerStatus{
+			Name:              "test-breaker",
+			State:             string(consensus.CircuitClosed),
+			SuccessCount:      100,
+			FailureCount:      5,
+			TimeoutCount:      2,
+			ConsecutiveFails:  0,
+			LastFailure:       time.Now().Add(-time.Hour),
+			LastSuccess:       time.Now(),
+			HalfOpenRemaining: 0,
+		}
+
+		assert.Equal(t, "test-breaker", status.Name)
+		assert.Equal(t, string(consensus.CircuitClosed), status.State)
+		assert.Equal(t, uint64(100), status.SuccessCount)
+		assert.Equal(t, uint64(5), status.FailureCount)
+		assert.Equal(t, uint64(2), status.TimeoutCount)
+		assert.Equal(t, 0, status.ConsecutiveFails)
+	})
+}
+
+func BenchmarkCircuitBreaker(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := consensus.DefaultCircuitBreakerConfig()
+	cb := consensus.NewCircuitBreaker("bench", config, logger)
+
+	b.Run("SuccessfulOperation", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cb.Execute(func() error {
+				return nil
+			})
+		}
+	})
+
+	b.Run("FailedOperation", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cb.Execute(func() error {
+				return assert.AnError
+			})
+		}
+	})
+
+	b.Run("GetState", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cb.GetState()
+		}
+	})
+
+	b.Run("ParallelExecution", func(b *testing.B) {
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				cb.Execute(func() error {
+					return nil
+				})
+			}
+		})
+	})
+}

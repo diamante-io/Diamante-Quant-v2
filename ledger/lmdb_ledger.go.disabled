@@ -1,0 +1,759 @@
+package ledger
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"diamante/apperrors"
+	"diamante/common"
+	"diamante/storage"
+
+	"github.com/sirupsen/logrus"
+)
+
+// LMDBLedger implements common.LedgerAPI using the storage.LMDBAdapter.
+// This is a production-ready implementation with comprehensive error handling,
+// validation, and security measures.
+type LMDBLedger struct {
+	store     *storage.LMDBAdapter
+	closed    bool
+	mu        sync.RWMutex
+	metrics   *LedgerMetrics
+	validator *TransactionValidator
+	config    *LedgerConfig
+	logger    *logrus.Logger
+}
+
+// LedgerConfig holds configuration for the ledger
+type LedgerConfig struct {
+	MaxTransactionSize int           `json:"maxTransactionSize"`
+	MaxBlockSize       int           `json:"maxBlockSize"`
+	TransactionTimeout time.Duration `json:"transactionTimeout"`
+	EnableValidation   bool          `json:"enableValidation"`
+	EnableMetrics      bool          `json:"enableMetrics"`
+	EnableCache        bool          `json:"enableCache"`
+	SecurityLevel      string        `json:"securityLevel"` // "strict", "normal", "relaxed"
+}
+
+// LedgerMetrics tracks ledger performance and usage
+type LedgerMetrics struct {
+	TotalTransactions  int64     `json:"totalTransactions"`
+	TotalBlocks        int64     `json:"totalBlocks"`
+	TotalAccounts      int64     `json:"totalAccounts"`
+	TotalContracts     int64     `json:"totalContracts"`
+	LastBlockTime      time.Time `json:"lastBlockTime"`
+	AverageBlockTime   float64   `json:"averageBlockTime"`
+	TransactionTPS     float64   `json:"transactionTPS"`
+	ErrorCount         int64     `json:"errorCount"`
+	ValidationFailures int64     `json:"validationFailures"`
+	mu                 sync.RWMutex
+}
+
+// TransactionValidator provides comprehensive transaction validation
+type TransactionValidator struct {
+	config *LedgerConfig
+}
+
+// DefaultLedgerConfig returns a production-ready default configuration
+func DefaultLedgerConfig() *LedgerConfig {
+	return &LedgerConfig{
+		MaxTransactionSize: 1024 * 1024,      // 1MB
+		MaxBlockSize:       10 * 1024 * 1024, // 10MB
+		TransactionTimeout: 30 * time.Second,
+		EnableValidation:   true,
+		EnableMetrics:      true,
+		EnableCache:        true,
+		SecurityLevel:      "strict",
+	}
+}
+
+// NewLMDBLedger creates a new LMDB-backed ledger using the given adapter.
+// This constructor includes comprehensive initialization and validation.
+func NewLMDBLedger(store *storage.LMDBAdapter) *LMDBLedger {
+	return NewLMDBLedgerWithConfig(store, DefaultLedgerConfig(), nil)
+}
+
+// NewLMDBLedgerWithConfig creates a new LMDB-backed ledger with custom configuration
+func NewLMDBLedgerWithConfig(store *storage.LMDBAdapter, config *LedgerConfig, logger *logrus.Logger) *LMDBLedger {
+	if logger == nil {
+		logger = logrus.New()
+		logger.SetLevel(logrus.InfoLevel)
+	}
+
+	if config == nil {
+		config = DefaultLedgerConfig()
+	}
+
+	ledger := &LMDBLedger{
+		store:     store,
+		closed:    false,
+		config:    config,
+		logger:    logger,
+		metrics:   &LedgerMetrics{},
+		validator: &TransactionValidator{config: config},
+	}
+
+	logger.WithFields(logrus.Fields{
+		"maxTransactionSize": config.MaxTransactionSize,
+		"maxBlockSize":       config.MaxBlockSize,
+		"securityLevel":      config.SecurityLevel,
+	}).Info("LMDB Ledger initialized")
+
+	return ledger
+}
+
+// ValidateTransaction performs comprehensive transaction validation
+func (tv *TransactionValidator) ValidateTransaction(tx *common.Transaction) error {
+	if tx == nil {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "transaction cannot be nil")
+	}
+
+	// Basic validation
+	if err := tx.Validate(); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "basic validation failed")
+	}
+
+	// Enhanced validation for production
+	if err := common.VerifyTransactionIntegrity(tx); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "integrity check failed")
+	}
+
+	// Size validation
+	txSize := len(tx.Data) + len(tx.Signature) + len([]byte(tx.ID))
+	if txSize > tv.config.MaxTransactionSize {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid,
+			fmt.Sprintf("transaction size %d exceeds maximum %d", txSize, tv.config.MaxTransactionSize))
+	}
+
+	// Security level specific validations
+	switch tv.config.SecurityLevel {
+	case "strict":
+		if len(tx.Signature) == 0 {
+			return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "signature required in strict mode")
+		}
+		if tx.Fee <= 0 {
+			return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "fee required in strict mode")
+		}
+	case "normal":
+		if tx.Amount <= 0 {
+			return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "amount must be positive")
+		}
+	}
+
+	return nil
+}
+
+// ValidateBlock performs comprehensive block validation
+func (tv *TransactionValidator) ValidateBlock(block *common.Block, previousBlock *common.Block) error {
+	if block == nil {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "block cannot be nil")
+	}
+
+	// Basic validation
+	if err := block.Validate(previousBlock); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "basic validation failed")
+	}
+
+	// Size validation
+	blockSize := len(block.Data)
+	for _, tx := range block.Transactions {
+		blockSize += len(tx.Data) + len(tx.Signature)
+	}
+
+	if blockSize > tv.config.MaxBlockSize {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid,
+			fmt.Sprintf("block size %d exceeds maximum %d", blockSize, tv.config.MaxBlockSize))
+	}
+
+	// Validate all transactions in the block
+	for i, tx := range block.Transactions {
+		if err := tv.ValidateTransaction(&tx); err != nil {
+			return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid,
+				fmt.Sprintf("transaction %d validation failed", i))
+		}
+	}
+
+	return nil
+}
+
+// checkClosed ensures the ledger is not closed
+func (l *LMDBLedger) checkClosed() error {
+	l.mu.RLock()
+	defer l.mu.RUnlock()
+	if l.closed {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeUnavailable, "ledger is closed")
+	}
+	return nil
+}
+
+// updateMetrics updates ledger metrics
+func (l *LMDBLedger) updateMetrics(operation string, success bool) {
+	if !l.config.EnableMetrics {
+		return
+	}
+
+	l.metrics.mu.Lock()
+	defer l.metrics.mu.Unlock()
+
+	switch operation {
+	case "transaction":
+		if success {
+			l.metrics.TotalTransactions++
+		}
+	case "block":
+		if success {
+			l.metrics.TotalBlocks++
+			l.metrics.LastBlockTime = time.Now()
+		}
+	case "account":
+		if success {
+			l.metrics.TotalAccounts++
+		}
+	case "contract":
+		if success {
+			l.metrics.TotalContracts++
+		}
+	}
+
+	if !success {
+		l.metrics.ErrorCount++
+	}
+}
+
+// CreateAccount stores a new account with comprehensive validation.
+func (l *LMDBLedger) CreateAccount(ac *common.Account) error {
+	if err := l.checkClosed(); err != nil {
+		return err
+	}
+
+	// Validate account
+	if ac == nil {
+		l.updateMetrics("account", false)
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "account cannot be nil")
+	}
+
+	if err := ac.Validate(); err != nil {
+		l.updateMetrics("account", false)
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "account validation failed")
+	}
+
+	// Set creation timestamp
+	if ac.CreatedAt == 0 {
+		ac.CreatedAt = common.GetCurrentTimestamp()
+	}
+	ac.LastActive = common.GetCurrentTimestamp()
+
+	l.logger.WithFields(logrus.Fields{
+		"accountID": ac.ID,
+		"balance":   ac.Balance,
+	}).Debug("Creating account")
+
+	if err := l.store.SaveAccount(ac); err != nil {
+		l.updateMetrics("account", false)
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "save account")
+	}
+
+	l.updateMetrics("account", true)
+	l.logger.WithField("accountID", ac.ID).Info("Account created successfully")
+	return nil
+}
+
+// UpdateAccount updates an existing account with validation.
+func (l *LMDBLedger) UpdateAccount(ac *common.Account) error {
+	if err := l.checkClosed(); err != nil {
+		return err
+	}
+
+	// Validate account
+	if ac == nil {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "account cannot be nil")
+	}
+
+	if err := ac.Validate(); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "account validation failed")
+	}
+
+	// Update last active timestamp
+	ac.LastActive = common.GetCurrentTimestamp()
+
+	l.logger.WithFields(logrus.Fields{
+		"accountID": ac.ID,
+		"balance":   ac.Balance,
+	}).Debug("Updating account")
+
+	if err := l.store.UpdateAccount(ac); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "update account")
+	}
+
+	l.logger.WithField("accountID", ac.ID).Debug("Account updated successfully")
+	return nil
+}
+
+// GetBalance returns the balance for an account with validation.
+func (l *LMDBLedger) GetBalance(accountID string) (float64, error) {
+	if err := l.checkClosed(); err != nil {
+		return 0, err
+	}
+
+	if err := common.ValidateAddress(accountID); err != nil {
+		return 0, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "invalid account address")
+	}
+
+	ac, err := l.store.GetAccount(accountID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			return 0, apperrors.New(apperrors.ModuleLedger, apperrors.CodeNotFound, "account not found")
+		}
+		return 0, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get account")
+	}
+
+	return ac.Balance, nil
+}
+
+// UpdateAccountBalance updates an account's balance with comprehensive validation and safety checks.
+func (l *LMDBLedger) UpdateAccountBalance(accountID string, amount float64) error {
+	if err := l.checkClosed(); err != nil {
+		return err
+	}
+
+	if err := common.ValidateAddress(accountID); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "invalid account address")
+	}
+
+	// Validate amount for safety
+	if amount != 0 {
+		if amount > 0 {
+			if err := common.ValidateAmount(amount); err != nil {
+				return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "invalid amount")
+			}
+		}
+	}
+
+	l.logger.WithFields(logrus.Fields{
+		"accountID": accountID,
+		"amount":    amount,
+	}).Debug("Updating account balance")
+
+	ac, err := l.store.GetAccount(accountID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			return apperrors.New(apperrors.ModuleLedger, apperrors.CodeNotFound, "account not found")
+		}
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get account")
+	}
+
+	// Check for underflow
+	newBalance, err := common.SafeAdd(ac.Balance, amount)
+	if err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "balance calculation error")
+	}
+
+	if newBalance < 0 {
+		return apperrors.New(apperrors.ModuleLedger, apperrors.CodeConflict, "insufficient funds")
+	}
+
+	ac.Balance = newBalance
+	ac.LastActive = common.GetCurrentTimestamp()
+
+	if err := l.store.UpdateAccount(ac); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "update account")
+	}
+
+	l.logger.WithFields(logrus.Fields{
+		"accountID":  accountID,
+		"amount":     amount,
+		"newBalance": newBalance,
+	}).Debug("Account balance updated successfully")
+
+	return nil
+}
+
+// AddTransaction saves a transaction with comprehensive validation.
+func (l *LMDBLedger) AddTransaction(tx common.Transaction) error {
+	if err := l.checkClosed(); err != nil {
+		return err
+	}
+
+	// Comprehensive validation
+	if l.config.EnableValidation {
+		if err := l.validator.ValidateTransaction(&tx); err != nil {
+			l.updateMetrics("transaction", false)
+			l.metrics.mu.Lock()
+			l.metrics.ValidationFailures++
+			l.metrics.mu.Unlock()
+			return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "transaction validation failed")
+		}
+	}
+
+	// Set transaction hash if not already set
+	if tx.ID == "" {
+		tx.ID = common.GenerateUniqueID()
+	}
+
+	// Set timestamp if not already set
+	if tx.Timestamp == 0 {
+		tx.Timestamp = common.GetCurrentTimestamp()
+	}
+
+	// Set status to pending if not set
+	if tx.Status == "" {
+		tx.Status = "pending"
+	}
+
+	l.logger.WithFields(logrus.Fields{
+		"txID":     tx.ID,
+		"sender":   tx.Sender,
+		"receiver": tx.Receiver,
+		"amount":   tx.Amount,
+		"fee":      tx.Fee,
+	}).Info("Adding transaction")
+
+	if err := l.store.SaveTransaction(&tx, int(tx.BlockHeight)); err != nil {
+		l.updateMetrics("transaction", false)
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "save transaction")
+	}
+
+	l.updateMetrics("transaction", true)
+	l.logger.WithField("txID", tx.ID).Debug("Transaction added successfully")
+	return nil
+}
+
+// IsTransactionCommitted checks if a transaction exists and is committed.
+func (l *LMDBLedger) IsTransactionCommitted(txID string) bool {
+	if err := l.checkClosed(); err != nil {
+		return false
+	}
+
+	if err := common.ValidateAddress(txID); err != nil {
+		return false
+	}
+
+	tx, err := l.store.GetTransaction(txID)
+	if err != nil {
+		return false
+	}
+
+	return tx.Status == "committed"
+}
+
+// GetTransaction retrieves a transaction by ID with validation.
+func (l *LMDBLedger) GetTransaction(txID string) (*common.Transaction, error) {
+	if err := l.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	if txID == "" {
+		return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "transaction ID cannot be empty")
+	}
+
+	tx, err := l.store.GetTransaction(txID)
+	if err != nil {
+		if err == storage.ErrNotFound {
+			return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeNotFound, "transaction not found")
+		}
+		return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get transaction")
+	}
+
+	return tx, nil
+}
+
+// GetAccountTransactions retrieves transactions for an address with validation and pagination.
+func (l *LMDBLedger) GetAccountTransactions(accountID string, limit, offset int) ([]common.Transaction, error) {
+	if err := l.checkClosed(); err != nil {
+		return nil, err
+	}
+
+	if err := common.ValidateAddress(accountID); err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "invalid account address")
+	}
+
+	// Validate pagination parameters
+	if limit <= 0 {
+		limit = 100 // Default limit
+	}
+	if limit > 1000 {
+		limit = 1000 // Maximum limit for safety
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	l.logger.WithFields(logrus.Fields{
+		"accountID": accountID,
+		"limit":     limit,
+		"offset":    offset,
+	}).Debug("Getting account transactions")
+
+	txs, err := l.store.GetTransactionsByAddress(accountID, limit, offset)
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get transactions by address")
+	}
+
+	out := make([]common.Transaction, len(txs))
+	for i, t := range txs {
+		out[i] = *t
+	}
+
+	return out, nil
+}
+
+// CommitBlock saves the block and its transactions with comprehensive validation.
+func (l *LMDBLedger) CommitBlock(block common.Block) error {
+	if err := l.checkClosed(); err != nil {
+		return err
+	}
+
+	// Comprehensive block validation
+	if l.config.EnableValidation {
+		// Get previous block for validation
+		var previousBlock *common.Block
+		if block.Number > 0 {
+			if prevBlk, err := l.store.GetBlock(uint64(block.Number - 1)); err == nil {
+				previousBlock = prevBlk
+			}
+		}
+
+		if err := l.validator.ValidateBlock(&block, previousBlock); err != nil {
+			l.updateMetrics("block", false)
+			return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInvalid, "block validation failed")
+		}
+	}
+
+	// Set block hash if not already set
+	if block.Hash == "" {
+		block.Hash = common.ComputeBlockHash(block)
+	}
+
+	// Set timestamp if not already set
+	if block.Timestamp == 0 {
+		block.Timestamp = common.GetCurrentTimestamp()
+	}
+
+	l.logger.WithFields(logrus.Fields{
+		"blockNumber":  block.Number,
+		"blockHash":    block.Hash,
+		"previousHash": block.PreviousHash,
+		"txCount":      len(block.Transactions),
+		"validator":    block.Validator,
+	}).Info("Committing block")
+
+	// Use a batch write for atomicity
+	batch := storage.NewWriteBatch()
+	batch.AddBlock(&block)
+
+	// Add all transactions to the batch
+	for i := range block.Transactions {
+		tx := &block.Transactions[i]
+		// Mark transaction as committed
+		tx.Status = "committed"
+		tx.BlockHeight = block.Number
+		batch.AddTransaction(tx)
+	}
+
+	// Execute batch write
+	if err := l.store.BatchWrite(batch); err != nil {
+		l.updateMetrics("block", false)
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "batch write failed")
+	}
+
+	l.updateMetrics("block", true)
+	l.logger.WithFields(logrus.Fields{
+		"blockNumber": block.Number,
+		"blockHash":   block.Hash,
+		"txCount":     len(block.Transactions),
+	}).Info("Block committed successfully")
+
+	return nil
+}
+
+// GetBlockByNumber retrieves a block by height.
+func (l *LMDBLedger) GetBlockByNumber(num int) (common.Block, bool) {
+	blk, err := l.store.GetBlock(uint64(num))
+	if err != nil {
+		return common.Block{}, false
+	}
+	return *blk, true
+}
+
+// GetLastBlockHash returns the hash of the latest block.
+func (l *LMDBLedger) GetLastBlockHash() (string, error) {
+	blk, err := l.store.GetLatestBlock()
+	if err != nil {
+		return "", apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get latest block")
+	}
+	return blk.Hash, nil
+}
+
+// GetBlockHeight returns the current block height.
+func (l *LMDBLedger) GetBlockHeight() (int, error) {
+	blk, err := l.store.GetLatestBlock()
+	if err != nil {
+		if err == storage.ErrNotFound {
+			return 0, nil
+		}
+		return 0, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get latest block")
+	}
+	return blk.Number, nil
+}
+
+// GetBlocksByRange retrieves a range of blocks.
+func (l *LMDBLedger) GetBlocksByRange(startNum, endNum int) ([]common.Block, error) {
+	blocks, err := l.store.GetBlockRange(uint64(startNum), uint64(endNum))
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get block range")
+	}
+	out := make([]common.Block, len(blocks))
+	for i, b := range blocks {
+		out[i] = *b
+	}
+	return out, nil
+}
+
+// CreateSnapshot delegates to the store.
+func (l *LMDBLedger) CreateSnapshot(height int) error {
+	return l.store.CreateSnapshot(uint64(height))
+}
+
+// RestoreSnapshot restores a snapshot from the store.
+func (l *LMDBLedger) RestoreSnapshot(height int) error {
+	return l.store.RestoreSnapshot(uint64(height))
+}
+
+// DeploySmartContract saves a contract to the store.
+func (l *LMDBLedger) DeploySmartContract(sc *common.SmartContract) error {
+	return l.store.SaveContract(sc)
+}
+
+// UpdateSmartContract updates contract code.
+func (l *LMDBLedger) UpdateSmartContract(contractID, newCode, version string) error {
+	sc, err := l.store.GetContract(contractID)
+	if err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get contract")
+	}
+	sc.Code = newCode
+	sc.Version = version
+	if err := l.store.UpdateContract(sc); err != nil {
+		return apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "update contract")
+	}
+	return nil
+}
+
+// ExecuteSmartContract executes a smart contract function
+func (l *LMDBLedger) ExecuteSmartContract(scID, function, sender string, params map[string]interface{}) (interface{}, error) {
+	// Get the contract from storage
+	contract, err := l.store.GetContract(scID)
+	if err != nil {
+		return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get contract")
+	}
+
+	// Check contract language and execute accordingly
+	switch contract.Language {
+	case "EVM":
+		// For EVM contracts, we need to encode the function call and use the EVM executor
+		// This is a basic implementation - in production, you'd use the EVMExecutor
+
+		// Validate sender address
+		if sender == "" {
+			return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "sender address required")
+		}
+
+		// Store the current state in the contract
+		if contract.State == nil {
+			contract.State = make(map[string]interface{})
+		}
+
+		// Simple state update based on function name
+		switch function {
+		case "get":
+			// Get a value from contract state
+			if key, ok := params["key"].(string); ok {
+				return contract.State[key], nil
+			}
+			return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "key parameter required")
+
+		case "set":
+			// Set a value in contract state
+			key, hasKey := params["key"].(string)
+			value, hasValue := params["value"]
+			if hasKey && hasValue {
+				contract.State[key] = value
+				// Update the contract in storage
+				if err := l.store.UpdateContract(contract); err != nil {
+					return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "update contract")
+				}
+				return true, nil
+			}
+			return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "key and value parameters required")
+
+		case "transfer":
+			// Handle token transfer
+			to, hasTo := params["to"].(string)
+			amount, hasAmount := params["amount"].(float64)
+			if !hasTo || !hasAmount {
+				return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "to and amount parameters required")
+			}
+
+			// Check sender balance
+			senderBalance, err := l.GetBalance(sender)
+			if err != nil {
+				return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "get sender balance")
+			}
+
+			if senderBalance < amount {
+				return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeConflict, "insufficient balance")
+			}
+
+			// Perform transfer
+			if err := l.UpdateAccountBalance(sender, -amount); err != nil {
+				return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "update sender balance")
+			}
+
+			if err := l.UpdateAccountBalance(to, amount); err != nil {
+				// Rollback sender balance
+				l.UpdateAccountBalance(sender, amount)
+				return nil, apperrors.Wrap(err, apperrors.ModuleLedger, apperrors.CodeInternal, "update recipient balance")
+			}
+
+			return map[string]interface{}{
+				"success": true,
+				"from":    sender,
+				"to":      to,
+				"amount":  amount,
+			}, nil
+
+		default:
+			return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "unsupported function: "+function)
+		}
+
+	default:
+		return nil, apperrors.New(apperrors.ModuleLedger, apperrors.CodeInvalid, "unsupported contract language: "+contract.Language)
+	}
+}
+
+// RemoveSmartContract deletes a contract.
+func (l *LMDBLedger) RemoveSmartContract(contractID string) error {
+	return l.store.DeleteContract(contractID)
+}
+
+// IntegrityCheck performs a simple health check.
+func (l *LMDBLedger) IntegrityCheck() error {
+	ctx := context.Background()
+	return l.store.HealthCheck(ctx)
+}
+
+// Close closes the underlying store.
+func (l *LMDBLedger) Close() error {
+	return l.store.Close()
+}
+
+// GetStats returns ledger statistics.
+func (l *LMDBLedger) GetStats() (map[string]interface{}, error) {
+	return l.store.GetStats()
+}
+
+// HealthCheck proxies to the store health check.
+func (l *LMDBLedger) HealthCheck(ctx context.Context) error {
+	return l.store.HealthCheck(ctx)
+}

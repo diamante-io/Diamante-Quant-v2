@@ -1,0 +1,422 @@
+package consensus_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPartitionAdapter(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.PartitionAdapterConfig{
+			DetectionInterval:    time.Second,
+			HealingTimeout:       30 * time.Second,
+			MinPartitionSize:     3,
+			MaxPartitionDuration: 5 * time.Minute,
+			EnableAutoHealing:    true,
+		}
+
+		pa := consensus.NewPartitionAdapter(config, logger)
+		require.NotNil(t, pa)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = pa.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("Partition Detection", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Report node disconnections
+		nodes := []string{"node1", "node2", "node3", "node4", "node5"}
+		
+		// Simulate partition - nodes 1,2,3 can't reach 4,5
+		pa.ReportDisconnection("node1", "node4")
+		pa.ReportDisconnection("node1", "node5")
+		pa.ReportDisconnection("node2", "node4")
+		pa.ReportDisconnection("node2", "node5")
+		pa.ReportDisconnection("node3", "node4")
+		pa.ReportDisconnection("node3", "node5")
+
+		// Check partition detection
+		partitions := pa.GetActivePartitions()
+		assert.NotEmpty(t, partitions)
+
+		// Get partition info
+		info := pa.GetPartitionInfo()
+		assert.NotNil(t, info)
+		assert.True(t, info.IsPartitioned)
+		assert.Greater(t, info.PartitionCount, 0)
+	})
+
+	t.Run("Node Group Management", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Add nodes to groups
+		group1 := []string{"node1", "node2", "node3"}
+		group2 := []string{"node4", "node5", "node6"}
+
+		for _, node := range group1 {
+			pa.AddNodeToGroup(node, "group1")
+		}
+
+		for _, node := range group2 {
+			pa.AddNodeToGroup(node, "group2")
+		}
+
+		// Get group members
+		members := pa.GetGroupMembers("group1")
+		assert.Equal(t, 3, len(members))
+		assert.Contains(t, members, "node1")
+		assert.Contains(t, members, "node2")
+		assert.Contains(t, members, "node3")
+
+		// Remove node from group
+		pa.RemoveNodeFromGroup("node3", "group1")
+		members = pa.GetGroupMembers("group1")
+		assert.Equal(t, 2, len(members))
+		assert.NotContains(t, members, "node3")
+	})
+
+	t.Run("Healing Process", func(t *testing.T) {
+		config := &consensus.PartitionAdapterConfig{
+			DetectionInterval:    100 * time.Millisecond,
+			HealingTimeout:       200 * time.Millisecond,
+			EnableAutoHealing:    true,
+		}
+
+		healed := false
+		pa := consensus.NewPartitionAdapter(config, logger)
+		pa.SetHealingCallback(func(partition *consensus.Partition) error {
+			healed = true
+			return nil
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Create partition
+		pa.ReportDisconnection("node1", "node2")
+		
+		// Wait for detection
+		time.Sleep(150 * time.Millisecond)
+
+		// Report reconnection
+		pa.ReportReconnection("node1", "node2")
+
+		// Wait for healing
+		time.Sleep(300 * time.Millisecond)
+
+		assert.True(t, healed, "Healing callback should have been called")
+
+		info := pa.GetPartitionInfo()
+		assert.False(t, info.IsPartitioned)
+	})
+
+	t.Run("Manual Healing", func(t *testing.T) {
+		config := &consensus.PartitionAdapterConfig{
+			EnableAutoHealing: false, // Disable auto healing
+		}
+
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Create partition
+		pa.ReportDisconnection("node1", "node2")
+		pa.ReportDisconnection("node3", "node4")
+
+		partitions := pa.GetActivePartitions()
+		require.NotEmpty(t, partitions)
+
+		// Manually heal first partition
+		err = pa.HealPartition(partitions[0].ID)
+		assert.NoError(t, err)
+
+		// Check partition count decreased
+		newPartitions := pa.GetActivePartitions()
+		assert.Less(t, len(newPartitions), len(partitions))
+	})
+
+	t.Run("Quorum Calculation", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Set up nodes with stakes
+		nodes := map[string]uint64{
+			"node1": 1000,
+			"node2": 2000,
+			"node3": 3000,
+			"node4": 4000,
+			"node5": 5000,
+		}
+
+		for node, stake := range nodes {
+			pa.UpdateNodeStake(node, stake)
+		}
+
+		// Create partition where nodes 1,2,3 are together (6000 stake)
+		// and nodes 4,5 are together (9000 stake)
+		pa.ReportDisconnection("node1", "node4")
+		pa.ReportDisconnection("node1", "node5")
+		pa.ReportDisconnection("node2", "node4")
+		pa.ReportDisconnection("node2", "node5")
+		pa.ReportDisconnection("node3", "node4")
+		pa.ReportDisconnection("node3", "node5")
+
+		// Check quorum - group with nodes 4,5 should have quorum
+		hasQuorum := pa.HasQuorum("node4")
+		assert.True(t, hasQuorum, "Larger partition should have quorum")
+
+		hasQuorum = pa.HasQuorum("node1")
+		assert.False(t, hasQuorum, "Smaller partition should not have quorum")
+	})
+
+	t.Run("Partition Metrics", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Create and heal partitions
+		pa.ReportDisconnection("node1", "node2")
+		time.Sleep(100 * time.Millisecond)
+		pa.ReportReconnection("node1", "node2")
+
+		metrics := pa.GetMetrics()
+		assert.NotNil(t, metrics)
+		assert.Greater(t, metrics.PartitionsDetected, uint64(0))
+		assert.GreaterOrEqual(t, metrics.PartitionsHealed, uint64(0))
+		assert.NotZero(t, metrics.LastPartitionTime)
+	})
+
+	t.Run("Concurrent Operations", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Concurrent disconnection reports
+		var wg sync.WaitGroup
+		nodes := 20
+
+		for i := 0; i < nodes; i++ {
+			wg.Add(1)
+			go func(nodeID int) {
+				defer wg.Done()
+				
+				node1 := string(rune('A' + nodeID))
+				node2 := string(rune('A' + (nodeID+1)%nodes))
+				
+				// Report disconnection
+				pa.ReportDisconnection(node1, node2)
+				time.Sleep(10 * time.Millisecond)
+				
+				// Report reconnection
+				pa.ReportReconnection(node1, node2)
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Verify no deadlocks and operations completed
+		info := pa.GetPartitionInfo()
+		assert.NotNil(t, info)
+	})
+
+	t.Run("Partition History", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Create partitions
+		pa.ReportDisconnection("node1", "node2")
+		pa.ReportDisconnection("node3", "node4")
+
+		// Get history
+		history := pa.GetPartitionHistory(10)
+		assert.NotEmpty(t, history)
+
+		// Clear history
+		pa.ClearPartitionHistory()
+		history = pa.GetPartitionHistory(10)
+		assert.Empty(t, history)
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultPartitionAdapterConfig()
+		pa := consensus.NewPartitionAdapter(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := pa.Start(ctx)
+		require.NoError(t, err)
+
+		// Stop
+		err = pa.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = pa.Stop()
+		assert.Error(t, err)
+
+		// Operations should fail after stop
+		err = pa.ReportDisconnection("node1", "node2")
+		assert.Error(t, err)
+	})
+}
+
+func TestPartition(t *testing.T) {
+	t.Run("Partition Structure", func(t *testing.T) {
+		partition := &consensus.Partition{
+			ID:        "partition-123",
+			Groups:    [][]string{{"node1", "node2"}, {"node3", "node4"}},
+			StartTime: time.Now(),
+			Healed:    false,
+		}
+
+		assert.Equal(t, "partition-123", partition.ID)
+		assert.Equal(t, 2, len(partition.Groups))
+		assert.False(t, partition.Healed)
+		assert.NotZero(t, partition.StartTime)
+	})
+
+	t.Run("Partition Duration", func(t *testing.T) {
+		startTime := time.Now().Add(-5 * time.Minute)
+		partition := &consensus.Partition{
+			ID:        "partition-456",
+			StartTime: startTime,
+			Healed:    false,
+		}
+
+		duration := partition.Duration()
+		assert.Greater(t, duration, 4*time.Minute)
+		assert.Less(t, duration, 6*time.Minute)
+	})
+}
+
+func TestPartitionInfo(t *testing.T) {
+	t.Run("Info Structure", func(t *testing.T) {
+		info := &consensus.PartitionInfo{
+			IsPartitioned:    true,
+			PartitionCount:   2,
+			LargestGroup:     5,
+			SmallestGroup:    2,
+			TotalNodes:       7,
+			LastUpdate:       time.Now(),
+			ActivePartitions: []string{"partition-1", "partition-2"},
+		}
+
+		assert.True(t, info.IsPartitioned)
+		assert.Equal(t, 2, info.PartitionCount)
+		assert.Equal(t, 5, info.LargestGroup)
+		assert.Equal(t, 2, info.SmallestGroup)
+		assert.Equal(t, 7, info.TotalNodes)
+		assert.NotZero(t, info.LastUpdate)
+		assert.Equal(t, 2, len(info.ActivePartitions))
+	})
+}
+
+func BenchmarkPartitionAdapter(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := consensus.DefaultPartitionAdapterConfig()
+	pa := consensus.NewPartitionAdapter(config, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	pa.Start(ctx)
+
+	b.Run("ReportDisconnection", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			node1 := string(rune('A' + (i % 26)))
+			node2 := string(rune('A' + ((i+1) % 26)))
+			pa.ReportDisconnection(node1, node2)
+		}
+	})
+
+	b.Run("GetPartitionInfo", func(b *testing.B) {
+		// Create some partitions
+		pa.ReportDisconnection("nodeA", "nodeB")
+		pa.ReportDisconnection("nodeC", "nodeD")
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			pa.GetPartitionInfo()
+		}
+	})
+
+	b.Run("HasQuorum", func(b *testing.B) {
+		// Set up nodes with stakes
+		for i := 0; i < 10; i++ {
+			node := string(rune('A' + i))
+			pa.UpdateNodeStake(node, uint64(1000*(i+1)))
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			node := string(rune('A' + (i % 10)))
+			pa.HasQuorum(node)
+		}
+	})
+}

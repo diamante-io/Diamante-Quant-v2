@@ -22,8 +22,8 @@ type Transaction struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
-// Store defines the interface for block storage.
-type Store interface {
+// BlockStore defines the interface for block storage.
+type BlockStore interface {
 	SaveBlock(block *Block) error
 	GetBlock(blockNumber uint64) (*Block, error)
 }

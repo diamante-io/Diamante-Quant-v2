@@ -1,0 +1,338 @@
+// Package runtime provides typed runtime interfaces for VM execution
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+	
+	"diamante/types"
+	"github.com/sirupsen/logrus"
+)
+
+// TypedRuntime is the interface for typed VM runtimes
+type TypedRuntime interface {
+	// Type returns the runtime type
+	Type() RuntimeType
+	
+	// Initialize sets up the runtime
+	Initialize(config *TypedRuntimeConfig) error
+	
+	// DeployContract deploys a new contract
+	DeployContract(ctx context.Context, deployment *types.ContractDeployData, sender string) (*DeploymentResult, error)
+	
+	// ExecuteContract executes a contract function
+	ExecuteContract(ctx context.Context, call *types.ContractCallData, sender string) (*ExecutionResult, error)
+	
+	// QueryContract queries contract state without modifying it
+	QueryContract(ctx context.Context, query *ContractQuery) (*QueryResult, error)
+	
+	// GetContractState retrieves contract state
+	GetContractState(contractAddress string) (*ContractState, error)
+	
+	// EstimateGas estimates gas for a contract call
+	EstimateGas(ctx context.Context, call *types.ContractCallData) (uint64, error)
+	
+	// Shutdown gracefully shuts down the runtime
+	Shutdown() error
+}
+
+// TypedRuntimeConfig contains configuration for typed runtime
+type TypedRuntimeConfig struct {
+	Type            RuntimeType       `json:"type"`
+	MaxGasLimit     uint64           `json:"max_gas_limit"`
+	MaxContractSize uint64           `json:"max_contract_size"`
+	MaxMemory       uint64           `json:"max_memory"`
+	EnableJIT       bool             `json:"enable_jit"`
+	EnableDebug     bool             `json:"enable_debug"`
+	Timeouts        *TimeoutConfig   `json:"timeouts"`
+	Resources       *ResourceLimits  `json:"resources"`
+	Logger          *logrus.Logger   `json:"-"`
+}
+
+// TimeoutConfig contains timeout settings
+type TimeoutConfig struct {
+	Deploy    time.Duration `json:"deploy"`
+	Execute   time.Duration `json:"execute"`
+	Query     time.Duration `json:"query"`
+}
+
+// ResourceLimits contains resource limit settings
+type ResourceLimits struct {
+	MaxCPUTime      time.Duration `json:"max_cpu_time"`
+	MaxMemoryMB     uint64        `json:"max_memory_mb"`
+	MaxStorageBytes uint64        `json:"max_storage_bytes"`
+	MaxLogSize      uint64        `json:"max_log_size"`
+}
+
+// DeploymentResult contains the result of contract deployment
+type DeploymentResult struct {
+	ContractAddress string                  `json:"contract_address"`
+	GasUsed         uint64                  `json:"gas_used"`
+	Events          []*types.TransactionEvent `json:"events"`
+	StateChanges    []*types.StateChange      `json:"state_changes"`
+	Logs            []string                  `json:"logs"`
+	Error           error                     `json:"error,omitempty"`
+}
+
+// ExecutionResult contains the result of contract execution
+type ExecutionResult struct {
+	Success      bool                      `json:"success"`
+	ReturnValue  *types.Value              `json:"return_value,omitempty"`
+	GasUsed      uint64                    `json:"gas_used"`
+	Events       []*types.TransactionEvent `json:"events"`
+	StateChanges []*types.StateChange      `json:"state_changes"`
+	Logs         []string                  `json:"logs"`
+	Error        error                     `json:"error,omitempty"`
+}
+
+// ContractQuery represents a contract state query
+type ContractQuery struct {
+	ContractAddress string                   `json:"contract_address"`
+	Method          string                   `json:"method"`
+	Arguments       []*types.ContractArgument `json:"arguments"`
+	BlockHeight     uint64                   `json:"block_height,omitempty"`
+}
+
+// QueryResult contains the result of a contract query
+type QueryResult struct {
+	Value     *types.Value `json:"value"`
+	StateRoot string       `json:"state_root"`
+	Proof     [][]byte     `json:"proof,omitempty"`
+	Error     error        `json:"error,omitempty"`
+}
+
+// ContractState represents the state of a deployed contract
+type ContractState struct {
+	Address         string            `json:"address"`
+	Runtime         RuntimeType       `json:"runtime"`
+	CodeHash        []byte            `json:"code_hash"`
+	Owner           string            `json:"owner"`
+	Balance         uint64            `json:"balance"`
+	Nonce           uint64            `json:"nonce"`
+	Storage         *types.TypedMap   `json:"storage"`
+	Metadata        *types.Metadata   `json:"metadata"`
+	CreatedAt       time.Time         `json:"created_at"`
+	LastExecuted    time.Time         `json:"last_executed"`
+	ExecutionCount  uint64            `json:"execution_count"`
+}
+
+// ContractEvent represents a typed contract event
+type ContractEvent struct {
+	Name      string                   `json:"name"`
+	Arguments []*types.ContractArgument `json:"arguments"`
+	Indexed   []bool                   `json:"indexed"`
+	Timestamp int64                    `json:"timestamp"`
+	LogIndex  uint                     `json:"log_index"`
+}
+
+// RuntimeManager manages multiple runtime instances
+type RuntimeManager struct {
+	runtimes map[RuntimeType]TypedRuntime
+	config   *RuntimeManagerConfig
+	logger   *logrus.Logger
+	mu       sync.RWMutex
+}
+
+// RuntimeManagerConfig contains configuration for runtime manager
+type RuntimeManagerConfig struct {
+	EnabledRuntimes []RuntimeType           `json:"enabled_runtimes"`
+	RuntimeConfigs  map[RuntimeType]*TypedRuntimeConfig `json:"runtime_configs"`
+	DefaultRuntime  RuntimeType             `json:"default_runtime"`
+}
+
+// NewRuntimeManager creates a new runtime manager
+func NewRuntimeManager(config *RuntimeManagerConfig, logger *logrus.Logger) (*RuntimeManager, error) {
+	if logger == nil {
+		logger = logrus.New()
+	}
+	
+	manager := &RuntimeManager{
+		runtimes: make(map[RuntimeType]TypedRuntime),
+		config:   config,
+		logger:   logger,
+	}
+	
+	// Initialize enabled runtimes
+	for _, runtimeType := range config.EnabledRuntimes {
+		runtimeConfig, exists := config.RuntimeConfigs[runtimeType]
+		if !exists {
+			return nil, fmt.Errorf("no configuration for runtime %s", runtimeType)
+		}
+		
+		runtime, err := createRuntime(runtimeType, runtimeConfig, logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create runtime %s: %w", runtimeType, err)
+		}
+		
+		manager.runtimes[runtimeType] = runtime
+		logger.WithField("runtime", runtimeType).Info("Runtime initialized")
+	}
+	
+	return manager, nil
+}
+
+// GetRuntime retrieves a specific runtime
+func (m *RuntimeManager) GetRuntime(runtimeType RuntimeType) (TypedRuntime, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	runtime, exists := m.runtimes[runtimeType]
+	if !exists {
+		return nil, fmt.Errorf("runtime %s not found", runtimeType)
+	}
+	
+	return runtime, nil
+}
+
+// DeployContract deploys a contract to the appropriate runtime
+func (m *RuntimeManager) DeployContract(ctx context.Context, deployment *types.ContractDeployData, sender string) (*DeploymentResult, error) {
+	runtimeType := RuntimeTypeFromString(deployment.Runtime)
+	
+	runtime, err := m.GetRuntime(runtimeType)
+	if err != nil {
+		return nil, err
+	}
+	
+	return runtime.DeployContract(ctx, deployment, sender)
+}
+
+// ExecuteContract executes a contract on the appropriate runtime
+func (m *RuntimeManager) ExecuteContract(ctx context.Context, contractAddress string, call *types.ContractCallData, sender string) (*ExecutionResult, error) {
+	// Determine runtime from contract address
+	state, err := m.getContractRuntime(contractAddress)
+	if err != nil {
+		return nil, err
+	}
+	
+	runtime, err := m.GetRuntime(state.Runtime)
+	if err != nil {
+		return nil, err
+	}
+	
+	return runtime.ExecuteContract(ctx, call, sender)
+}
+
+// Shutdown shuts down all runtimes
+func (m *RuntimeManager) Shutdown() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	
+	var lastErr error
+	for runtimeType, runtime := range m.runtimes {
+		if err := runtime.Shutdown(); err != nil {
+			m.logger.WithError(err).Errorf("Failed to shutdown runtime %s", runtimeType)
+			lastErr = err
+		}
+	}
+	
+	return lastErr
+}
+
+// getContractRuntime determines which runtime a contract belongs to
+func (m *RuntimeManager) getContractRuntime(contractAddress string) (*ContractState, error) {
+	// In a real implementation, this would query the contract registry
+	// For now, return a mock state
+	return &ContractState{
+		Address: contractAddress,
+		Runtime: RuntimeTypeEVM,
+	}, nil
+}
+
+// createRuntime creates a runtime instance based on type
+func createRuntime(runtimeType RuntimeType, config *TypedRuntimeConfig, logger *logrus.Logger) (TypedRuntime, error) {
+	switch runtimeType {
+	case RuntimeTypeEVM:
+		return NewEVMRuntime(config, logger)
+	case RuntimeTypeWASM:
+		return NewWASMRuntime(config, logger)
+	case RuntimeTypeNative:
+		return NewNativeRuntime(config, logger)
+	default:
+		return nil, fmt.Errorf("unsupported runtime type: %s", runtimeType)
+	}
+}
+
+// RuntimeMetrics contains runtime performance metrics
+type RuntimeMetrics struct {
+	Runtime              RuntimeType   `json:"runtime"`
+	TotalDeployments     uint64        `json:"total_deployments"`
+	TotalExecutions      uint64        `json:"total_executions"`
+	TotalGasUsed         uint64        `json:"total_gas_used"`
+	AvgDeploymentTime    time.Duration `json:"avg_deployment_time"`
+	AvgExecutionTime     time.Duration `json:"avg_execution_time"`
+	ActiveContracts      uint64        `json:"active_contracts"`
+	MemoryUsage          uint64        `json:"memory_usage"`
+	LastError            string        `json:"last_error,omitempty"`
+	LastErrorTime        time.Time     `json:"last_error_time,omitempty"`
+}
+
+// GetMetrics returns runtime metrics
+func (m *RuntimeManager) GetMetrics() map[RuntimeType]*RuntimeMetrics {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	
+	metrics := make(map[RuntimeType]*RuntimeMetrics)
+	
+	// In a real implementation, each runtime would provide its own metrics
+	for runtimeType := range m.runtimes {
+		metrics[runtimeType] = &RuntimeMetrics{
+			Runtime:         runtimeType,
+			TotalDeployments: 0,
+			TotalExecutions: 0,
+			// ... other metrics would be populated from runtime
+		}
+	}
+	
+	return metrics
+}
+
+// ValidateContract validates contract code before deployment
+func ValidateContract(runtimeType RuntimeType, code []byte) (*ValidationResult, error) {
+	switch runtimeType {
+	case RuntimeTypeEVM:
+		return validateEVMContract(code)
+	case RuntimeTypeWASM:
+		return validateWASMContract(code)
+	case RuntimeTypeNative:
+		return validateNativeContract(code)
+	default:
+		return nil, fmt.Errorf("unsupported runtime type: %s", runtimeType)
+	}
+}
+
+// ValidationResult contains contract validation results
+type ValidationResult struct {
+	Valid           bool     `json:"valid"`
+	Errors          []string `json:"errors,omitempty"`
+	Warnings        []string `json:"warnings,omitempty"`
+	EstimatedGas    uint64   `json:"estimated_gas"`
+	EstimatedMemory uint64   `json:"estimated_memory"`
+	SecurityScore   float64  `json:"security_score"`
+}
+
+// Stub validation functions
+func validateEVMContract(code []byte) (*ValidationResult, error) {
+	// Implementation would validate EVM bytecode
+	return &ValidationResult{
+		Valid:        true,
+		EstimatedGas: 3000000,
+	}, nil
+}
+
+func validateWASMContract(code []byte) (*ValidationResult, error) {
+	// Implementation would validate WASM module
+	return &ValidationResult{
+		Valid:        true,
+		EstimatedGas: 1000000,
+	}, nil
+}
+
+func validateNativeContract(code []byte) (*ValidationResult, error) {
+	// Implementation would validate native contract
+	return &ValidationResult{
+		Valid:        true,
+		EstimatedGas: 500000,
+	}, nil
+}

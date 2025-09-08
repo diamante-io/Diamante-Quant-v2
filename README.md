@@ -1,390 +1,260 @@
 # Diamante Quant v2
 
-Diamante Quant v2 is a modular blockchain network that integrates state-of-the-art mechanisms in consensus, cryptography, networking, ledger management, and more. This repository outlines the essential modules and their key components, forming a robust, scalable, and secure blockchain platform.
+> **Mirror Notice**  
+> This public repository is a read-only mirror of our private codebase. Issues and PRs are welcome here, but canonical development occurs in the private repo and is synced periodically.
+
+**Diamante Quant v2** is a next-generation, modular blockchain that unifies three execution paradigms—Type-3 zkEVM, enterprise Chaincode, and a native WASM VM ("DNA")—over a hybrid consensus pipeline: PoH (pre-ordering), DPoS (validator election), and aBFT (deterministic finality). The protocol adopts a post-quantum cryptography (PQC) baseline by default and includes a confidentiality layer for shielded transfers and private computation.
+
+**Whitepaper**: [Diamante Quantum White Paper](docs/whitepaper.pdf)
+
+**Status**: Active testnet engineering; APIs and internals subject to change.
 
 ---
 
 ## Table of Contents
 
-- [Overview](#overview)
+- [Key Features](#key-features)
+- [Architecture at a Glance](#architecture-at-a-glance)
 - [Modules](#modules)
-  - [Consensus Module](#consensus-module)
-  - [Crypto Module](#crypto-module)
-  - [Networking / P2P Module](#networking--p2p-module)
-  - [Ledger / State Machine Module](#ledger--state-machine-module)
-  - [Transaction Module](#transaction-module)
-  - [Storage / Data Layer](#storage--data-layer)
-  - [Governance Module](#governance-module)
-  - [Smart Contract Module](#smart-contract-module)
-  - [Validator / Node Management Module](#validator--node-management-module)
-  - [Light Node Support](#light-node-support)
-  - [Optimizer / Performance Tuning Module](#optimizer--performance-tuning-module)
-  - [Transaction Pool (Mempool)](#transaction-pool-mempool)
-  - [API / SDK Integration](#api--sdk-integration)
-  - [Wallet & Key Management](#wallet--key-management)
+  - [Consensus](#consensus)
+  - [Cryptography (PQC Baseline)](#cryptography-pqc-baseline)
+  - [Networking / P2P](#networking--p2p)
+  - [Ledger / State](#ledger--state)
+  - [Transactions & Mempool](#transactions--mempool)
+  - [Unified Smart-Contract Stack](#unified-smart-contract-stack)
+  - [Cross-VM Messaging (CVM)](#cross-vm-messaging-cvm)
+  - [Confidentiality Layer](#confidentiality-layer)
+  - [Storage / Data](#storage--data)
+  - [Governance & Token](#governance--token)
+  - [Validator Operations & SRE](#validator-operations--sre)
+  - [API / SDK](#api--sdk)
   - [Monitoring & Analytics](#monitoring--analytics)
-  - [Testing & QA Framework](#testing--qa-framework)
+  - [Testing & Benchmarks](#testing--benchmarks)
   - [DevOps & Deployment](#devops--deployment)
-  - [Migration & Interoperability](#migration--interoperability)
-- [Putting It All Together](#putting-it-all-together)
+  - [Interoperability](#interoperability)
+- [Performance Targets](#performance-targets)
+- [Repository Layout](#repository-layout)
+- [Getting Started](#getting-started)
+- [Contributing](#contributing)
 - [License](#license)
+- [Alignment Notes](#alignment-notes)
 
 ---
 
-## Overview
+## Key Features
 
-Diamante Quant v2 is designed to offer a high-performance, secure, and scalable blockchain network. Its architecture is composed of multiple interconnected modules, each responsible for a critical aspect of the system's operation—from consensus and cryptography to networking and smart contracts. This modular approach ensures flexibility, robust security, and seamless integration with both legacy systems and future enhancements.
+- **Hybrid Consensus**: PoH → DPoS → aBFT for low latency and deterministic finality.
+- **Post-Quantum by Default**: ML-KEM (CRYSTALS-Kyber) for KEM, ML-DSA (CRYSTALS-Dilithium) for signatures; SLH-DSA (SPHINCS+) as stateless alternative.
+- **Unified Contracts**: Type-3 zkEVM, Chaincode, and DNA/WASM in one network.
+- **CVM Atomicity**: Cross-VM atomic calls with ordered messaging and all-or-nothing commits.
+- **Confidentiality**: Commitment/nullifier model + zk proofs for shielded transfers and private compute.
+- **Tiered Storage**: LMDB (canonical), Redis (hot cache), MongoDB (archival/analytics), SQLite (edge/light).
+- **Observability & SRE**: Prometheus/Grafana dashboards, OpenTelemetry traces, alerting & runbooks.
 
----
+## Architecture at a Glance
+
+- **Time-to-Finality (upper-bound)**: T_poh + R·Δ + T_exec
+- **Throughput (approx.)**: (B − ε)/ŝ · 1/T_block
+- **Bandwidth per validator** (example @100k TPS, 250B/tx): ≈ 23.8 MB/s (≈190 Mbps)
 
 ## Modules
 
-### Consensus Module
+### Consensus
 
-**Purpose:**  
-Orchestrates how nodes agree on the state of the ledger (i.e., the canonical chain or DAG of blocks/events).
+- **Pipeline**: PoH (pre-ordering) → DPoS (election/proposal) → aBFT (finality).
+- **Goals**: sub-second TTF, deterministic safety for f < ⌊n/3⌋.
+- **Implementation Notes**: deterministic serialization; bounded timeouts; proposer schedule aligned with stake.
 
-**Key Components:**
-- **Core Algorithms:** e.g., Lachesis aBFT, DPoS, PoH, PBFT, etc.
-- **Consensus State:** Data needed by all nodes to maintain a consistent view (validators, last finalized block, etc.).
-- **Voting Mechanisms:** Virtual voting, block proposals, finality thresholds.
-- **Security Checks:** Slashing or penalty logic for misbehaving validators.
+### Cryptography (PQC Baseline)
 
-**Interactions:**
-- **Transaction Module:** Receives transactions and determines the final order.
-- **Crypto Module:** Validates signatures on blocks and events.
-- **Governance:** Allows parameter changes (e.g., staking thresholds, finality time).
-- **Networking:** Uses gossip or other P2P protocols to exchange consensus messages.
+- **Key Exchange**: ML-KEM (CRYSTALS-Kyber)
+- **Signatures**: ML-DSA (CRYSTALS-Dilithium); optional SLH-DSA (SPHINCS+) where stateless ops are preferred.
+- **Roadmap**: hybrid ECDSA+Dilithium support for migration paths (if enabled by network policy).
 
----
+### Networking / P2P
 
-### Crypto Module
+- Encrypted transport (TLS 1.3), rate limiting, partition handling under partial synchrony.
+- Service layer: REST/gRPC for wallets, explorers, and bulk ingestion.
 
-**Purpose:**  
-Provides cryptographic primitives (signing, hashing, key generation) and handles security operations (e.g., quantum-resistant signatures).
+### Ledger / State
 
-**Key Components:**
-- **Signature Schemes:** e.g., ECDSA, Ed25519, Dilithium (quantum-resistant), etc.
-- **Key Management:** Secure generation, storage, and usage of private/public keys.
-- **Keyber Implementation:**  
-  Incorporates **Keyber**, a robust key management solution that offers secure key storage, multi-signature support, and threshold signing. This enhances our cryptographic operations and ensures advanced security measures are in place.
-- **Hash Functions:** e.g., SHA-256, BLAKE2, or quantum-resistant hashes for block headers, Merkle trees, PoH, etc.
-- **Encryption:** (Optional) For confidential data or zero-knowledge proofs.
+- Deterministic state machine; canonical state in LMDB.
+- Snapshots/Checkpoints for fast sync; indexers for queries.
 
-**Interactions:**
-- **Consensus:** Verifies block/event signatures.
-- **Transaction & Wallet:** Signs transactions and verifies authenticity.
-- **Governance:** Authenticates voting actions and proposals.
-- **Node Security:** Manages node identity and secure P2P connections (TLS, secure handshake).
+### Transactions & Mempool
 
----
+- Typed envelopes with stable JSON fields.
+- Validation: signatures, nonces, fee/gas checks; spam/DoS controls.
+- Prioritization by fee and policy.
 
-### Networking / P2P Module
+### Unified Smart-Contract Stack
 
-**Purpose:**  
-Facilitates node-to-node communication, enabling the exchange of blocks, transactions, and consensus messages.
+- **Type-3 zkEVM**: Solidity/Vyper compatibility; zk proof verification on-chain.
+- **Chaincode**: enterprise logic (Go/Java/Node) with auditable state hashes.
+- **DNA/WASM**: resource-oriented semantics (ownership/linearity) for safety and performance.
 
-**Key Components:**
-- **Peer Discovery:** Mechanisms to find and maintain a list of active peers.
-- **Message Routing:** Efficient broadcasting/gossiping of transactions and consensus events.
-- **Reliability & Security:** NAT traversal, DoS protection, bandwidth usage controls.
-- **Topology Management:** Options like full mesh, gossip-based overlay, or partial mesh with super-nodes.
+### Cross-VM Messaging (CVM)
 
-**Interactions:**
-- **Consensus:** Exchanges block proposals, votes, and finality messages.
-- **Transaction:** Distributes unconfirmed transactions.
-- **Optimizer:** Adjusts gossip rates based on network load.
+- Ordered message bus across zkEVM / DNA / Chaincode.
+- Atomicity: multi-VM transactions commit or revert as a whole.
+- Determinism: explicit ordering, capability checks, and gas/accounting rules.
 
----
+### Confidentiality Layer
 
-### Ledger / State Machine Module
+- Commitments & Nullifiers to hide values/ownership and prevent double-spend.
+- zk Proofs (SNARK/STARK backends) to validate correctness without revealing inputs.
+- Note: pairing-based SNARKs are not PQ-safe; STARK path available per network policy.
 
-**Purpose:**  
-Maintains the canonical record of all state transitions (balances, smart contract states, account data) by applying transactions in the order decided by consensus.
+### Storage / Data
 
-**Key Components:**
-- **State Database:** Options include LevelDB, RocksDB, or a custom solution.
-- **State Transition Logic:** Applies validated transactions to update account balances and contract storage.
-- **Block/Transaction Indexing:** Facilitates fast lookups, queries, and historical checks.
-- **Checkpointing / Snapshots:** Enables quick synchronization and recovery.
+- **LMDB** (authoritative state), **Redis** (hot keys), **MongoDB** (archival/analytics), **SQLite** (light/edge).
+- Data growth planning and pruning/archival policies for high-TPS workloads.
 
-**Interactions:**
-- **Consensus:** Receives finalized blocks/events for state updates.
-- **Storage:** Persists state changes, block headers, and logs.
-- **Smart Contracts:** Executes contract code and updates related states.
+### Governance & Token
 
----
+- **$DIAM** for fees, staking, governance, collateral.
+- DPoS elections; proposal/threshold/quorum rules with timelock enactment.
 
-### Transaction Module
+### Validator Operations & SRE
 
-**Purpose:**  
-Handles the lifecycle of transactions: creation, validation, and packaging into blocks, ensuring correctness and preventing double-spending.
+- **Dashboards & Alerts**: uptime, missed blocks, peer count, CPU/memory, sync lag.
+- **Runbooks**: upgrades, rollback, incident response; restart-invariance checks.
 
-**Key Components:**
-- **Transaction Structure:** Defines inputs/outputs, signatures, fees, and timestamps.
-- **Validation Rules:** Includes balance checks, signature verifications, replay protection, and fee/gas checks.
-- **Mempool (Transaction Pool):** Buffers unconfirmed transactions.
-- **Prioritization:** Sorts transactions by fee, nonce, or other criteria for block inclusion.
+### API / SDK
 
-**Interactions:**
-- **Crypto:** Verifies transaction signatures.
-- **Consensus:** Integrates valid transactions into blocks.
-- **Ledger:** Applies transactions upon finalization.
-- **Wallet:** Prepares transactions for signing.
-
----
-
-### Storage / Data Layer
-
-**Purpose:**  
-Provides persistent storage for blocks, transactions, chain metadata, and snapshots to ensure data integrity and fast lookups.
-
-**Key Components:**
-- **Block Storage:** Stores raw block data or DAG events.
-- **Transaction Storage:** Provides indexing for lookups by hash, address, block number, etc.
-- **Metadata:** Stores chain configuration, consensus parameters, and checkpoint data.
-- **Snapshot Management:** Facilitates quick node bootstrap or recovery.
-
-**Interactions:**
-- **Ledger:** Reads and writes state transitions.
-- **Consensus:** Saves finalized blocks and aids in handling reorganizations.
-- **Governance:** Stores proposals, votes, and results.
-
----
-
-### Governance Module
-
-**Purpose:**  
-Enables on-chain governance for protocol upgrades, parameter adjustments, and community-driven proposals.
-
-**Key Components:**
-- **Proposal System:** Mechanisms to create, vote on, and finalize proposals.
-- **Voting Logic:** Can be weighted by stake, validator roles, etc.
-- **Upgrade Logic:** Supports automated or semi-automated application of accepted proposals.
-- **Slashing / Rewards:** Adjusts validator rewards or penalties based on proposals.
-
-**Interactions:**
-- **Consensus:** Updates parameters based on governance votes.
-- **Crypto:** Authenticates governance actions.
-- **Ledger:** Reflects governance outcomes in the network state.
-
----
-
-### Smart Contract Module
-
-**Purpose:**  
-Supports the creation, deployment, and execution of smart contracts to enable decentralized application (dApp) functionality.
-
-**Key Components:**
-- **Virtual Machine:** E.g., EVM-like or WASM-based environments for deterministic execution.
-- **Contract Lifecycle:** Manages deployment, upgrades, and self-destruct procedures.
-- **Gas Model / Execution Fees:** Prevents infinite loops and incentivizes node operators.
-- **API / ABI:** Provides interfaces for external contract function calls.
-
-**Interactions:**
-- **Ledger:** Updates contract storage and state.
-- **Transaction:** Executes smart contract function calls.
-- **Governance:** May incorporate contract-level governance features.
-
----
-
-### Validator / Node Management Module
-
-**Purpose:**  
-Orchestrates the lifecycle of validator nodes—from registration and staking to performance monitoring and rotation.
-
-**Key Components:**
-- **Staking & Unstaking:** Manages token locking for validator eligibility and redemption.
-- **Validator Registry:** Maintains an updated list of active validators.
-- **Performance Monitoring:** Rewards well-performing validators and penalizes misbehaving ones.
-- **Epoch Management:** Rotates or re-elects validators based on network conditions.
-
-**Interactions:**
-- **Consensus:** Determines which validators produce blocks or events.
-- **Governance:** Adjusts rules for validator eligibility and stake thresholds.
-- **Crypto:** Manages validator keys and signatures.
-
----
-
-### Light Node Support
-
-**Purpose:**  
-Provides an efficient mechanism for resource-constrained nodes (light nodes) to participate in the blockchain network without needing full validation capabilities.
-
-**Key Features:**
-- **Efficient Block Verification:**  
-  Light nodes download and verify only block headers, relying on full nodes or validators for complete block and transaction verification.
-- **Voting and Staking via Delegation:**  
-  Light nodes delegate their staking and voting rights to validators through a Delegated Proof of Stake (DPoS) mechanism, ensuring network participation without the overhead of full block validation.
-- **Security Through Merkle Proofs:**  
-  Light nodes verify transaction inclusion using Merkle proofs obtained from full nodes, ensuring security without requiring the entire blockchain state.
-
-**How Light Nodes Participate in Key Activities:**
-- **Transaction Initiation:**  
-  Light nodes can initiate transactions and send them to validators for inclusion in the next block. The mechanism can be extended with multisignature and threshold signing approaches to securely manage assets.
-- **Voting and Governance:**  
-  By delegating votes to validators in a DPoS system, light nodes (e.g., those running on smartphones) can participate in governance without running a full node.
-- **Staking:**  
-  Light nodes stake tokens by delegating them to validators or full nodes. Validators use these stakes to propose and validate blocks, allowing light nodes to earn rewards without direct consensus participation.
-- **Synchronization:**  
-  Utilizing block headers and Merkle proofs, light nodes can quickly verify transaction integrity, enabling fast synchronization on devices with limited storage and bandwidth.
-
----
-
-### Optimizer / Performance Tuning Module
-
-**Purpose:**  
-Monitors network conditions and dynamically adjusts consensus parameters or node settings to maintain high throughput and low latency.
-
-**Key Components:**
-- **Metrics Collection:** Gathers TPS, block sizes, network delays, and node performance data.
-- **Adaptive Algorithms:** Adjusts parameters like gossip intervals and block production timings.
-- **Load Balancing:** Distributes validator roles or tasks to manage load spikes.
-- **Alerts / Feedback:** Notifies governance or operators if manual intervention is needed.
-
-**Interactions:**
-- **Consensus:** Modifies finality thresholds and round times.
-- **Networking:** Dynamically adjusts gossip rates and message prioritization.
-- **Governance:** May propose larger changes if automated tuning is insufficient.
-
----
-
-### Transaction Pool (Mempool)
-
-**Purpose:**  
-Holds incoming transactions that have not yet been included in a block or event.
-
-**Key Components:**
-- **Transaction Sorting:** Orders transactions by fee, nonce, or other priorities.
-- **Spam Protection:** Implements rate limits or minimum fee requirements.
-- **Broadcast Logic:** Re-broadcasts or prunes transactions based on network events.
-- **Synchronization:** Keeps the pool consistent as blocks are finalized.
-
-**Interactions:**
-- **Consensus:** Supplies transactions for block inclusion.
-- **Transaction Module:** Validates and enqueues new transactions.
-- **Optimizer:** Adjusts thresholds during high load.
-
----
-
-### API / SDK Integration
-
-**Purpose:**  
-Provides a user-friendly interface for developers and end-users to interact with the blockchain, supporting dApp development, wallet integration, and blockchain exploration.
-
-**Key Components:**
-- **RPC / REST / gRPC Endpoints:** For transaction submission, block queries, and event streaming.
-- **Client Libraries (SDKs):** Available in languages like Golang, JavaScript, and Python.
-- **Backward Compatibility:** Adapters to maintain stable interfaces for existing users.
-- **Documentation & Examples:** Essential for encouraging developer adoption.
-
-**Interactions:**
-- **Transaction Module:** Submits signed transactions.
-- **Ledger:** Facilitates queries for balances, contract states, and block details.
-- **Governance:** Provides endpoints for proposal and voting operations.
-
----
-
-### Wallet & Key Management
-
-**Purpose:**  
-Enables users to create and manage keys, sign transactions, and review balances with secure handling of private keys.
-
-**Key Components:**
-- **Key Generation:** Uses secure random sources and robust cryptographic algorithms.
-- **Secure Storage:** Supports encrypted keystores, hardware wallets, or secure enclaves.
-- **Transaction Signing:** Allows offline or hardware-based signing for enhanced security.
-- **Backup & Recovery:** Utilizes mnemonic phrases or other recovery methods.
-
-**Interactions:**
-- **Crypto:** Underpins key generation, encryption, and signing.
-- **API / SDK:** Provides user-facing libraries and interfaces.
-- **Governance:** Integrates with on-chain voting mechanisms.
-
----
+- REST/gRPC for tx submission, status, bulk ops; versioned under `/api/v1`.
+- SDKs (Go/JS/Python) for wallets, dApps, indexers.
 
 ### Monitoring & Analytics
 
-**Purpose:**  
-Observes the network’s health, performance, and security, aiding in issue identification and usage tracking.
+- Prometheus/Grafana, OpenTelemetry; anomaly detection hooks.
 
-**Key Components:**
-- **Metrics Gathering:** Monitors TPS, block propagation times, node uptime, and resource usage.
-- **Analytics Platform:** Offers dashboards (e.g., Grafana, Kibana) for real-time and historical data.
-- **Alerting & Notifications:** Utilizes SMS, email, or push notifications for critical alerts.
-- **Block / Transaction Explorer:** Provides a user interface for browsing network data.
+### Testing & Benchmarks
 
-**Interactions:**
-- **Optimizer:** Feeds performance metrics for tuning.
-- **Governance:** Supplies data for informed decision-making.
-- **Storage:** Enables historical analysis via logged data.
-
----
-
-### Testing & QA Framework
-
-**Purpose:**  
-Ensures system correctness, performance, and resilience prior to production deployment.
-
-**Key Components:**
-- **Unit Tests:** Validate individual module functionalities.
-- **Integration Tests:** Verify end-to-end scenarios from transaction submission to ledger updates.
-- **Performance / Stress Tests:** Assess throughput, latency, and system resilience under heavy loads.
-- **Security Audits:** Tools and processes to identify vulnerabilities in contracts and protocol logic.
-
-**Interactions:**
-- **All Modules:** Each module includes dedicated test suites.
-- **DevOps Pipeline:** Integrates automated testing and quality assurance.
-- **Governance:** Evaluates the impact of proposals on system stability.
-
----
+- Throughput/latency suites with machine-readable outputs (e.g., `report.json`).
+- Targets (example): ≥100k TPS, P99 ≤ 10 ms (environment-dependent).
 
 ### DevOps & Deployment
 
-**Purpose:**  
-Automates the building, testing, and deployment of the blockchain software to ensure consistent and repeatable environments.
+- Docker/Kubernetes manifests; deterministic genesis; expected-hash checks.
+- CI: lint, build, test; CD for dev/test networks.
 
-**Key Components:**
-- **Continuous Integration (CI):** Automated builds, linting, and testing on every commit.
-- **Continuous Deployment (CD):** Automatic or semi-automatic deployment to testnet/mainnet after tests pass.
-- **Containerization:** Utilizes Docker images or Kubernetes for node deployments.
-- **Version Control:** Manages releases and branch configurations (e.g., testnet vs. mainnet).
+### Interoperability
 
-**Interactions:**
-- **Testing & QA:** Integrates with CI pipelines.
-- **Governance / Upgrades:** Coordinates network-wide updates following on-chain approval.
-- **Node Management:** Provides standardized configurations for operators.
+- CVM intra-chain atomicity; bridges/light-client verifiers for extra-chain messaging.
 
----
+## Performance Targets
 
-### Migration & Interoperability
+- **Goal**: 100,000+ TPS with < 1 s finality (hardware and network dependent).
+- Example derivations in whitepaper; validate with provided load-test suites and SRE playbooks.
 
-**Purpose:**  
-Facilitates smooth transitions from legacy networks (like Diamante Net) and ensures integration with external ecosystems.
+## Repository Layout
 
-**Key Components:**
-- **Snapshot / Migration Tools:** Scripts or modules to capture and load legacy ledger states.
-- **Bridges / Interoperability:** Enables connections with other blockchains (e.g., Ethereum bridges).
-- **Backward Compatibility:** Provides adapters for legacy clients and contracts.
-- **Verification & Rollback:** Tools to verify data integrity and handle partial migrations.
+```
+/api/                    # REST/gRPC handlers, typed schemas
+/app/                    # Application layer integration
+/benchmarks/             # Load/perf suites
+/cmd/                    # Node executables (e.g., realtestnet)
+/common/                 # Shared utilities and types
+/consensus/              # PoH, DPoS, aBFT implementation
+/contracts/              # Smart contract interfaces
+/crypto/                 # Kyber, Dilithium, SPHINCS+ integration
+/fees/                   # Fee calculation and management
+/ledger/                 # State machine, receipts
+/lightnode/              # Light client implementation
+/metrics/                # Performance metrics collection
+/migration/              # Data migration utilities
+/mobile/                 # Mobile SDK support
+/monitoring/             # Dashboards, alerts, OTel
+/network/                # P2P, peer mgmt, envelopes
+/sdk/                    # Client SDKs
+/security/               # Security framework and validation
+/storage/                # LMDB/Redis/Mongo/SQLite adapters
+/tests/                  # Integration and unit tests
+/transaction/            # Transaction processing and validation
+/types/                  # Core type definitions
+/vm/                     # zkEVM, DNA/WASM, Chaincode
+/wallet/                 # Wallet management and key derivation
+/docker-deployment/      # Compose/manifests, configs
+```
 
-**Interactions:**
-- **Governance:** Coordinates migration phases and necessary parameter adjustments.
-- **Ledger / Storage:** Imports balances and states from the old network.
-- **API / SDK:** Ensures seamless connectivity during transitions.
+## Getting Started
 
----
+> **Note**: This repo is a mirror; some scripts/manifests may point to private resources. Follow the whitepaper and docs for public equivalents.
 
-## Putting It All Together
+```bash
+# Clone the mirror
+git clone https://github.com/diamante-io/diamante-quant-v2.git
+cd diamante-quant-v2
 
-A successful blockchain network like **Diamante Quant v2** relies on the seamless integration of all these modules. Each component—from consensus and cryptographic security to networking, ledger management, and smart contracts—plays a vital role in maintaining a secure, scalable, and adaptable system. This modular architecture not only addresses current needs but also provides a solid foundation for future innovations and network upgrades.
+# Install dependencies
+go mod download
 
----
+# Build (example)
+go build -o realtestnet ./cmd/realtestnet
+
+# Run a local test stack (example)
+cd docker-deployment
+docker-compose -f docker-compose.yml up -d
+
+# Verify status (node ports in compose)
+curl http://localhost:8090/api/v1/status
+
+# Run tests
+go test ./...
+
+# Run benchmarks
+go test -bench=. ./benchmarks/...
+```
+
+### Prerequisites
+
+- **Go**: 1.21+ required
+- **Docker**: For containerized deployment
+- **MongoDB**: For archival storage (optional)
+- **Redis**: For caching layer (optional)
+- **Ubuntu**: 20.04+ recommended for production
+
+### Configuration
+
+Configuration is managed through environment variables. See `.env.example` for a template:
+
+```bash
+MONGO_URI=mongodb://localhost:27017
+REDIS_URL=redis://localhost:6379
+API_PORT=8090
+P2P_PORT=30303
+METRICS_PORT=9090
+```
+
+## Contributing
+
+Contributions are welcome via issues and PRs. For large changes, please open an issue first to align on scope and architecture.
+
+- **Code Style**: Follow Go conventions and run `go fmt`
+- **Testing**: Add tests for new features
+- **Documentation**: Update relevant docs
+- **Security disclosures**: Please report privately per [SECURITY.md](SECURITY.md)
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE).
 
 ---
 
-Feel free to contribute, open issues, or suggest improvements as we continue to build and enhance Diamante Quant v2!
+## Alignment Notes
+
+*Why this README matches the whitepaper:*
+
+- ✅ Fixes consensus description to **PoH + DPoS + aBFT** (not a grab-bag of algorithms).
+- ✅ Corrects cryptography to the **NIST PQC trio** (Kyber, Dilithium, SPHINCS+).
+- ✅ Adds the **Unified Smart-Contract Stack** and CVM atomicity.
+- ✅ Introduces the **Confidentiality Layer** details (commitments/nullifiers + zk).
+- ✅ Restores the **tiered storage model** (LMDB/Redis/Mongo/SQLite).
+- ✅ Includes **performance targets**, observability/SRE, and deterministic genesis checks.
+
+---
+
+**Built with ❤️ by the Diamante team**
+
+*Empowering the future of decentralized technology with quantum-safe, enterprise-grade blockchain infrastructure.*

@@ -169,10 +169,10 @@ func (bp *BatchProcessor) Start() error {
 	go bp.handleResults()
 
 	bp.logger.Info("Batch processor started",
-		"batchSize", bp.config.BatchSize,
-		"maxDelay", bp.config.MaxBatchDelay,
-		"groupByCreator", bp.config.GroupByCreator,
-		"parallelProcessing", bp.config.ParallelProcessing)
+		LogKeyValue{Key: "batchSize", Value: fmt.Sprintf("%d", bp.config.BatchSize)},
+		LogKeyValue{Key: "maxDelay", Value: fmt.Sprintf("%v", bp.config.MaxBatchDelay)},
+		LogKeyValue{Key: "groupByCreator", Value: fmt.Sprintf("%v", bp.config.GroupByCreator)},
+		LogKeyValue{Key: "parallelProcessing", Value: fmt.Sprintf("%v", bp.config.ParallelProcessing)})
 
 	return nil
 }
@@ -285,7 +285,7 @@ func (bp *BatchProcessor) processingLoop() {
 			}
 
 			// Adapt batch size if enabled
-			if bp.config.AdaptiveBatchSize && time.Since(bp.lastAdapted) > 30*time.Second {
+			if bp.config.AdaptiveBatchSize && ConsensusSince(bp.lastAdapted) > 30*time.Second {
 				bp.adaptBatchSize()
 			}
 
@@ -307,7 +307,7 @@ func (bp *BatchProcessor) processBatch() {
 
 	defer bp.processingWg.Done()
 
-	startTime := time.Now()
+	startTime := ConsensusNow()
 
 	// Determine how to process events
 	var batches [][]*types.Event
@@ -325,7 +325,7 @@ func (bp *BatchProcessor) processBatch() {
 	}
 
 	// Update metrics
-	bp.updateMetrics(len(batches), time.Since(startTime))
+	bp.updateMetrics(len(batches), ConsensusSince(startTime))
 }
 
 // createCreatorBasedBatches creates batches grouped by creator
@@ -466,7 +466,7 @@ func (bp *BatchProcessor) processSequentially(batches [][]*types.Event) {
 
 // processSingleBatch processes a single batch of events
 func (bp *BatchProcessor) processSingleBatch(events []*types.Event, batchID string) BatchResult {
-	startTime := time.Now()
+	startTime := ConsensusNow()
 	result := BatchResult{
 		Events:          events,
 		BatchIdentifier: batchID,
@@ -486,7 +486,7 @@ func (bp *BatchProcessor) processSingleBatch(events []*types.Event, batchID stri
 		}
 	}
 
-	result.ProcessingTime = time.Since(startTime)
+	result.ProcessingTime = ConsensusSince(startTime)
 	return result
 }
 
@@ -496,15 +496,15 @@ func (bp *BatchProcessor) handleResults() {
 		select {
 		case result := <-bp.processingResults:
 			bp.logger.Info("Batch processed",
-				"batchID", result.BatchIdentifier,
-				"processed", result.ProcessedCount,
-				"success", result.SuccessCount,
-				"failure", result.FailureCount,
-				"duration", result.ProcessingTime)
+				LogKeyValue{Key: "batchID", Value: result.BatchIdentifier},
+				LogKeyValue{Key: "processed", Value: fmt.Sprintf("%d", result.ProcessedCount)},
+				LogKeyValue{Key: "success", Value: fmt.Sprintf("%d", result.SuccessCount)},
+				LogKeyValue{Key: "failure", Value: fmt.Sprintf("%d", result.FailureCount)},
+				LogKeyValue{Key: "duration", Value: fmt.Sprintf("%v", result.ProcessingTime)})
 
 			// Handle any errors
 			for _, err := range result.Errors {
-				bp.logger.Error("Batch processing error", "error", err)
+				bp.logger.Error("Batch processing error", LogKeyValue{Key: "error", Value: err.Error()})
 			}
 
 		case <-bp.stopChan:
@@ -531,7 +531,7 @@ func (bp *BatchProcessor) updateMetrics(batchCount int, duration time.Duration) 
 	defer bp.metricsMu.Unlock()
 
 	bp.metrics.TotalBatches += batchCount
-	bp.metrics.LastBatchTime = time.Now()
+	bp.metrics.LastBatchTime = ConsensusNow()
 
 	// Update processing time metrics
 	if bp.metrics.MaxProcessingTime < duration {
@@ -558,7 +558,7 @@ func (bp *BatchProcessor) adaptBatchSize() {
 	bp.metricsMu.Lock()
 	defer bp.metricsMu.Unlock()
 
-	bp.lastAdapted = time.Now()
+	bp.lastAdapted = ConsensusNow()
 
 	// If we don't have enough history, don't adapt
 	if len(bp.metrics.BatchSizeHistory) < 3 {
@@ -573,8 +573,8 @@ func (bp *BatchProcessor) adaptBatchSize() {
 		}
 		bp.config.BatchSize = newSize
 		bp.logger.Info("Reduced batch size due to high processing time",
-			"newBatchSize", bp.config.BatchSize,
-			"avgProcessingTime", bp.metrics.AvgProcessingTime)
+			LogKeyValue{Key: "newBatchSize", Value: fmt.Sprintf("%d", bp.config.BatchSize)},
+			LogKeyValue{Key: "avgProcessingTime", Value: fmt.Sprintf("%v", bp.metrics.AvgProcessingTime)})
 		return
 	}
 
@@ -586,8 +586,8 @@ func (bp *BatchProcessor) adaptBatchSize() {
 		}
 		bp.config.BatchSize = newSize
 		bp.logger.Info("Increased batch size due to low processing time",
-			"newBatchSize", bp.config.BatchSize,
-			"avgProcessingTime", bp.metrics.AvgProcessingTime)
+			LogKeyValue{Key: "newBatchSize", Value: fmt.Sprintf("%d", bp.config.BatchSize)},
+			LogKeyValue{Key: "avgProcessingTime", Value: fmt.Sprintf("%v", bp.metrics.AvgProcessingTime)})
 	}
 }
 

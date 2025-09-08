@@ -1,63 +1,58 @@
 package storage
 
 import (
-	"context"
-	"fmt"
 	"time"
 
 	"diamante/common"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"github.com/sirupsen/logrus"
 )
 
-// MongoStore implements the Store interface using MongoDB.
+// MongoStore is now a thin wrapper around MongoAdapter for backward compatibility
 type MongoStore struct {
-	client     *mongo.Client
-	db         *mongo.Database
-	blocksColl *mongo.Collection
+	*MongoAdapter
 }
 
-// NewMongoStore creates a new MongoStore instance.
-func NewMongoStore(connectionString, dbName string) (*MongoStore, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
+// NewMongoStore creates a new MongoStore instance using MongoAdapter internally
+func NewMongoStore(connectionString, dbName string, maxPoolSize uint64, retries int, retryDelay time.Duration) (*MongoStore, error) {
+	// Create a logger if not provided
+	logger := logrus.New()
 
-	clientOpts := options.Client().ApplyURI(connectionString)
-	client, err := mongo.Connect(ctx, clientOpts)
+	// Use a reasonable cache size
+	cacheSize := 10000
+
+	// Create MongoAdapter with retry logic
+	adapter, err := NewMongoAdapter(connectionString, dbName, logger, cacheSize)
 	if err != nil {
-		return nil, fmt.Errorf("mongo connect error: %w", err)
+		return nil, err
 	}
 
-	db := client.Database(dbName)
-	ms := &MongoStore{
-		client:     client,
-		db:         db,
-		blocksColl: db.Collection("blocks"),
-	}
-	return ms, nil
+	return &MongoStore{
+		MongoAdapter: adapter,
+	}, nil
 }
 
-// SaveBlock stores a block document.
+// SaveBlock stores a block document (wrapper for compatibility)
 func (ms *MongoStore) SaveBlock(block *common.Block) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	_, err := ms.blocksColl.InsertOne(ctx, block)
-	return err
+	return ms.MongoAdapter.SaveBlock(block)
 }
 
-// GetBlock retrieves a block by its number.
+// GetBlock retrieves a block by its number (wrapper for compatibility)
 func (ms *MongoStore) GetBlock(blockNumber uint64) (*common.Block, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+	return ms.MongoAdapter.GetBlock(blockNumber)
+}
 
-	filter := bson.M{"number": blockNumber}
-	var block common.Block
-	err := ms.blocksColl.FindOne(ctx, filter).Decode(&block)
-	if err != nil {
-		return nil, fmt.Errorf("failed to retrieve block %d: %w", blockNumber, err)
-	}
-	return &block, nil
+// SaveReceipt stores a transaction receipt (wrapper for compatibility)
+func (ms *MongoStore) SaveReceipt(receipt *Receipt) error {
+	return ms.MongoAdapter.SaveReceipt(receipt)
+}
+
+// GetReceipt retrieves a transaction receipt by transaction ID (wrapper for compatibility)
+func (ms *MongoStore) GetReceipt(txID string) (*Receipt, error) {
+	return ms.MongoAdapter.GetReceipt(txID)
+}
+
+// Close closes the MongoDB connection (wrapper for compatibility)
+func (ms *MongoStore) Close() error {
+	return ms.MongoAdapter.Close()
 }

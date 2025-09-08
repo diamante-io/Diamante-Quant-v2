@@ -1,0 +1,456 @@
+// Package network provides typed network message handling
+package network
+
+import (
+	"encoding/json"
+	"fmt"
+	"sync"
+	"time"
+	
+	"diamante/common"
+	"diamante/types"
+	"github.com/sirupsen/logrus"
+)
+
+// MessageType represents the type of network message
+type MessageType uint8
+
+const (
+	MessageTypeUnknown MessageType = iota
+	MessageTypeHandshake
+	MessageTypePing
+	MessageTypePong
+	MessageTypeBlock
+	MessageTypeTransaction
+	MessageTypeConsensus
+	MessageTypeSync
+	MessageTypeState
+	MessageTypeQuery
+	MessageTypeResponse
+)
+
+// TypedMessage represents a typed network message
+type TypedMessage struct {
+	Type      MessageType      `json:"type"`
+	ID        string          `json:"id"`
+	Sender    string          `json:"sender"`
+	Recipient string          `json:"recipient,omitempty"`
+	Timestamp int64           `json:"timestamp"`
+	Payload   *MessagePayload `json:"payload"`
+	Signature []byte          `json:"signature,omitempty"`
+}
+
+// MessagePayload contains typed message data
+type MessagePayload struct {
+	Handshake   *HandshakeData   `json:"handshake,omitempty"`
+	Block       *BlockData       `json:"block,omitempty"`
+	Transaction *TransactionData `json:"transaction,omitempty"`
+	Consensus   *ConsensusData   `json:"consensus,omitempty"`
+	Sync        *SyncData        `json:"sync,omitempty"`
+	State       *StateData       `json:"state,omitempty"`
+	Query       *QueryData       `json:"query,omitempty"`
+	Response    *ResponseData    `json:"response,omitempty"`
+}
+
+// HandshakeData contains peer handshake information
+type HandshakeData struct {
+	Version      string            `json:"version"`
+	NodeID       string            `json:"node_id"`
+	ChainID      string            `json:"chain_id"`
+	Height       uint64            `json:"height"`
+	Capabilities []string          `json:"capabilities"`
+	Metadata     map[string]*types.Value `json:"metadata"`
+}
+
+// BlockData contains block propagation data
+type BlockData struct {
+	Height       uint64          `json:"height"`
+	Hash         []byte          `json:"hash"`
+	Block        []byte          `json:"block"`
+	Compressed   bool            `json:"compressed"`
+	Metadata     *types.Metadata `json:"metadata"`
+}
+
+// TransactionData contains transaction propagation data
+type TransactionData struct {
+	Transaction *types.TypedTransaction `json:"transaction"`
+	Priority    types.TransactionPriority `json:"priority"`
+	Broadcast   bool                    `json:"broadcast"`
+}
+
+// ConsensusData contains consensus message data
+type ConsensusData struct {
+	Type    types.ConsensusMessageType `json:"type"`
+	Height  uint64                    `json:"height"`
+	Round   uint32                    `json:"round"`
+	Data    *types.ConsensusPayload   `json:"data"`
+}
+
+// SyncData contains state synchronization data
+type SyncData struct {
+	Type        SyncType         `json:"type"`
+	StartHeight uint64           `json:"start_height"`
+	EndHeight   uint64           `json:"end_height"`
+	Chunks      []*SyncChunk     `json:"chunks,omitempty"`
+	Metadata    *types.Metadata  `json:"metadata"`
+}
+
+// SyncType represents the type of sync operation
+type SyncType uint8
+
+const (
+	SyncTypeHeaders SyncType = iota
+	SyncTypeBlocks
+	SyncTypeState
+	SyncTypeSnapshots
+)
+
+// SyncChunk represents a chunk of sync data
+type SyncChunk struct {
+	Index      uint32 `json:"index"`
+	TotalChunks uint32 `json:"total_chunks"`
+	Data       []byte `json:"data"`
+	Hash       []byte `json:"hash"`
+}
+
+// StateData contains state query/response data
+type StateData struct {
+	Keys     []string              `json:"keys"`
+	Values   map[string]*types.StateEntry `json:"values,omitempty"`
+	Proof    [][]byte              `json:"proof,omitempty"`
+	Height   uint64                `json:"height"`
+}
+
+// QueryData contains query request data
+type QueryData struct {
+	QueryType   QueryType         `json:"query_type"`
+	Parameters  map[string]*types.Value `json:"parameters"`
+	MaxResults  uint32            `json:"max_results,omitempty"`
+	Timeout     time.Duration     `json:"timeout,omitempty"`
+}
+
+// QueryType represents the type of query
+type QueryType uint8
+
+const (
+	QueryTypeBlock QueryType = iota
+	QueryTypeTransaction
+	QueryTypeState
+	QueryTypePeer
+	QueryTypeValidator
+)
+
+// ResponseData contains query response data
+type ResponseData struct {
+	RequestID   string            `json:"request_id"`
+	Success     bool              `json:"success"`
+	Data        *types.Value      `json:"data,omitempty"`
+	Error       string            `json:"error,omitempty"`
+	Metadata    map[string]*types.Value `json:"metadata,omitempty"`
+}
+
+// TypedMessageHandler handles typed network messages
+type TypedMessageHandler struct {
+	handlers map[MessageType]MessageHandlerFunc
+	logger   *logrus.Logger
+	metrics  *NetworkMetrics
+	mu       sync.RWMutex
+}
+
+// MessageHandlerFunc is a function that handles a specific message type
+type MessageHandlerFunc func(msg *TypedMessage, peer *Peer) error
+
+// NetworkMetrics tracks network performance metrics
+type NetworkMetrics struct {
+	MessagesReceived   map[MessageType]uint64
+	MessagesSent       map[MessageType]uint64
+	BytesReceived      uint64
+	BytesSent          uint64
+	ErrorCount         uint64
+	AvgProcessingTime  time.Duration
+	ActiveConnections  uint32
+}
+
+// NewTypedMessageHandler creates a new typed message handler
+func NewTypedMessageHandler(logger *logrus.Logger) *TypedMessageHandler {
+	if logger == nil {
+		logger = logrus.New()
+	}
+	
+	return &TypedMessageHandler{
+		handlers: make(map[MessageType]MessageHandlerFunc),
+		logger:   logger,
+		metrics: &NetworkMetrics{
+			MessagesReceived: make(map[MessageType]uint64),
+			MessagesSent:     make(map[MessageType]uint64),
+		},
+	}
+}
+
+// RegisterHandler registers a handler for a specific message type
+func (h *TypedMessageHandler) RegisterHandler(msgType MessageType, handler MessageHandlerFunc) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	
+	h.handlers[msgType] = handler
+	h.logger.WithField("type", msgType).Debug("Registered message handler")
+}
+
+// HandleMessage processes an incoming message
+func (h *TypedMessageHandler) HandleMessage(data []byte, peer *Peer) error {
+	// Deserialize message
+	var msg TypedMessage
+	if err := json.Unmarshal(data, &msg); err != nil {
+		h.metrics.ErrorCount++
+		return fmt.Errorf("failed to unmarshal message: %w", err)
+	}
+	
+	// Validate message
+	if err := h.validateMessage(&msg); err != nil {
+		h.metrics.ErrorCount++
+		return fmt.Errorf("invalid message: %w", err)
+	}
+	
+	// Update metrics
+	h.mu.Lock()
+	h.metrics.MessagesReceived[msg.Type]++
+	h.metrics.BytesReceived += uint64(len(data))
+	h.mu.Unlock()
+	
+	// Get handler
+	h.mu.RLock()
+	handler, exists := h.handlers[msg.Type]
+	h.mu.RUnlock()
+	
+	if !exists {
+		return fmt.Errorf("no handler for message type %d", msg.Type)
+	}
+	
+	// Process message
+	start := common.ConsensusNow()
+	err := handler(&msg, peer)
+	processingTime := common.ConsensusSince(start)
+	
+	// Update average processing time
+	h.updateProcessingTime(processingTime)
+	
+	if err != nil {
+		h.logger.WithError(err).WithFields(logrus.Fields{
+			"type":   msg.Type,
+			"sender": msg.Sender,
+			"id":     msg.ID,
+		}).Error("Failed to handle message")
+		h.metrics.ErrorCount++
+		return err
+	}
+	
+	return nil
+}
+
+// SendMessage sends a typed message to a peer
+func (h *TypedMessageHandler) SendMessage(msg *TypedMessage, peer *Peer) error {
+	// Set timestamp if not set
+	if msg.Timestamp == 0 {
+		msg.Timestamp = common.ConsensusUnix()
+	}
+	
+	// Serialize message
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("failed to marshal message: %w", err)
+	}
+	
+	// Send to peer
+	if err := peer.Send(data); err != nil {
+		h.metrics.ErrorCount++
+		return fmt.Errorf("failed to send message: %w", err)
+	}
+	
+	// Update metrics
+	h.mu.Lock()
+	h.metrics.MessagesSent[msg.Type]++
+	h.metrics.BytesSent += uint64(len(data))
+	h.mu.Unlock()
+	
+	h.logger.WithFields(logrus.Fields{
+		"type":      msg.Type,
+		"recipient": peer.ID(),
+		"id":        msg.ID,
+		"size":      len(data),
+	}).Debug("Sent message")
+	
+	return nil
+}
+
+// BroadcastMessage broadcasts a message to multiple peers
+func (h *TypedMessageHandler) BroadcastMessage(msg *TypedMessage, peers []*Peer) error {
+	var lastErr error
+	successCount := 0
+	
+	for _, peer := range peers {
+		if err := h.SendMessage(msg, peer); err != nil {
+			lastErr = err
+			h.logger.WithError(err).WithField("peer", peer.ID()).Warn("Failed to send to peer")
+		} else {
+			successCount++
+		}
+	}
+	
+	if successCount == 0 && lastErr != nil {
+		return fmt.Errorf("failed to broadcast to any peer: %w", lastErr)
+	}
+	
+	h.logger.WithFields(logrus.Fields{
+		"type":       msg.Type,
+		"recipients": len(peers),
+		"success":    successCount,
+	}).Info("Broadcast message")
+	
+	return nil
+}
+
+// validateMessage validates a typed message
+func (h *TypedMessageHandler) validateMessage(msg *TypedMessage) error {
+	if msg.Type == MessageTypeUnknown {
+		return fmt.Errorf("unknown message type")
+	}
+	
+	if msg.ID == "" {
+		return fmt.Errorf("message ID is empty")
+	}
+	
+	if msg.Sender == "" {
+		return fmt.Errorf("sender is empty")
+	}
+	
+	if msg.Payload == nil {
+		return fmt.Errorf("payload is nil")
+	}
+	
+	// Validate payload based on type
+	switch msg.Type {
+	case MessageTypeHandshake:
+		if msg.Payload.Handshake == nil {
+			return fmt.Errorf("handshake data is nil")
+		}
+	case MessageTypeBlock:
+		if msg.Payload.Block == nil {
+			return fmt.Errorf("block data is nil")
+		}
+	case MessageTypeTransaction:
+		if msg.Payload.Transaction == nil {
+			return fmt.Errorf("transaction data is nil")
+		}
+	// ... other validations
+	}
+	
+	return nil
+}
+
+// updateProcessingTime updates the average processing time
+func (h *TypedMessageHandler) updateProcessingTime(duration time.Duration) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	
+	// Simple moving average
+	if h.metrics.AvgProcessingTime == 0 {
+		h.metrics.AvgProcessingTime = duration
+	} else {
+		h.metrics.AvgProcessingTime = (h.metrics.AvgProcessingTime + duration) / 2
+	}
+}
+
+// GetMetrics returns network metrics
+func (h *TypedMessageHandler) GetMetrics() *NetworkMetrics {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	
+	// Create a copy
+	metrics := &NetworkMetrics{
+		MessagesReceived:  make(map[MessageType]uint64),
+		MessagesSent:      make(map[MessageType]uint64),
+		BytesReceived:     h.metrics.BytesReceived,
+		BytesSent:         h.metrics.BytesSent,
+		ErrorCount:        h.metrics.ErrorCount,
+		AvgProcessingTime: h.metrics.AvgProcessingTime,
+		ActiveConnections: h.metrics.ActiveConnections,
+	}
+	
+	for k, v := range h.metrics.MessagesReceived {
+		metrics.MessagesReceived[k] = v
+	}
+	
+	for k, v := range h.metrics.MessagesSent {
+		metrics.MessagesSent[k] = v
+	}
+	
+	return metrics
+}
+
+// Helper functions for creating typed messages
+
+// NewHandshakeMessage creates a handshake message
+func NewHandshakeMessage(nodeID, chainID string, height uint64, version string) *TypedMessage {
+	return &TypedMessage{
+		Type:      MessageTypeHandshake,
+		ID:        generateMessageID(),
+		Sender:    nodeID,
+		Timestamp: common.ConsensusUnix(),
+		Payload: &MessagePayload{
+			Handshake: &HandshakeData{
+				Version:      version,
+				NodeID:       nodeID,
+				ChainID:      chainID,
+				Height:       height,
+				Capabilities: []string{"compression", "encryption", "fast-sync"},
+				Metadata:     make(map[string]*types.Value),
+			},
+		},
+	}
+}
+
+// NewBlockMessage creates a block propagation message
+func NewBlockMessage(height uint64, hash, blockData []byte, compressed bool) *TypedMessage {
+	return &TypedMessage{
+		Type:      MessageTypeBlock,
+		ID:        generateMessageID(),
+		Timestamp: common.ConsensusUnix(),
+		Payload: &MessagePayload{
+			Block: &BlockData{
+				Height:     height,
+				Hash:       hash,
+				Block:      blockData,
+				Compressed: compressed,
+				Metadata:   types.NewMetadata("block-propagation"),
+			},
+		},
+	}
+}
+
+// NewTransactionMessage creates a transaction propagation message
+func NewTransactionMessage(tx *types.TypedTransaction, broadcast bool) *TypedMessage {
+	return &TypedMessage{
+		Type:      MessageTypeTransaction,
+		ID:        generateMessageID(),
+		Sender:    tx.From,
+		Timestamp: common.ConsensusUnix(),
+		Payload: &MessagePayload{
+			Transaction: &TransactionData{
+				Transaction: tx,
+				Priority:    tx.Priority,
+				Broadcast:   broadcast,
+			},
+		},
+	}
+}
+
+// generateMessageID generates a unique message ID
+func generateMessageID() string {
+	// In production, use proper UUID generation
+	return fmt.Sprintf("msg-%d-%d", common.ConsensusUnixNano(), randInt())
+}
+
+func randInt() int {
+	// Placeholder - use proper random generation
+	return int(common.ConsensusUnixNano() % 1000000)
+}

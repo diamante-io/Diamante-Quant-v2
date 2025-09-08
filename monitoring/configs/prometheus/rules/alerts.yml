@@ -1,0 +1,17 @@
+groups:
+  - name: diamante.rules
+    rules:
+      - alert: HighCPUUsage
+        expr: diamante_cpu_usage_percent > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High CPU usage on Diamante node"
+      - alert: LowValidators
+        expr: diamante_active_validators < 3
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Validator count dropped below 3"

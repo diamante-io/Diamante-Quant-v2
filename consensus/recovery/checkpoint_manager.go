@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	"diamante/consensus"
 )
 
 // CheckpointMetadata contains metadata about a checkpoint
@@ -252,7 +254,7 @@ func (cm *CheckpointManager) CreateCheckpoint(height uint64, blockHash, prevHash
 	checkpoint := &Checkpoint{
 		Metadata: CheckpointMetadata{
 			Height:       height,
-			Timestamp:    time.Now(),
+			Timestamp:    consensus.ConsensusNow(),
 			BlockHash:    blockHash,
 			PreviousHash: prevHash,
 			Components:   make([]string, 0, len(cm.components)),

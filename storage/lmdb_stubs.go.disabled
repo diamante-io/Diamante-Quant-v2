@@ -1,0 +1,49 @@
+// storage/lmdb_stubs.go
+// Placeholder types for LMDB functionality (disabled on Windows)
+
+package storage
+
+import (
+	"fmt"
+	"github.com/sirupsen/logrus"
+)
+
+// LMDBConfig placeholder for disabled LMDB functionality
+type LMDBConfig struct {
+	Path           string
+	MapSize        int64
+	MaxReaders     uint
+	MaxDbs         uint
+	NoSync         bool
+	NoMetaSync     bool
+	ReadOnly       bool
+	WriteMap       bool
+	MapAsync       bool
+	NoTLS          bool
+	NoLock         bool
+	NoReadahead    bool
+	NoMemInit      bool
+	AutoResize     bool
+	ResizeFactor   float64
+	Debug          bool
+}
+
+// DefaultLMDBConfig returns default config (disabled)
+func DefaultLMDBConfig() *LMDBConfig {
+	return &LMDBConfig{
+		Path:         "data/lmdb_disabled",
+		MapSize:      1024 * 1024 * 1024, // 1GB
+		MaxReaders:   126,
+		MaxDbs:       8,
+		AutoResize:   true,
+		ResizeFactor: 1.5,
+	}
+}
+
+// LMDBAdapter placeholder (disabled)
+type LMDBAdapter struct{}
+
+// NewLMDBAdapter returns error indicating LMDB is disabled
+func NewLMDBAdapter(config *LMDBConfig, logger *logrus.Logger, cacheSize int) (*LMDBAdapter, error) {
+	return nil, fmt.Errorf("LMDB support has been disabled for Windows compatibility - use MongoDB adapter instead")
+}

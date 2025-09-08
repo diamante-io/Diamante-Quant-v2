@@ -1,6 +1,6 @@
-// consensus/diamantefinality/finality/lachesis.go
+// consensus/diamantefinality/lachesis.go
 
-package finality
+package diamantefinality
 
 import (
 	"context"
@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math"
 	"os"
 	"sync"
 	"time"
@@ -26,8 +25,8 @@ type Lachesis struct {
 
 	// Configuration
 	gossipDelay     time.Duration
-	votingThreshold float64 // e.g., 0.66 => 66% stake needed for finality
-	networkLoad     float64 // ∈ [0,1] for dynamic gossip scaling
+	votingThreshold uint32 // e.g., 66 => 66% stake needed for finality
+	networkLoad     uint32 // ∈ [0,100] for dynamic gossip scaling (percentage)
 	configMu        sync.RWMutex
 
 	// State
@@ -46,14 +45,14 @@ type Lachesis struct {
 	logger *log.Logger
 }
 
-// NewLachesis constructs a Lachesis instance with default votingThreshold=0.66
+// NewLachesis constructs a Lachesis instance with default votingThreshold=66%
 // and sets up the DAG, GossipProtocol, VirtualVoting, and Finalizer submodules.
 func NewLachesis(gossipDelay time.Duration) *Lachesis {
 	dag := NewDAG()
 	l := &Lachesis{
 		DAG:             dag,
 		gossipDelay:     gossipDelay,
-		votingThreshold: 0.66, // can be adjusted later
+		votingThreshold: 66, // 66% can be adjusted later
 		networkLoad:     0,
 		finalizedEvents: make(map[uint64][]*types.Event),
 		// Initialize logger with default settings.
@@ -83,35 +82,40 @@ func (l *Lachesis) SetGossipDelay(delay time.Duration) {
 }
 
 // AdjustNetworkLoad modifies the networkLoad by the given amount (positive or negative),
-// clamps it to [0,1], and updates the GossipProtocol. This can be used by external modules
+// clamps it to [0,100], and updates the GossipProtocol. This can be used by external modules
 // to indicate changes in network traffic or system load.
 func (l *Lachesis) AdjustNetworkLoad(adjustment float64) {
 	l.configMu.Lock()
 	defer l.configMu.Unlock()
-	newLoad := l.networkLoad + adjustment
-	l.networkLoad = math.Max(0, math.Min(1, newLoad))
-	l.GossipProtocol.UpdateNetworkLoad(l.networkLoad)
+	newLoad := int32(l.networkLoad) + int32(adjustment)
+	if newLoad < 0 {
+		newLoad = 0
+	} else if newLoad > 100 {
+		newLoad = 100
+	}
+	l.networkLoad = uint32(newLoad)
+	l.GossipProtocol.UpdateNetworkLoad(float64(l.networkLoad))
 }
 
 // GetNetworkLoad returns the current load factor used for scaling gossip delay.
 func (l *Lachesis) GetNetworkLoad() float64 {
 	l.configMu.RLock()
 	defer l.configMu.RUnlock()
-	return l.networkLoad
+	return float64(l.networkLoad)
 }
 
-// GetVotingThreshold returns the fraction of stake required to finalize an event.
+// GetVotingThreshold returns the percentage of stake required to finalize an event.
 func (l *Lachesis) GetVotingThreshold() float64 {
 	l.configMu.RLock()
 	defer l.configMu.RUnlock()
-	return l.votingThreshold
+	return float64(l.votingThreshold)
 }
 
-// SetVotingThreshold updates the fraction of stake needed for finality, and applies it to VirtualVoting.
+// SetVotingThreshold updates the percentage of stake needed for finality, and applies it to VirtualVoting.
 func (l *Lachesis) SetVotingThreshold(threshold float64) {
 	l.configMu.Lock()
 	defer l.configMu.Unlock()
-	l.votingThreshold = threshold
+	l.votingThreshold = uint32(threshold)
 	l.VirtualVoting.SetThreshold(threshold)
 }
 
@@ -163,6 +167,9 @@ func (l *Lachesis) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []by
 // to see if the event can be finalized. If yes, it calls Finalizer and records
 // the event in finalizedEvents. Returns true on success.
 func (l *Lachesis) ProcessEvent(event *types.Event) bool {
+	if event == nil {
+		return false
+	}
 	if !l.DAG.IsActiveValidator(event.Creator) {
 		return false
 	}
@@ -248,11 +255,13 @@ func (l *Lachesis) detectFinality(event *types.Event) bool {
 
 	// Read threshold under config lock
 	l.configMu.RLock()
-	requiredWeight := float64(totalStake) * l.votingThreshold
+	threshold := l.votingThreshold
 	l.configMu.RUnlock()
 
-	var totalWeight float64
-	var remainingStake float64 = float64(totalStake)
+	// Use integer arithmetic: requiredWeight = (totalStake * threshold) / 100
+	requiredWeight := (totalStake * uint64(threshold)) / 100
+	var totalWeight uint64
+	var remainingStake uint64 = totalStake
 
 	// This needs nodesMu to safely read node stakes
 	l.DAG.nodesMu.RLock()
@@ -263,7 +272,7 @@ func (l *Lachesis) detectFinality(event *types.Event) bool {
 		if !ok || !node.Active {
 			continue
 		}
-		stk := float64(node.Stake)
+		stk := node.Stake
 		remainingStake -= stk
 
 		if l.VirtualVoting.HasSeen(nid, event) {

@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"diamante/common"
 	"diamante/consensus/types"
 )
 
@@ -25,6 +26,7 @@ const (
 	Passed
 	Rejected
 	Executed
+	Canceled
 )
 
 func (s ProposalStatus) String() string {
@@ -39,6 +41,8 @@ func (s ProposalStatus) String() string {
 		return "Rejected"
 	case Executed:
 		return "Executed"
+	case Canceled:
+		return "Canceled"
 	default:
 		return "Unknown"
 	}
@@ -53,15 +57,16 @@ const (
 )
 
 type Proposal struct {
-	ID          [32]byte
-	Type        ProposalType
-	Description string
-	StartTime   time.Time
-	EndTime     time.Time
-	Status      ProposalStatus
-	Votes       map[[32]byte]bool
-	Data        []byte
-	Creator     [32]byte
+	ID            [32]byte
+	Type          ProposalType
+	Description   string
+	StartTime     time.Time
+	EndTime       time.Time
+	Status        ProposalStatus
+	StatusHistory []ProposalStatus
+	Votes         map[[32]byte]bool
+	Data          []byte
+	Creator       [32]byte
 }
 
 type ConsensusChangeData struct {
@@ -71,13 +76,33 @@ type ConsensusChangeData struct {
 }
 
 type ParameterChangeData struct {
-	NewEpochDuration uint64 `json:"new_epoch_duration"`
-	NewMinStake      uint64 `json:"new_min_stake"`
+	NewEpochDuration         uint64 `json:"new_epoch_duration"`
+	NewMinStake              uint64 `json:"new_min_stake"`
+	NewVotingDurationSeconds uint64 `json:"new_voting_duration_seconds"`
 }
 
 type UpgradeProposalData struct {
 	NewVersion    string `json:"new_version"`
 	UpgradeHeight uint64 `json:"upgrade_height"`
+}
+
+func validateProposalData(pt ProposalType, data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	switch pt {
+	case ConsensusChange:
+		var cd ConsensusChangeData
+		return json.Unmarshal(data, &cd)
+	case ParameterChange:
+		var pd ParameterChangeData
+		return json.Unmarshal(data, &pd)
+	case UpgradeProposal:
+		var ud UpgradeProposalData
+		return json.Unmarshal(data, &ud)
+	default:
+		return errors.New("unknown proposal type")
+	}
 }
 
 type ConsensusAdapter interface {
@@ -99,6 +124,29 @@ type Governance struct {
 	mu              sync.RWMutex
 	logger          Logger
 	superValidators map[[32]byte]bool
+}
+
+func (g *Governance) updateStatus(p *Proposal, newStatus ProposalStatus) error {
+	valid := map[ProposalStatus][]ProposalStatus{
+		Pending:  {Active, Canceled},
+		Active:   {Passed, Rejected, Canceled},
+		Passed:   {Executed},
+		Rejected: {},
+		Executed: {},
+		Canceled: {},
+	}
+	allowed, ok := valid[p.Status]
+	if !ok {
+		return errors.New("invalid current status")
+	}
+	for _, st := range allowed {
+		if st == newStatus {
+			p.Status = newStatus
+			p.StatusHistory = append(p.StatusHistory, newStatus)
+			return nil
+		}
+	}
+	return fmt.Errorf("cannot transition from %s to %s", p.Status, newStatus)
 }
 
 func NewGovernance(c ConsensusAdapter, votingDuration time.Duration, logger Logger) *Governance {
@@ -136,18 +184,23 @@ func (g *Governance) CreateProposal(
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	startTime := time.Now().Add(-10 * time.Millisecond)
+	if err := validateProposalData(proposalType, data); err != nil {
+		return [32]byte{}, fmt.Errorf("invalid proposal data: %w", err)
+	}
+
+	startTime := common.ConsensusNow().Add(-10 * time.Millisecond)
 	endTime := startTime.Add(g.votingDuration)
 
 	prop := &Proposal{
-		Type:        proposalType,
-		Description: description,
-		StartTime:   startTime,
-		EndTime:     endTime,
-		Status:      Pending,
-		Votes:       make(map[[32]byte]bool),
-		Data:        data,
-		Creator:     creatorID,
+		Type:          proposalType,
+		Description:   description,
+		StartTime:     startTime,
+		EndTime:       endTime,
+		Status:        Pending,
+		StatusHistory: []ProposalStatus{Pending},
+		Votes:         make(map[[32]byte]bool),
+		Data:          data,
+		Creator:       creatorID,
 	}
 
 	// Deterministic ID generation.
@@ -191,8 +244,10 @@ func (g *Governance) CancelProposal(proposalID, cancelerID [32]byte) error {
 		}
 	}
 
-	delete(g.proposals, proposalID)
-	g.logger.Info("CancelProposal: proposal deleted", "proposalID", fmt.Sprintf("%x", proposalID))
+	if err := g.updateStatus(prop, Canceled); err != nil {
+		return err
+	}
+	g.logger.Info("CancelProposal: proposal canceled", "proposalID", fmt.Sprintf("%x", proposalID))
 	return nil
 }
 
@@ -207,7 +262,7 @@ func (g *Governance) Vote(proposalID, validatorID [32]byte, vote bool) error {
 	if prop.Status != Active {
 		return errors.New("proposal is not active")
 	}
-	if time.Now().After(prop.EndTime) {
+	if common.ConsensusNow().After(prop.EndTime) {
 		return errors.New("voting period has ended")
 	}
 	if !g.consensus.GetDPoS().IsActiveValidator(validatorID) {
@@ -233,7 +288,9 @@ func (g *Governance) ExecuteProposal(proposalID [32]byte) error {
 	if err := g.executeProposal(prop); err != nil {
 		return fmt.Errorf("failed to execute proposal: %w", err)
 	}
-	prop.Status = Executed
+	if err := g.updateStatus(prop, Executed); err != nil {
+		return err
+	}
 	g.logger.Info("Proposal executed", "proposalID", fmt.Sprintf("%x", proposalID))
 	return nil
 }
@@ -247,7 +304,7 @@ func (g *Governance) ProcessProposals() {
 		g.logger.Info("ProcessProposals: finished")
 	}()
 
-	now := time.Now()
+	now := common.ConsensusNow()
 	for _, prop := range g.proposals {
 		g.logger.Info("Processing proposal",
 			"proposalID", fmt.Sprintf("%x", prop.ID),
@@ -259,7 +316,9 @@ func (g *Governance) ProcessProposals() {
 		case Pending:
 			if now.After(prop.StartTime) {
 				g.logger.Info("Marking proposal as Active", "proposalID", fmt.Sprintf("%x", prop.ID))
-				prop.Status = Active
+				if err := g.updateStatus(prop, Active); err != nil {
+					g.logger.Error("Failed to update proposal status to Active", "error", err, "proposalID", fmt.Sprintf("%x", prop.ID))
+				}
 			}
 		case Active:
 			if now.After(prop.EndTime) {
@@ -284,10 +343,16 @@ func (g *Governance) finalizeProposal(prop *Proposal) {
 	}
 
 	if float64(yesStake) >= float64(totalStake)*majorityFraction {
-		prop.Status = Passed
+		if err := g.updateStatus(prop, Passed); err != nil {
+			g.logger.Error("Failed to update proposal status to Passed", "error", err, "proposalID", fmt.Sprintf("%x", prop.ID))
+			return
+		}
 		g.logger.Info("Proposal finalized as Passed", "proposalID", fmt.Sprintf("%x", prop.ID), "yesStake", yesStake, "totalStake", totalStake)
 	} else {
-		prop.Status = Rejected
+		if err := g.updateStatus(prop, Rejected); err != nil {
+			g.logger.Error("Failed to update proposal status to Rejected", "error", err, "proposalID", fmt.Sprintf("%x", prop.ID))
+			return
+		}
 		g.logger.Info("Proposal finalized as Rejected", "proposalID", fmt.Sprintf("%x", prop.ID), "yesStake", yesStake, "totalStake", totalStake)
 	}
 }
@@ -406,6 +471,15 @@ func (g *Governance) ChangeVotingDuration(newDuration time.Duration) error {
 	return nil
 }
 
+// GetVotingDuration returns the current voting duration used by the governance
+// module. A read lock is taken to ensure a consistent view while allowing
+// concurrent readers.
+func (g *Governance) GetVotingDuration() time.Duration {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.votingDuration
+}
+
 func (g *Governance) GetActiveProposals() []*Proposal {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -417,6 +491,32 @@ func (g *Governance) GetActiveProposals() []*Proposal {
 		}
 	}
 	return active
+}
+
+// GetAllProposals returns a slice of all proposals regardless of status.
+func (g *Governance) GetAllProposals() []*Proposal {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	all := make([]*Proposal, 0, len(g.proposals))
+	for _, prop := range g.proposals {
+		all = append(all, prop)
+	}
+	return all
+}
+
+// GetProposalsByStatus returns proposals that match the given status.
+func (g *Governance) GetProposalsByStatus(status ProposalStatus) []*Proposal {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+
+	var filtered []*Proposal
+	for _, prop := range g.proposals {
+		if prop.Status == status {
+			filtered = append(filtered, prop)
+		}
+	}
+	return filtered
 }
 
 func (g *Governance) HasVoted(proposalID, validatorID [32]byte) (bool, bool, error) {
@@ -452,9 +552,13 @@ func (g *Governance) ExecutePassedProposals() []error {
 			if err := g.executeProposal(prop); err != nil {
 				errs = append(errs, err)
 			} else {
-				prop.Status = Executed
-				g.proposals[id] = prop
-				g.logger.Info("Executed proposal", "proposalID", fmt.Sprintf("%x", id))
+				if err := g.updateStatus(prop, Executed); err != nil {
+					g.logger.Error("Failed to update proposal status to Executed", "error", err, "proposalID", fmt.Sprintf("%x", prop.ID))
+					errs = append(errs, err)
+				} else {
+					g.proposals[id] = prop
+					g.logger.Info("Executed proposal", "proposalID", fmt.Sprintf("%x", id))
+				}
 			}
 		}
 	}
@@ -506,7 +610,7 @@ func (g *Governance) CleanupOldProposals(age time.Duration) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
-	now := time.Now()
+	now := common.ConsensusNow()
 	var removed int
 
 	if age < time.Minute {
@@ -514,7 +618,7 @@ func (g *Governance) CleanupOldProposals(age time.Duration) int {
 	}
 
 	for id, prop := range g.proposals {
-		if prop.Status == Rejected || prop.Status == Executed {
+		if prop.Status == Rejected || prop.Status == Executed || prop.Status == Canceled {
 			if now.Sub(prop.EndTime) >= time.Minute {
 				delete(g.proposals, id)
 				removed++
@@ -537,7 +641,14 @@ func (g *Governance) executeParameterChange(proposal *Proposal) error {
 		g.logger.Info("Parameter change: updated epoch duration", "newEpochDuration", changeData.NewEpochDuration)
 	}
 	if changeData.NewMinStake > 0 {
-		g.logger.Info("Parameter change: newMinStake not implemented", "newMinStake", changeData.NewMinStake)
+		dpos.SetMinStake(changeData.NewMinStake)
+		g.logger.Info("Parameter change: updated minimum stake", "newMinStake", changeData.NewMinStake)
+	}
+	if changeData.NewVotingDurationSeconds > 0 {
+		newDur := time.Duration(changeData.NewVotingDurationSeconds) * time.Second
+		if err := g.ChangeVotingDuration(newDur); err != nil {
+			return err
+		}
 	}
 	return nil
 }

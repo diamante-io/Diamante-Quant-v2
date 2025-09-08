@@ -1,0 +1,8 @@
+{
+  "title": "Diamante Metrics Sample",
+  "panels": [
+    {"type": "graph", "title": "CPU Usage", "targets": [{"expr": "diamante_cpu_usage_percent"}]},
+    {"type": "graph", "title": "Memory Usage", "targets": [{"expr": "diamante_memory_usage_bytes"}]},
+    {"type": "graph", "title": "Active Validators", "targets": [{"expr": "diamante_active_validators"}]}
+  ]
+}

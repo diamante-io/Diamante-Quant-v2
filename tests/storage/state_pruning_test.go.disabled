@@ -1,0 +1,779 @@
+// storage/state_pruning_test.go
+
+package storage_test
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/storage"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+)
+
+// StateIterator interface for iterating over state entries
+type StateIterator interface {
+	Next() bool
+	Key() []byte
+	Value() []byte
+	Error() error
+	Close()
+}
+
+// MockStateDB is a mock implementation of the StateDB interface for testing
+type MockStateDB struct {
+	mock.Mock
+	data     map[string][]byte
+	dataLock sync.RWMutex
+}
+
+// NewMockStateDB creates a new mock state database
+func NewMockStateDB() *MockStateDB {
+	return &MockStateDB{
+		data: make(map[string][]byte),
+	}
+}
+
+// Get retrieves a value from the database
+func (m *MockStateDB) Get(key []byte) ([]byte, error) {
+	m.dataLock.RLock()
+	defer m.dataLock.RUnlock()
+
+	args := m.Called(key)
+	if args.Get(0) != nil {
+		return args.Get(0).([]byte), args.Error(1)
+	}
+
+	// If not mocked, use the internal data map
+	value, ok := m.data[string(key)]
+	if !ok {
+		return nil, errors.New("key not found")
+	}
+	return value, nil
+}
+
+// Put stores a key-value pair in the database
+func (m *MockStateDB) Put(key, value []byte) error {
+	m.dataLock.Lock()
+	defer m.dataLock.Unlock()
+
+	args := m.Called(key, value)
+	if args.Error(0) != nil {
+		return args.Error(0)
+	}
+
+	// If not mocked, use the internal data map
+	m.data[string(key)] = value
+	return nil
+}
+
+// Delete removes a key-value pair from the database
+func (m *MockStateDB) Delete(key []byte) error {
+	m.dataLock.Lock()
+	defer m.dataLock.Unlock()
+
+	args := m.Called(key)
+	if args.Error(0) != nil {
+		return args.Error(0)
+	}
+
+	// If not mocked, use the internal data map
+	delete(m.data, string(key))
+	return nil
+}
+
+// MockStateIterator is a mock implementation of the StateIterator interface
+type MockStateIterator struct {
+	mock.Mock
+	keys   [][]byte
+	values [][]byte
+	index  int
+	err    error
+}
+
+// NewMockStateIterator creates a new mock state iterator
+func NewMockStateIterator(keys [][]byte, values [][]byte, err error) *MockStateIterator {
+	return &MockStateIterator{
+		keys:   keys,
+		values: values,
+		index:  -1,
+		err:    err,
+	}
+}
+
+// Next advances the iterator to the next key
+func (m *MockStateIterator) Next() bool {
+	args := m.Called()
+	if args.Bool(0) {
+		return args.Bool(0)
+	}
+
+	// If not mocked, use the internal implementation
+	m.index++
+	return m.index < len(m.keys)
+}
+
+// Key returns the current key
+func (m *MockStateIterator) Key() []byte {
+	args := m.Called()
+	if args.Get(0) != nil {
+		return args.Get(0).([]byte)
+	}
+
+	// If not mocked, use the internal implementation
+	if m.index < 0 || m.index >= len(m.keys) {
+		return nil
+	}
+	return m.keys[m.index]
+}
+
+// Value returns the current value
+func (m *MockStateIterator) Value() []byte {
+	args := m.Called()
+	if args.Get(0) != nil {
+		return args.Get(0).([]byte)
+	}
+
+	// If not mocked, use the internal implementation
+	if m.index < 0 || m.index >= len(m.values) {
+		return nil
+	}
+	return m.values[m.index]
+}
+
+// Error returns any accumulated error
+func (m *MockStateIterator) Error() error {
+	args := m.Called()
+	if args.Error(0) != nil {
+		return args.Error(0)
+	}
+
+	// If not mocked, use the internal implementation
+	return m.err
+}
+
+// Close releases resources associated with the iterator
+func (m *MockStateIterator) Close() {
+	m.Called()
+}
+
+// NewIterator creates an iterator over a key range
+func (m *MockStateDB) NewIterator(start, end []byte) storage.StateIterator {
+	args := m.Called(start, end)
+	if args.Get(0) != nil {
+		return args.Get(0).(StateIterator)
+	}
+
+	// If not mocked, create a simple iterator from the data map
+	var keys [][]byte
+	var values [][]byte
+
+	m.dataLock.RLock()
+	defer m.dataLock.RUnlock()
+
+	for k, v := range m.data {
+		keyBytes := []byte(k)
+		if bytes.Compare(keyBytes, start) >= 0 && (end == nil || bytes.Compare(keyBytes, end) < 0) {
+			keys = append(keys, keyBytes)
+			values = append(values, v)
+		}
+	}
+
+	return NewMockStateIterator(keys, values, nil)
+}
+
+// Compact runs database compaction on a key range
+func (m *MockStateDB) Compact(start, end []byte) error {
+	args := m.Called(start, end)
+	return args.Error(0)
+}
+
+// GetStats returns database statistics
+func (m *MockStateDB) GetStats() *storage.StorageStats {
+	args := m.Called()
+	if args.Get(0) != nil {
+		return args.Get(0).(*storage.StorageStats)
+	}
+
+	// If not mocked, return some basic stats
+	m.dataLock.RLock()
+	defer m.dataLock.RUnlock()
+
+	return &storage.StorageStats{
+		ConnectionsActive:     1,
+		ConnectionsTotal:      1,
+		QueriesExecuted:       int64(len(m.data)),
+		TransactionsProcessed: 0,
+		CacheHitRate:          0.0,
+		AverageQueryTime:      0.0,
+		ErrorCount:            0,
+		LastError:             "",
+		UptimeSeconds:         0,
+		MemoryUsageMB:         0.0,
+	}
+}
+
+// Helper function to create a test logger
+func createTestLogger() *logrus.Logger {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+	return logger
+}
+
+// TestStatePruningManager_Creation tests the creation of a state pruning manager
+func TestStatePruningManager_Creation(t *testing.T) {
+	db := NewMockStateDB()
+	config := storage.DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+	// Cannot test unexported fields - just verify it was created
+}
+
+// TestStatePruningManager_StartStop tests starting and stopping the pruning manager
+func TestStatePruningManager_StartStop(t *testing.T) {
+	db := NewMockStateDB()
+	config := storage.DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+
+	// Test starting
+	err := pm.Start()
+	assert.NoError(t, err, "Start should not return an error")
+	assert.True(t, pm.running, "Running state should be true after start")
+
+	// Test starting again (should fail)
+	err = pm.Start()
+	assert.Error(t, err, "Starting an already running manager should return an error")
+
+	// Test stopping
+	err = pm.Stop()
+	assert.NoError(t, err, "Stop should not return an error")
+	assert.False(t, pm.running, "Running state should be false after stop")
+
+	// Test stopping again (should fail)
+	err = pm.Stop()
+	assert.Error(t, err, "Stopping an already stopped manager should return an error")
+}
+
+// TestStatePruningManager_UpdateBlockHeight tests updating the block height
+func TestStatePruningManager_UpdateBlockHeight(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+
+	// Update block height
+	pm.UpdateBlockHeight(100)
+	assert.Equal(t, uint64(100), pm.currentBlockHeight, "Block height should be updated")
+
+	// Update to checkpoint height
+	pm.UpdateBlockHeight(config.CheckpointInterval)
+	assert.Equal(t, config.CheckpointInterval, pm.currentBlockHeight, "Block height should be updated")
+	assert.Equal(t, config.CheckpointInterval, pm.lastCheckpoint, "Last checkpoint should be updated")
+
+	// Update to trigger pruning
+	pm.Start()
+	pm.UpdateBlockHeight(config.BlocksToKeep + config.PruningInterval)
+	// Wait a bit for the pruning to be triggered
+	time.Sleep(100 * time.Millisecond)
+	pm.Stop()
+}
+
+// TestStatePruningManager_GetMetrics tests getting metrics
+func TestStatePruningManager_GetMetrics(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+
+	// Get initial metrics
+	metrics := pm.GetMetrics()
+	assert.Equal(t, uint64(0), metrics.TotalPruningRuns, "Initial total pruning runs should be 0")
+	assert.Equal(t, uint64(0), metrics.TotalEntriesPruned, "Initial total entries pruned should be 0")
+	assert.Equal(t, uint64(0), metrics.TotalBytesReclaimed, "Initial total bytes reclaimed should be 0")
+	assert.Equal(t, uint64(0), metrics.PruningErrors, "Initial pruning errors should be 0")
+
+	// Update metrics
+	pm.mu.Lock()
+	pm.metrics.TotalPruningRuns = 1
+	pm.metrics.TotalEntriesPruned = 100
+	pm.metrics.TotalBytesReclaimed = 1024
+	pm.metrics.PruningErrors = 2
+	pm.mu.Unlock()
+
+	// Get updated metrics
+	metrics = pm.GetMetrics()
+	assert.Equal(t, uint64(1), metrics.TotalPruningRuns, "Updated total pruning runs should be 1")
+	assert.Equal(t, uint64(100), metrics.TotalEntriesPruned, "Updated total entries pruned should be 100")
+	assert.Equal(t, uint64(1024), metrics.TotalBytesReclaimed, "Updated total bytes reclaimed should be 1024")
+	assert.Equal(t, uint64(2), metrics.PruningErrors, "Updated pruning errors should be 2")
+}
+
+// TestStatePruningManager_GetConfig tests getting the configuration
+func TestStatePruningManager_GetConfig(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+
+	// Get the config
+	retrievedConfig := pm.GetConfig()
+	assert.Equal(t, config.Policy, retrievedConfig.Policy, "Policy should match")
+	assert.Equal(t, config.BlocksToKeep, retrievedConfig.BlocksToKeep, "BlocksToKeep should match")
+	assert.Equal(t, config.CheckpointInterval, retrievedConfig.CheckpointInterval, "CheckpointInterval should match")
+	assert.Equal(t, config.PruningInterval, retrievedConfig.PruningInterval, "PruningInterval should match")
+	assert.Equal(t, config.MaxPruningBatchSize, retrievedConfig.MaxPruningBatchSize, "MaxPruningBatchSize should match")
+	assert.Equal(t, config.EnableCompaction, retrievedConfig.EnableCompaction, "EnableCompaction should match")
+	assert.Equal(t, config.CompactionThreshold, retrievedConfig.CompactionThreshold, "CompactionThreshold should match")
+
+	// Check that the retention policy was deep copied
+	assert.Equal(t, len(config.RetentionPolicy), len(retrievedConfig.RetentionPolicy), "RetentionPolicy length should match")
+	for k, v := range config.RetentionPolicy {
+		assert.Equal(t, v, retrievedConfig.RetentionPolicy[k], "RetentionPolicy values should match")
+	}
+
+	// Modify the retrieved config and check that the original is unchanged
+	retrievedConfig.BlocksToKeep = 999
+	assert.NotEqual(t, config.BlocksToKeep, retrievedConfig.BlocksToKeep, "Original config should not be affected by changes to the retrieved config")
+}
+
+// TestStatePruningManager_UpdateConfig tests updating the configuration
+func TestStatePruningManager_UpdateConfig(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+
+	// Create a new config
+	newConfig := &PruningConfig{
+		Policy:              FullPruning,
+		BlocksToKeep:        5000,
+		CheckpointInterval:  500,
+		PruningInterval:     50,
+		MaxPruningBatchSize: 500,
+		EnableCompaction:    false,
+		CompactionThreshold: 5000,
+		RetentionPolicy: map[string]uint64{
+			"accounts":     25000,
+			"transactions": 50000,
+		},
+	}
+
+	// Update the config
+	err := pm.UpdateConfig(newConfig)
+	assert.NoError(t, err, "UpdateConfig should not return an error")
+
+	// Get the updated config
+	retrievedConfig := pm.GetConfig()
+	assert.Equal(t, newConfig.Policy, retrievedConfig.Policy, "Policy should match")
+	assert.Equal(t, newConfig.BlocksToKeep, retrievedConfig.BlocksToKeep, "BlocksToKeep should match")
+	assert.Equal(t, newConfig.CheckpointInterval, retrievedConfig.CheckpointInterval, "CheckpointInterval should match")
+	assert.Equal(t, newConfig.PruningInterval, retrievedConfig.PruningInterval, "PruningInterval should match")
+	assert.Equal(t, newConfig.MaxPruningBatchSize, retrievedConfig.MaxPruningBatchSize, "MaxPruningBatchSize should match")
+	assert.Equal(t, newConfig.EnableCompaction, retrievedConfig.EnableCompaction, "EnableCompaction should match")
+	assert.Equal(t, newConfig.CompactionThreshold, retrievedConfig.CompactionThreshold, "CompactionThreshold should match")
+
+	// Check that the retention policy was updated
+	assert.Equal(t, len(newConfig.RetentionPolicy), len(retrievedConfig.RetentionPolicy), "RetentionPolicy length should match")
+	for k, v := range newConfig.RetentionPolicy {
+		assert.Equal(t, v, retrievedConfig.RetentionPolicy[k], "RetentionPolicy values should match")
+	}
+
+	// Test invalid config (nil)
+	err = pm.UpdateConfig(nil)
+	assert.Error(t, err, "UpdateConfig with nil config should return an error")
+
+	// Test invalid config (BlocksToKeep < CheckpointInterval)
+	invalidConfig := &PruningConfig{
+		BlocksToKeep:       100,
+		CheckpointInterval: 200,
+	}
+	err = pm.UpdateConfig(invalidConfig)
+	assert.Error(t, err, "UpdateConfig with invalid config should return an error")
+}
+
+// TestStatePruningImpl_Creation tests the creation of a state pruning implementation
+func TestStatePruningImpl_Creation(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	assert.NotNil(t, pm, "StatePruningManager should not be nil")
+
+	impl := storage.NewStatePruningImpl(pm, logger)
+	assert.NotNil(t, impl, "StatePruningImpl should not be nil")
+	assert.Equal(t, pm, impl.manager, "Manager should match")
+	assert.Equal(t, logger, impl.logger, "Logger should match")
+}
+
+// TestStatePruningImpl_GetStateTypePrefix tests getting state type prefixes
+func TestStatePruningImpl_GetStateTypePrefix(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Test valid state types
+	assert.Equal(t, AccountPrefix, impl.getStateTypePrefix(StateTypeAccount), "Account prefix should match")
+	assert.Equal(t, TransactionPrefix, impl.getStateTypePrefix(StateTypeTransaction), "Transaction prefix should match")
+	assert.Equal(t, BlockPrefix, impl.getStateTypePrefix(StateTypeBlock), "Block prefix should match")
+	assert.Equal(t, ContractPrefix, impl.getStateTypePrefix(StateTypeContract), "Contract prefix should match")
+	assert.Equal(t, ContractStoragePrefix, impl.getStateTypePrefix(StateTypeContractStorage), "Contract storage prefix should match")
+
+	// Test invalid state type
+	assert.Nil(t, impl.getStateTypePrefix("invalid"), "Invalid state type should return nil")
+}
+
+// TestStatePruningImpl_CreateHeightKey tests creating height keys
+func TestStatePruningImpl_CreateHeightKey(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Test creating a height key
+	prefix := []byte("test:")
+	height := uint64(12345)
+	key := impl.createHeightKey(prefix, height)
+
+	// Check that the key has the correct prefix
+	assert.True(t, bytes.HasPrefix(key, prefix), "Key should have the correct prefix")
+
+	// Check that the key has the correct length
+	assert.Equal(t, len(prefix)+8, len(key), "Key should have the correct length")
+
+	// Extract the height from the key
+	extractedHeight, err := impl.extractHeightFromKey(key, prefix)
+	assert.NoError(t, err, "Extracting height should not return an error")
+	assert.Equal(t, height, extractedHeight, "Extracted height should match")
+}
+
+// TestStatePruningImpl_ExtractHeightFromKey tests extracting heights from keys
+func TestStatePruningImpl_ExtractHeightFromKey(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Test extracting height from a valid key
+	prefix := []byte("test:")
+	height := uint64(12345)
+	key := impl.createHeightKey(prefix, height)
+
+	extractedHeight, err := impl.extractHeightFromKey(key, prefix)
+	assert.NoError(t, err, "Extracting height should not return an error")
+	assert.Equal(t, height, extractedHeight, "Extracted height should match")
+
+	// Test extracting height from a key with the wrong prefix
+	wrongPrefix := []byte("wrong:")
+	_, err = impl.extractHeightFromKey(key, wrongPrefix)
+	assert.Error(t, err, "Extracting height with wrong prefix should return an error")
+
+	// Test extracting height from a key that's too short
+	shortKey := []byte("test:123")
+	_, err = impl.extractHeightFromKey(shortKey, prefix)
+	assert.Error(t, err, "Extracting height from a short key should return an error")
+}
+
+// TestStatePruningImpl_IsCheckpointHeight tests checking if a height is a checkpoint height
+func TestStatePruningImpl_IsCheckpointHeight(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	config.CheckpointInterval = 100
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Test checkpoint heights
+	assert.True(t, impl.isCheckpointHeight(100), "Height 100 should be a checkpoint height")
+	assert.True(t, impl.isCheckpointHeight(200), "Height 200 should be a checkpoint height")
+	assert.True(t, impl.isCheckpointHeight(300), "Height 300 should be a checkpoint height")
+
+	// Test non-checkpoint heights
+	assert.False(t, impl.isCheckpointHeight(50), "Height 50 should not be a checkpoint height")
+	assert.False(t, impl.isCheckpointHeight(150), "Height 150 should not be a checkpoint height")
+	assert.False(t, impl.isCheckpointHeight(250), "Height 250 should not be a checkpoint height")
+
+	// Test with checkpoint interval of 0
+	config.CheckpointInterval = 0
+	assert.False(t, impl.isCheckpointHeight(100), "With interval 0, no height should be a checkpoint height")
+}
+
+// TestStatePruningImpl_PruneStateType tests pruning a specific state type
+func TestStatePruningImpl_PruneStateType(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	config.CheckpointInterval = 100
+	config.MaxPruningBatchSize = 10
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Create some test data
+	stateType := StateTypeAccount
+	prefix := impl.getStateTypePrefix(stateType)
+
+	// Add some keys to the database directly
+	for i := uint64(1); i <= 200; i++ {
+		key := impl.createHeightKey(prefix, i)
+		value := []byte(fmt.Sprintf("value-%d", i))
+		db.data[string(key)] = value
+	}
+
+	// Start the pruning manager
+	pm.Start()
+	defer pm.Stop()
+
+	// Prune up to height 150
+	pruned, bytes, err := impl.pruneStateType(stateType, 150)
+	assert.NoError(t, err, "Pruning should not return an error")
+
+	// We should have pruned all non-checkpoint heights up to 150
+	// That's 150 - (100/100) = 149 entries
+	expectedPruned := 149
+	assert.Equal(t, expectedPruned, pruned, "Should have pruned the expected number of entries")
+	assert.Greater(t, bytes, uint64(0), "Should have reclaimed some bytes")
+
+	// Verify that the checkpoint height was not pruned
+	checkpointKey := impl.createHeightKey(prefix, 100)
+	_, err = db.Get(checkpointKey)
+	assert.NoError(t, err, "Checkpoint key should still exist")
+
+	// Verify that heights above the target were not pruned
+	highKey := impl.createHeightKey(prefix, 175)
+	_, err = db.Get(highKey)
+	assert.NoError(t, err, "Key above target height should still exist")
+
+	// Verify that non-checkpoint heights below the target were pruned
+	for i := uint64(1); i < 150; i++ {
+		if i == 100 {
+			continue // Skip checkpoint
+		}
+		key := impl.createHeightKey(prefix, i)
+		_, err = db.Get(key)
+		assert.Error(t, err, "Key below target height should be pruned")
+	}
+}
+
+// TestStatePruningImpl_PruneState tests pruning all state types
+func TestStatePruningImpl_PruneState(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	config.CheckpointInterval = 100
+	config.MaxPruningBatchSize = 10
+	config.RetentionPolicy = map[string]uint64{
+		"account":     50,
+		"transaction": 100,
+	}
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Create some test data for different state types
+	stateTypes := []StateType{StateTypeAccount, StateTypeTransaction}
+
+	for _, stateType := range stateTypes {
+		prefix := impl.getStateTypePrefix(stateType)
+
+		// Add some keys to the database directly
+		for i := uint64(1); i <= 200; i++ {
+			key := impl.createHeightKey(prefix, i)
+			value := []byte(fmt.Sprintf("value-%s-%d", stateType, i))
+			db.data[string(key)] = value
+		}
+	}
+
+	// Set the current block height
+	pm.currentBlockHeight = 200
+
+	// Start the pruning manager
+	pm.Start()
+	defer pm.Stop()
+
+	// Prune all state types up to height 150
+	err := impl.PruneState(150)
+	assert.NoError(t, err, "Pruning should not return an error")
+
+	// Verify that the retention policy was applied correctly
+	// For accounts, we should keep up to height 150
+	// For transactions, we should keep up to height 100
+
+	// Check accounts
+	accountPrefix := impl.getStateTypePrefix(StateTypeAccount)
+	for i := uint64(1); i <= 200; i++ {
+		key := impl.createHeightKey(accountPrefix, i)
+		_, err = db.Get(key)
+
+		if i == 100 || i > 150 {
+			// Checkpoint or above target height
+			assert.NoError(t, err, "Account key at checkpoint or above target should exist")
+		} else {
+			// Below target height and not a checkpoint
+			assert.Error(t, err, "Account key below target should be pruned")
+		}
+	}
+
+	// Check transactions
+	txPrefix := impl.getStateTypePrefix(StateTypeTransaction)
+	for i := uint64(1); i <= 200; i++ {
+		key := impl.createHeightKey(txPrefix, i)
+		_, err = db.Get(key)
+
+		if i == 100 || i > 150 {
+			// Checkpoint or above target height
+			assert.NoError(t, err, "Transaction key at checkpoint or above target should exist")
+		} else {
+			// Below target height and not a checkpoint
+			assert.Error(t, err, "Transaction key below target should be pruned")
+		}
+	}
+}
+
+// TestStatePruningImpl_VerifyPruning tests verifying pruning
+func TestStatePruningImpl_VerifyPruning(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Create some test data
+	stateType := StateTypeAccount
+	prefix := impl.getStateTypePrefix(stateType)
+
+	// Add some keys to the database directly
+	for i := uint64(151); i <= 200; i++ {
+		key := impl.createHeightKey(prefix, i)
+		value := []byte(fmt.Sprintf("value-%d", i))
+		db.data[string(key)] = value
+	}
+
+	// Verify pruning up to height 150
+	success, err := impl.VerifyPruning(stateType, 150)
+	assert.NoError(t, err, "Verification should not return an error")
+	assert.True(t, success, "Verification should succeed")
+
+	// Add a key below the pruned height
+	lowKey := impl.createHeightKey(prefix, 100)
+	db.data[string(lowKey)] = []byte("value-100")
+
+	// Verify pruning again
+	success, err = impl.VerifyPruning(stateType, 150)
+	assert.NoError(t, err, "Verification should not return an error")
+	assert.False(t, success, "Verification should fail")
+}
+
+// TestStatePruningImpl_GetStateTypeStats tests getting state type statistics
+func TestStatePruningImpl_GetStateTypeStats(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Create some test data
+	stateType := StateTypeAccount
+	prefix := impl.getStateTypePrefix(stateType)
+
+	// Add some keys to the database directly
+	for i := uint64(100); i <= 200; i++ {
+		key := impl.createHeightKey(prefix, i)
+		value := []byte(fmt.Sprintf("value-%d", i))
+		db.data[string(key)] = value
+	}
+
+	// Get statistics
+	stats, err := impl.GetStateTypeStats(stateType)
+	assert.NoError(t, err, "Getting stats should not return an error")
+	assert.NotNil(t, stats, "Stats should not be nil")
+
+	// Check statistics
+	assert.Equal(t, 101, stats["count"], "Count should match")
+	assert.Equal(t, uint64(100), stats["minHeight"], "Min height should match")
+	assert.Equal(t, uint64(200), stats["maxHeight"], "Max height should match")
+	assert.Greater(t, stats["totalSize"].(uint64), uint64(0), "Total size should be greater than 0")
+	assert.Greater(t, stats["avgSize"].(float64), float64(0), "Average size should be greater than 0")
+}
+
+// TestStatePruningManager_PruneStateToHeight verifies that the manager removes
+// old data when pruneStateToHeight is called.
+func TestStatePruningManager_PruneStateToHeight(t *testing.T) {
+	db := NewMockStateDB()
+	config := DefaultPruningConfig()
+	config.CheckpointInterval = 100
+	config.MaxPruningBatchSize = 10
+	config.RetentionPolicy = map[string]uint64{
+		"account":     50,
+		"transaction": 100,
+	}
+	logger := createTestLogger()
+
+	pm := storage.NewStatePruningManager(db, config, logger)
+	impl := storage.NewStatePruningImpl(pm, logger)
+
+	// Populate database with account and transaction entries directly
+	for i := uint64(1); i <= 200; i++ {
+		accKey := impl.createHeightKey(AccountPrefix, i)
+		txKey := impl.createHeightKey(TransactionPrefix, i)
+		db.data[string(accKey)] = []byte(fmt.Sprintf("acc-%d", i))
+		db.data[string(txKey)] = []byte(fmt.Sprintf("tx-%d", i))
+	}
+
+	pm.currentBlockHeight = 200
+
+	err := pm.pruneStateToHeight(150)
+	assert.NoError(t, err, "Pruning should not return an error")
+
+	// Verify account entries
+	for i := uint64(1); i <= 200; i++ {
+		key := impl.createHeightKey(AccountPrefix, i)
+		_, err := db.Get(key)
+
+		if i == 100 || i > 150 {
+			assert.NoError(t, err, "Account key at checkpoint or above target should exist")
+		} else {
+			assert.Error(t, err, "Account key below target should be pruned")
+		}
+	}
+
+	// Verify transaction entries
+	for i := uint64(1); i <= 200; i++ {
+		key := impl.createHeightKey(TransactionPrefix, i)
+		_, err := db.Get(key)
+
+		if i >= 100 {
+			assert.NoError(t, err, "Transaction key at or above retention height should exist")
+		} else {
+			assert.Error(t, err, "Transaction key below retention should be pruned")
+		}
+	}
+}

@@ -1,0 +1,419 @@
+package consensus_test
+
+import (
+	"context"
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPerformanceOptimizer(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.PerformanceOptimizerConfig{
+			OptimizationInterval: time.Second,
+			MetricsWindow:        100,
+			TargetTPS:            10000,
+			MinBatchSize:         10,
+			MaxBatchSize:         1000,
+			EnableAutoTuning:     true,
+		}
+
+		po := consensus.NewPerformanceOptimizer(config, logger)
+		require.NotNil(t, po)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = po.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("Record Metrics", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Record various metrics
+		po.RecordTPS(5000)
+		po.RecordLatency(50 * time.Millisecond)
+		po.RecordBatchSize(100)
+		po.RecordCPUUsage(0.65)
+		po.RecordMemoryUsage(0.45)
+		po.RecordNetworkBandwidth(1000000) // 1MB/s
+
+		// Get current stats
+		stats := po.GetStats()
+		assert.NotNil(t, stats)
+		assert.Greater(t, stats.MetricsRecorded, uint64(0))
+		assert.Greater(t, stats.CurrentTPS, float64(0))
+	})
+
+	t.Run("Auto Tuning", func(t *testing.T) {
+		config := &consensus.PerformanceOptimizerConfig{
+			OptimizationInterval: 100 * time.Millisecond,
+			MetricsWindow:        10,
+			TargetTPS:            1000,
+			MinBatchSize:         10,
+			MaxBatchSize:         500,
+			EnableAutoTuning:     true,
+		}
+
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Record metrics below target
+		for i := 0; i < 20; i++ {
+			po.RecordTPS(500) // Half of target
+			po.RecordLatency(100 * time.Millisecond)
+			po.RecordCPUUsage(0.3) // Low CPU usage
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		// Wait for optimization
+		time.Sleep(200 * time.Millisecond)
+
+		stats := po.GetStats()
+		assert.Greater(t, stats.OptimizationsApplied, uint64(0))
+	})
+
+	t.Run("Get Recommendations", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Record varied metrics
+		for i := 0; i < 50; i++ {
+			po.RecordTPS(float64(8000 + i*100))
+			po.RecordLatency(time.Duration(30+i) * time.Millisecond)
+			po.RecordCPUUsage(0.5 + float64(i%20)*0.01)
+			po.RecordMemoryUsage(0.4 + float64(i%10)*0.02)
+		}
+
+		recommendations := po.GetRecommendations()
+		assert.NotNil(t, recommendations)
+		
+		// Verify recommendation structure
+		for _, rec := range recommendations {
+			assert.NotEmpty(t, rec.Type)
+			assert.NotEmpty(t, rec.Description)
+			assert.NotEmpty(t, rec.Impact)
+			assert.True(t, rec.Priority >= 1 && rec.Priority <= 5)
+		}
+	})
+
+	t.Run("Apply Settings", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Apply new settings
+		settings := &consensus.PerformanceSettings{
+			BatchSize:         200,
+			WorkerCount:       8,
+			BufferSize:        10000,
+			CacheSize:         1000000,
+			NetworkBufferSize: 65536,
+			GCFrequency:       5 * time.Minute,
+		}
+
+		err = po.ApplySettings(settings)
+		assert.NoError(t, err)
+
+		// Get current settings
+		current := po.GetCurrentSettings()
+		assert.Equal(t, settings.BatchSize, current.BatchSize)
+		assert.Equal(t, settings.WorkerCount, current.WorkerCount)
+		assert.Equal(t, settings.BufferSize, current.BufferSize)
+	})
+
+	t.Run("Bottleneck Detection", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Simulate CPU bottleneck
+		for i := 0; i < 20; i++ {
+			po.RecordCPUUsage(0.95) // High CPU
+			po.RecordMemoryUsage(0.3) // Low memory
+			po.RecordNetworkBandwidth(100000) // Low network
+			po.RecordTPS(1000) // Low TPS due to CPU
+		}
+
+		bottlenecks := po.DetectBottlenecks()
+		assert.NotEmpty(t, bottlenecks)
+		
+		// Should detect CPU bottleneck
+		found := false
+		for _, b := range bottlenecks {
+			if b.Type == consensus.BottleneckCPU {
+				found = true
+				assert.Greater(t, b.Severity, float64(0.8))
+				break
+			}
+		}
+		assert.True(t, found, "Should detect CPU bottleneck")
+	})
+
+	t.Run("Performance Profile", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Set performance profile
+		err = po.SetProfile(consensus.ProfileHighThroughput)
+		assert.NoError(t, err)
+
+		profile := po.GetProfile()
+		assert.Equal(t, consensus.ProfileHighThroughput, profile)
+
+		// Try different profiles
+		profiles := []consensus.PerformanceProfile{
+			consensus.ProfileBalanced,
+			consensus.ProfileLowLatency,
+			consensus.ProfilePowerSaving,
+		}
+
+		for _, p := range profiles {
+			err = po.SetProfile(p)
+			assert.NoError(t, err)
+			assert.Equal(t, p, po.GetProfile())
+		}
+	})
+
+	t.Run("Concurrent Metrics", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Record metrics concurrently
+		var wg sync.WaitGroup
+		workers := 10
+		metricsPerWorker := 100
+
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				for i := 0; i < metricsPerWorker; i++ {
+					po.RecordTPS(float64(1000 + workerID*100))
+					po.RecordLatency(time.Duration(10+workerID) * time.Millisecond)
+					po.RecordCPUUsage(0.5)
+				}
+			}(w)
+		}
+
+		wg.Wait()
+
+		stats := po.GetStats()
+		assert.Equal(t, uint64(workers*metricsPerWorker*3), stats.MetricsRecorded)
+	})
+
+	t.Run("Reset Stats", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Record some metrics
+		po.RecordTPS(5000)
+		po.RecordLatency(50 * time.Millisecond)
+
+		stats := po.GetStats()
+		assert.Greater(t, stats.MetricsRecorded, uint64(0))
+
+		// Reset
+		po.ResetStats()
+
+		stats = po.GetStats()
+		assert.Equal(t, uint64(0), stats.MetricsRecorded)
+		assert.Equal(t, float64(0), stats.CurrentTPS)
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultPerformanceOptimizerConfig()
+		po := consensus.NewPerformanceOptimizer(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := po.Start(ctx)
+		require.NoError(t, err)
+
+		// Stop
+		err = po.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = po.Stop()
+		assert.Error(t, err)
+	})
+}
+
+func TestOptimizationStats(t *testing.T) {
+	t.Run("Stats Structure", func(t *testing.T) {
+		stats := &types.OptimizationStats{
+			MetricsRecorded:      1000,
+			OptimizationsApplied: 10,
+			LastOptimization:     time.Now(),
+			CurrentTPS:           8500,
+			TargetTPS:            10000,
+			AverageLatency:       45 * time.Millisecond,
+			CPUUsage:             0.65,
+			MemoryUsage:          0.48,
+			NetworkBandwidth:     2000000, // 2MB/s
+			CurrentBatchSize:     150,
+			CurrentWorkerCount:   8,
+		}
+
+		assert.Equal(t, uint64(1000), stats.MetricsRecorded)
+		assert.Equal(t, uint64(10), stats.OptimizationsApplied)
+		assert.Equal(t, float64(8500), stats.CurrentTPS)
+		assert.Equal(t, float64(10000), stats.TargetTPS)
+		assert.Equal(t, 45*time.Millisecond, stats.AverageLatency)
+		assert.Equal(t, 0.65, stats.CPUUsage)
+		assert.Equal(t, 150, stats.CurrentBatchSize)
+	})
+}
+
+func TestPerformanceRecommendation(t *testing.T) {
+	t.Run("Recommendation Fields", func(t *testing.T) {
+		rec := &consensus.PerformanceRecommendation{
+			Type:        "batch_size",
+			Description: "Increase batch size to improve throughput",
+			Current:     "100",
+			Recommended: "200",
+			Impact:      "Expected 20% throughput improvement",
+			Priority:    3,
+		}
+
+		assert.Equal(t, "batch_size", rec.Type)
+		assert.NotEmpty(t, rec.Description)
+		assert.Equal(t, "100", rec.Current)
+		assert.Equal(t, "200", rec.Recommended)
+		assert.NotEmpty(t, rec.Impact)
+		assert.Equal(t, 3, rec.Priority)
+	})
+}
+
+func TestBottleneck(t *testing.T) {
+	t.Run("Bottleneck Detection", func(t *testing.T) {
+		bottleneck := &consensus.Bottleneck{
+			Type:        consensus.BottleneckCPU,
+			Severity:    0.85,
+			Description: "CPU usage consistently above 85%",
+			Impact:      "Limiting transaction processing speed",
+			Solution:    "Consider increasing worker count or optimizing algorithms",
+		}
+
+		assert.Equal(t, consensus.BottleneckCPU, bottleneck.Type)
+		assert.Equal(t, 0.85, bottleneck.Severity)
+		assert.NotEmpty(t, bottleneck.Description)
+		assert.NotEmpty(t, bottleneck.Impact)
+		assert.NotEmpty(t, bottleneck.Solution)
+	})
+}
+
+func BenchmarkPerformanceOptimizer(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := consensus.DefaultPerformanceOptimizerConfig()
+	po := consensus.NewPerformanceOptimizer(config, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	po.Start(ctx)
+
+	b.Run("RecordTPS", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			po.RecordTPS(float64(i % 10000))
+		}
+	})
+
+	b.Run("RecordLatency", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			po.RecordLatency(time.Duration(i%100) * time.Millisecond)
+		}
+	})
+
+	b.Run("GetStats", func(b *testing.B) {
+		// Pre-populate with metrics
+		for i := 0; i < 1000; i++ {
+			po.RecordTPS(float64(i))
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			po.GetStats()
+		}
+	})
+
+	b.Run("DetectBottlenecks", func(b *testing.B) {
+		// Pre-populate with metrics
+		for i := 0; i < 100; i++ {
+			po.RecordCPUUsage(0.8)
+			po.RecordMemoryUsage(0.5)
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			po.DetectBottlenecks()
+		}
+	})
+}

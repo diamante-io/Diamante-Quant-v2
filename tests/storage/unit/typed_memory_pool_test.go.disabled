@@ -1,0 +1,330 @@
+package storage_test
+
+import (
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"diamante/common"
+	"diamante/storage/optimization"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestBlock implements PoolableObject for testing
+type TestBlock struct {
+	common.Block
+	resetCount int
+	validated  bool
+}
+
+func (tb *TestBlock) Reset() {
+	tb.resetCount++
+	tb.Hash = ""
+	tb.Transactions = nil
+	tb.validated = true
+}
+
+func (tb *TestBlock) Validate() bool {
+	return tb.validated
+}
+
+func (tb *TestBlock) GetSize() uint64 {
+	// Approximate size calculation
+	size := uint64(100) // Base size
+	size += uint64(len(tb.Transactions) * 200) // Approx per transaction
+	return size
+}
+
+func TestTypedMemoryPool(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Basic Get and Put", func(t *testing.T) {
+		config := &types.MemoryPoolConfig{
+			MaxSize:      1024 * 1024, // 1MB
+			BlockSize:    1024,        // 1KB
+			GrowthFactor: 1.5,
+			EnableStats:  true,
+		}
+
+		pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+			return &TestBlock{validated: true}
+		}, logger)
+
+		// Get object from pool
+		obj, err := pool.Get()
+		require.NoError(t, err)
+		assert.NotNil(t, obj)
+		assert.True(t, obj.validated)
+
+		// Modify object
+		obj.Hash = "test-hash"
+
+		// Return to pool
+		err = pool.Put(obj)
+		require.NoError(t, err)
+
+		// Get again - should be reset
+		obj2, err := pool.Get()
+		require.NoError(t, err)
+		assert.Equal(t, "", obj2.Hash)
+		assert.Equal(t, 1, obj2.resetCount)
+	})
+
+	t.Run("Pool Growth", func(t *testing.T) {
+		config := &types.MemoryPoolConfig{
+			MaxSize:      1024 * 100, // 100KB
+			BlockSize:    1024,       // 1KB
+			GrowthFactor: 2.0,
+			EnableStats:  true,
+		}
+
+		pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+			return &TestBlock{validated: true}
+		}, logger)
+
+		// Get many objects to trigger growth
+		objects := make([]*TestBlock, 0, 50)
+		for i := 0; i < 50; i++ {
+			obj, err := pool.Get()
+			require.NoError(t, err)
+			objects = append(objects, obj)
+		}
+
+		// Return all objects
+		for _, obj := range objects {
+			err := pool.Put(obj)
+			require.NoError(t, err)
+		}
+
+		// Check stats
+		stats := pool.GetStats()
+		assert.Equal(t, uint64(50), stats.Allocations)
+		assert.Equal(t, uint64(50), stats.Deallocations)
+	})
+
+	t.Run("Invalid Object Handling", func(t *testing.T) {
+		config := &types.MemoryPoolConfig{
+			MaxSize:     1024 * 10,
+			BlockSize:   1024,
+			EnableStats: true,
+		}
+
+		pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+			return &TestBlock{validated: true}
+		}, logger)
+
+		// Get object
+		obj, err := pool.Get()
+		require.NoError(t, err)
+
+		// Invalidate object
+		obj.validated = false
+
+		// Put back - should fail validation
+		err = pool.Put(obj)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "validation failed")
+	})
+
+	t.Run("Concurrent Access", func(t *testing.T) {
+		config := &types.MemoryPoolConfig{
+			MaxSize:      1024 * 1024, // 1MB
+			BlockSize:    1024,        // 1KB
+			EnableStats:  true,
+		}
+
+		pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+			return &TestBlock{validated: true}
+		}, logger)
+
+		var wg sync.WaitGroup
+		workers := 10
+		operations := 100
+
+		// Track operations
+		var gets atomic.Int64
+		var puts atomic.Int64
+		var errors atomic.Int64
+
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+
+				for j := 0; j < operations; j++ {
+					// Get
+					obj, err := pool.Get()
+					if err != nil {
+						errors.Add(1)
+						continue
+					}
+					gets.Add(1)
+
+					// Simulate work
+					obj.Hash = "concurrent-test"
+					time.Sleep(time.Microsecond)
+
+					// Put
+					if err := pool.Put(obj); err != nil {
+						errors.Add(1)
+					} else {
+						puts.Add(1)
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		// Verify operations
+		assert.Equal(t, int64(0), errors.Load())
+		assert.Equal(t, gets.Load(), puts.Load())
+		assert.Equal(t, int64(workers*operations), gets.Load())
+	})
+
+	t.Run("Memory Limit", func(t *testing.T) {
+		config := &types.MemoryPoolConfig{
+			MaxSize:      1024 * 10, // 10KB limit
+			BlockSize:    1024 * 2,  // 2KB per block
+			EnableStats:  true,
+		}
+
+		pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+			return &TestBlock{validated: true}
+		}, logger)
+
+		// Try to allocate more than limit
+		objects := make([]*TestBlock, 0)
+		errorCount := 0
+
+		for i := 0; i < 10; i++ {
+			obj, err := pool.Get()
+			if err != nil {
+				errorCount++
+			} else {
+				objects = append(objects, obj)
+			}
+		}
+
+		// Should have some allocation failures
+		assert.Greater(t, errorCount, 0)
+		assert.Less(t, len(objects), 10)
+
+		// Return objects
+		for _, obj := range objects {
+			pool.Put(obj)
+		}
+	})
+
+	t.Run("Compaction", func(t *testing.T) {
+		config := &types.MemoryPoolConfig{
+			MaxSize:         1024 * 100,
+			BlockSize:       1024,
+			CompactionRatio: 0.5,
+			EnableStats:     true,
+		}
+
+		pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+			return &TestBlock{validated: true}
+		}, logger)
+
+		// Allocate many objects
+		objects := make([]*TestBlock, 0, 20)
+		for i := 0; i < 20; i++ {
+			obj, _ := pool.Get()
+			objects = append(objects, obj)
+		}
+
+		// Return all
+		for _, obj := range objects {
+			pool.Put(obj)
+		}
+
+		// Trigger compaction
+		err := pool.Compact()
+		require.NoError(t, err)
+
+		stats := pool.GetStats()
+		assert.Greater(t, stats.Compactions, uint64(0))
+	})
+}
+
+func TestMemoryPoolItem(t *testing.T) {
+	t.Run("Creation and Access", func(t *testing.T) {
+		item := &types.MemoryPoolItem{
+			ID:          "test-item",
+			Data:        []byte("test data"),
+			Size:        uint64(len("test data")),
+			AllocatedAt: time.Now(),
+			LastAccess:  time.Now(),
+			AccessCount: 0,
+			Priority:    1,
+		}
+
+		assert.Equal(t, "test-item", item.ID)
+		assert.Equal(t, uint64(9), item.Size)
+		assert.Equal(t, uint32(1), item.Priority)
+	})
+}
+
+func BenchmarkTypedMemoryPool(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &types.MemoryPoolConfig{
+		MaxSize:     1024 * 1024 * 10, // 10MB
+		BlockSize:   1024,             // 1KB
+		EnableStats: false,            // Disable for benchmark
+	}
+
+	pool := optimization.NewTypedMemoryPool[*TestBlock](config, func() *TestBlock {
+		return &TestBlock{validated: true}
+	}, logger)
+
+	b.Run("Sequential", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			obj, err := pool.Get()
+			if err != nil {
+				b.Fatal(err)
+			}
+			pool.Put(obj)
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				obj, err := pool.Get()
+				if err != nil {
+					b.Fatal(err)
+				}
+				pool.Put(obj)
+			}
+		})
+	})
+
+	b.Run("WithWork", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			obj, err := pool.Get()
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			// Simulate work
+			obj.Hash = "benchmark-hash"
+			obj.Number = uint64(i)
+			obj.Timestamp = time.Now().Unix()
+
+			pool.Put(obj)
+		}
+	})
+}

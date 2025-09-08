@@ -1,0 +1,152 @@
+package config
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+func TestLoadExplorerConfig(t *testing.T) {
+	// Test with default values
+	config, err := LoadExplorerConfig()
+	if err != nil {
+		t.Fatalf("Failed to load explorer config: %v", err)
+	}
+
+	if config.Port != 8091 {
+		t.Errorf("Expected default port 8091, got %d", config.Port)
+	}
+
+	if config.Host != "0.0.0.0" {
+		t.Errorf("Expected default host 0.0.0.0, got %s", config.Host)
+	}
+
+	if config.LogLevel != "info" {
+		t.Errorf("Expected default log level info, got %s", config.LogLevel)
+	}
+}
+
+func TestLoadFaucetConfig(t *testing.T) {
+	// Test with default values
+	config, err := LoadFaucetConfig()
+	if err != nil {
+		t.Fatalf("Failed to load faucet config: %v", err)
+	}
+
+	if config.Port != 8090 {
+		t.Errorf("Expected default port 8090, got %d", config.Port)
+	}
+
+	if config.FundAmount != 10 {
+		t.Errorf("Expected default fund amount 10, got %d", config.FundAmount)
+	}
+
+	if config.CooldownTime != 24*time.Hour {
+		t.Errorf("Expected default cooldown time 24h, got %v", config.CooldownTime)
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	// Test invalid explorer config
+	explorerConfig := &ExplorerConfig{
+		Port: -1, // Invalid port
+		Host: "",
+	}
+
+	if err := explorerConfig.validate(); err == nil {
+		t.Error("Expected validation error for invalid explorer config")
+	}
+
+	// Test invalid faucet config
+	faucetConfig := &FaucetConfig{
+		Port:         8090,
+		Host:         "localhost",
+		MongoURL:     "mongodb://localhost:27017",
+		DatabaseName: "test",
+		MaxPoolSize:  10,
+		FundAmount:   -1, // Invalid fund amount
+		MaxFunds:     1000,
+		RateLimit:    10,
+		RateBurst:    5,
+		MetricsPort:  9090,
+	}
+
+	if err := faucetConfig.validate(); err == nil {
+		t.Error("Expected validation error for invalid faucet config")
+	}
+}
+
+func TestEnvironmentVariables(t *testing.T) {
+	// Set environment variables
+	os.Setenv("EXPLORER_PORT", "9091")
+	os.Setenv("EXPLORER_HOST", "127.0.0.1")
+	os.Setenv("LOG_LEVEL", "debug")
+	defer func() {
+		os.Unsetenv("EXPLORER_PORT")
+		os.Unsetenv("EXPLORER_HOST")
+		os.Unsetenv("LOG_LEVEL")
+	}()
+
+	config, err := LoadExplorerConfig()
+	if err != nil {
+		t.Fatalf("Failed to load explorer config: %v", err)
+	}
+
+	if config.Port != 9091 {
+		t.Errorf("Expected port 9091 from env var, got %d", config.Port)
+	}
+
+	if config.Host != "127.0.0.1" {
+		t.Errorf("Expected host 127.0.0.1 from env var, got %s", config.Host)
+	}
+
+	if config.LogLevel != "debug" {
+		t.Errorf("Expected log level debug from env var, got %s", config.LogLevel)
+	}
+}
+
+func TestHelperFunctions(t *testing.T) {
+	// Test getEnvString
+	os.Setenv("TEST_STRING", "test_value")
+	defer os.Unsetenv("TEST_STRING")
+
+	if value := getEnvString("TEST_STRING", "default"); value != "test_value" {
+		t.Errorf("Expected test_value, got %s", value)
+	}
+
+	if value := getEnvString("NON_EXISTENT", "default"); value != "default" {
+		t.Errorf("Expected default, got %s", value)
+	}
+
+	// Test getEnvInt
+	os.Setenv("TEST_INT", "42")
+	defer os.Unsetenv("TEST_INT")
+
+	if value := getEnvInt("TEST_INT", 0); value != 42 {
+		t.Errorf("Expected 42, got %d", value)
+	}
+
+	if value := getEnvInt("NON_EXISTENT", 99); value != 99 {
+		t.Errorf("Expected 99, got %d", value)
+	}
+
+	// Test getEnvBool
+	os.Setenv("TEST_BOOL", "true")
+	defer os.Unsetenv("TEST_BOOL")
+
+	if value := getEnvBool("TEST_BOOL", false); !value {
+		t.Error("Expected true, got false")
+	}
+
+	if value := getEnvBool("NON_EXISTENT", true); !value {
+		t.Error("Expected true, got false")
+	}
+
+	// Test getEnvDuration
+	os.Setenv("TEST_DURATION", "5m")
+	defer os.Unsetenv("TEST_DURATION")
+
+	if value := getEnvDuration("TEST_DURATION", time.Second); value != 5*time.Minute {
+		t.Errorf("Expected 5m, got %v", value)
+	}
+}

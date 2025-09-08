@@ -1,0 +1,512 @@
+package consensus_test
+
+import (
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+	"diamante/types"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// MockContract represents a test contract
+type MockContract struct {
+	Address    string
+	Code       []byte
+	State      map[string][]byte
+	Valid      bool
+	ValidateFunc func() error
+}
+
+func (mc *MockContract) GetAddress() string {
+	return mc.Address
+}
+
+func (mc *MockContract) GetCode() []byte {
+	return mc.Code
+}
+
+func (mc *MockContract) Validate() error {
+	if mc.ValidateFunc != nil {
+		return mc.ValidateFunc()
+	}
+	if !mc.Valid {
+		return assert.AnError
+	}
+	return nil
+}
+
+func TestContractValidator(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			MaxContractSize:    1024 * 1024, // 1MB
+			MaxGasLimit:        10000000,
+			EnableWhitelist:    true,
+			EnableBlacklist:    true,
+			ValidationTimeout:  5 * time.Second,
+			CacheSize:          1000,
+			EnableParallel:     true,
+			ParallelWorkers:    4,
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		require.NotNil(t, cv)
+
+		// Start validator
+		err := cv.Start()
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = cv.Start()
+		assert.Error(t, err)
+	})
+
+	t.Run("Basic Validation", func(t *testing.T) {
+		config := consensus.DefaultContractValidatorConfig()
+		cv := consensus.NewContractValidator(config, logger)
+
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Valid contract
+		validContract := &MockContract{
+			Address: "0x1234567890abcdef",
+			Code:    []byte("valid contract code"),
+			Valid:   true,
+		}
+
+		result, err := cv.ValidateContract(validContract)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.True(t, result.Valid)
+		assert.Empty(t, result.Errors)
+
+		// Invalid contract
+		invalidContract := &MockContract{
+			Address: "0xdeadbeef",
+			Code:    []byte("invalid code"),
+			Valid:   false,
+		}
+
+		result, err = cv.ValidateContract(invalidContract)
+		assert.NoError(t, err)
+		assert.NotNil(t, result)
+		assert.False(t, result.Valid)
+		assert.NotEmpty(t, result.Errors)
+	})
+
+	t.Run("Size Validation", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			MaxContractSize: 100, // Very small limit
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Contract exceeding size limit
+		largeContract := &MockContract{
+			Address: "0xlarge",
+			Code:    make([]byte, 200), // Exceeds limit
+			Valid:   true,
+		}
+
+		result, err := cv.ValidateContract(largeContract)
+		assert.NoError(t, err)
+		assert.False(t, result.Valid)
+		assert.Contains(t, result.Errors[0], "size")
+	})
+
+	t.Run("Whitelist Validation", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			EnableWhitelist: true,
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Add to whitelist
+		cv.AddToWhitelist("0xwhitelisted")
+
+		// Whitelisted contract
+		whitelistedContract := &MockContract{
+			Address: "0xwhitelisted",
+			Code:    []byte("whitelisted code"),
+			Valid:   true,
+		}
+
+		result, err := cv.ValidateContract(whitelistedContract)
+		assert.NoError(t, err)
+		assert.True(t, result.Valid)
+		assert.True(t, result.Whitelisted)
+
+		// Non-whitelisted contract
+		normalContract := &MockContract{
+			Address: "0xnormal",
+			Code:    []byte("normal code"),
+			Valid:   true,
+		}
+
+		result, err = cv.ValidateContract(normalContract)
+		assert.NoError(t, err)
+		assert.True(t, result.Valid) // Still valid, just not whitelisted
+		assert.False(t, result.Whitelisted)
+
+		// Remove from whitelist
+		cv.RemoveFromWhitelist("0xwhitelisted")
+
+		result, err = cv.ValidateContract(whitelistedContract)
+		assert.NoError(t, err)
+		assert.False(t, result.Whitelisted)
+	})
+
+	t.Run("Blacklist Validation", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			EnableBlacklist: true,
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Add to blacklist
+		cv.AddToBlacklist("0xblacklisted")
+
+		// Blacklisted contract
+		blacklistedContract := &MockContract{
+			Address: "0xblacklisted",
+			Code:    []byte("malicious code"),
+			Valid:   true,
+		}
+
+		result, err := cv.ValidateContract(blacklistedContract)
+		assert.NoError(t, err)
+		assert.False(t, result.Valid)
+		assert.True(t, result.Blacklisted)
+		assert.Contains(t, result.Errors[0], "blacklisted")
+
+		// Remove from blacklist
+		cv.RemoveFromBlacklist("0xblacklisted")
+
+		result, err = cv.ValidateContract(blacklistedContract)
+		assert.NoError(t, err)
+		assert.True(t, result.Valid)
+		assert.False(t, result.Blacklisted)
+	})
+
+	t.Run("Cache Functionality", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			CacheSize: 10,
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Contract with expensive validation
+		callCount := 0
+		contract := &MockContract{
+			Address: "0xcached",
+			Code:    []byte("cached code"),
+			ValidateFunc: func() error {
+				callCount++
+				time.Sleep(10 * time.Millisecond) // Simulate expensive operation
+				return nil
+			},
+		}
+
+		// First validation should call validate
+		result1, err := cv.ValidateContract(contract)
+		assert.NoError(t, err)
+		assert.True(t, result1.Valid)
+		assert.Equal(t, 1, callCount)
+
+		// Second validation should use cache
+		result2, err := cv.ValidateContract(contract)
+		assert.NoError(t, err)
+		assert.True(t, result2.Valid)
+		assert.Equal(t, 1, callCount) // Should not increase
+
+		// Clear cache
+		cv.ClearCache()
+
+		// Third validation should call validate again
+		result3, err := cv.ValidateContract(contract)
+		assert.NoError(t, err)
+		assert.True(t, result3.Valid)
+		assert.Equal(t, 2, callCount)
+	})
+
+	t.Run("Parallel Validation", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			EnableParallel:  true,
+			ParallelWorkers: 4,
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Create multiple contracts
+		contracts := make([]*MockContract, 20)
+		for i := 0; i < 20; i++ {
+			contracts[i] = &MockContract{
+				Address: string(rune('A' + i)),
+				Code:    []byte("parallel test"),
+				Valid:   i%2 == 0, // Half valid, half invalid
+			}
+		}
+
+		// Validate in parallel
+		results, err := cv.ValidateBatch(contracts)
+		assert.NoError(t, err)
+		assert.Equal(t, 20, len(results))
+
+		// Check results
+		validCount := 0
+		for i, result := range results {
+			if contracts[i].Valid {
+				assert.True(t, result.Valid)
+				validCount++
+			} else {
+				assert.False(t, result.Valid)
+			}
+		}
+		assert.Equal(t, 10, validCount)
+	})
+
+	t.Run("Validation Timeout", func(t *testing.T) {
+		config := &consensus.ContractValidatorConfig{
+			ValidationTimeout: 50 * time.Millisecond,
+		}
+
+		cv := consensus.NewContractValidator(config, logger)
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Contract with slow validation
+		slowContract := &MockContract{
+			Address: "0xslow",
+			Code:    []byte("slow validation"),
+			ValidateFunc: func() error {
+				time.Sleep(100 * time.Millisecond) // Exceeds timeout
+				return nil
+			},
+		}
+
+		result, err := cv.ValidateContract(slowContract)
+		assert.NoError(t, err)
+		assert.False(t, result.Valid)
+		assert.Contains(t, result.Errors[0], "timeout")
+	})
+
+	t.Run("Contract Arguments", func(t *testing.T) {
+		config := consensus.DefaultContractValidatorConfig()
+		cv := consensus.NewContractValidator(config, logger)
+
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Contract with arguments
+		args := &types.ContractArguments{
+			Method:     "transfer",
+			Parameters: []interface{}{"0xrecipient", uint64(1000)},
+			GasLimit:   100000,
+			Value:      []byte{0, 0, 0, 0, 0, 0, 0, 100}, // 100 units
+		}
+
+		contract := &MockContract{
+			Address: "0xwithargs",
+			Code:    []byte("contract with args"),
+			Valid:   true,
+		}
+
+		result, err := cv.ValidateContractWithArgs(contract, args)
+		assert.NoError(t, err)
+		assert.True(t, result.Valid)
+		assert.Equal(t, args.GasLimit, result.GasEstimate)
+	})
+
+	t.Run("Get Stats", func(t *testing.T) {
+		config := consensus.DefaultContractValidatorConfig()
+		cv := consensus.NewContractValidator(config, logger)
+
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Validate some contracts
+		for i := 0; i < 10; i++ {
+			contract := &MockContract{
+				Address: string(rune('A' + i)),
+				Code:    []byte("stats test"),
+				Valid:   i < 7, // 7 valid, 3 invalid
+			}
+			cv.ValidateContract(contract)
+		}
+
+		stats := cv.GetStats()
+		assert.NotNil(t, stats)
+		assert.Equal(t, uint64(10), stats.TotalValidations)
+		assert.Equal(t, uint64(7), stats.ValidContracts)
+		assert.Equal(t, uint64(3), stats.InvalidContracts)
+		assert.Greater(t, stats.CacheHits+stats.CacheMisses, uint64(0))
+	})
+
+	t.Run("Concurrent Validation", func(t *testing.T) {
+		config := consensus.DefaultContractValidatorConfig()
+		cv := consensus.NewContractValidator(config, logger)
+
+		err := cv.Start()
+		require.NoError(t, err)
+		defer cv.Stop()
+
+		// Validate contracts concurrently
+		var wg sync.WaitGroup
+		validationCount := 100
+
+		for i := 0; i < validationCount; i++ {
+			wg.Add(1)
+			go func(index int) {
+				defer wg.Done()
+
+				contract := &MockContract{
+					Address: string(rune('A' + (index % 26))),
+					Code:    []byte("concurrent test"),
+					Valid:   index%3 != 0,
+				}
+
+				result, err := cv.ValidateContract(contract)
+				assert.NoError(t, err)
+				assert.NotNil(t, result)
+			}(i)
+		}
+
+		wg.Wait()
+
+		stats := cv.GetStats()
+		assert.Equal(t, uint64(validationCount), stats.TotalValidations)
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultContractValidatorConfig()
+		cv := consensus.NewContractValidator(config, logger)
+
+		err := cv.Start()
+		require.NoError(t, err)
+
+		// Stop
+		err = cv.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = cv.Stop()
+		assert.Error(t, err)
+
+		// Operations should fail after stop
+		contract := &MockContract{
+			Address: "0xtest",
+			Code:    []byte("test"),
+			Valid:   true,
+		}
+
+		_, err = cv.ValidateContract(contract)
+		assert.Error(t, err)
+	})
+}
+
+func TestValidationResult(t *testing.T) {
+	t.Run("Result Fields", func(t *testing.T) {
+		result := &consensus.ValidationResult{
+			Valid:       true,
+			Errors:      []string{},
+			Warnings:    []string{"Minor issue"},
+			GasEstimate: 50000,
+			Whitelisted: true,
+			Blacklisted: false,
+			CacheHit:    true,
+			Duration:    100 * time.Millisecond,
+		}
+
+		assert.True(t, result.Valid)
+		assert.Empty(t, result.Errors)
+		assert.NotEmpty(t, result.Warnings)
+		assert.Equal(t, uint64(50000), result.GasEstimate)
+		assert.True(t, result.Whitelisted)
+		assert.False(t, result.Blacklisted)
+		assert.True(t, result.CacheHit)
+		assert.Equal(t, 100*time.Millisecond, result.Duration)
+	})
+}
+
+func BenchmarkContractValidator(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &consensus.ContractValidatorConfig{
+		MaxContractSize: 1024 * 1024,
+		CacheSize:       10000,
+		EnableParallel:  true,
+		ParallelWorkers: 8,
+	}
+
+	cv := consensus.NewContractValidator(config, logger)
+	cv.Start()
+	defer cv.Stop()
+
+	// Create test contract
+	contract := &MockContract{
+		Address: "0xbenchmark",
+		Code:    make([]byte, 1024), // 1KB contract
+		Valid:   true,
+	}
+
+	b.Run("SingleValidation", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cv.ValidateContract(contract)
+		}
+	})
+
+	b.Run("CachedValidation", func(b *testing.B) {
+		// Prime cache
+		cv.ValidateContract(contract)
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cv.ValidateContract(contract)
+		}
+	})
+
+	b.Run("ParallelValidation", func(b *testing.B) {
+		contracts := make([]*MockContract, 100)
+		for i := 0; i < 100; i++ {
+			contracts[i] = &MockContract{
+				Address: string(rune('A' + (i % 26))),
+				Code:    make([]byte, 1024),
+				Valid:   true,
+			}
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			cv.ValidateBatch(contracts)
+		}
+	})
+}

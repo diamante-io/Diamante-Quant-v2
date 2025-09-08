@@ -1,0 +1,488 @@
+package unit
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"diamante/monitoring"
+	"diamante/types"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestNewMetrics(t *testing.T) {
+	metrics := monitoring.NewMetrics()
+	require.NotNil(t, metrics)
+
+	// Verify all metrics are created
+	assert.NotNil(t, metrics.ConsensusHeight)
+	assert.NotNil(t, metrics.ConsensusLatency)
+	assert.NotNil(t, metrics.TxProcessed)
+	assert.NotNil(t, metrics.TxFailed)
+	assert.NotNil(t, metrics.TxPoolSize)
+	assert.NotNil(t, metrics.NetworkPeers)
+	assert.NotNil(t, metrics.NetworkBytesSent)
+	assert.NotNil(t, metrics.NetworkBytesReceived)
+	assert.NotNil(t, metrics.ValidatorsActive)
+	assert.NotNil(t, metrics.ValidatorsTotal)
+	assert.NotNil(t, metrics.ContractsDeployed)
+	assert.NotNil(t, metrics.ContractCalls)
+	assert.NotNil(t, metrics.FeesCollected)
+	assert.NotNil(t, metrics.CPUUsage)
+	assert.NotNil(t, metrics.MemoryUsage)
+	assert.NotNil(t, metrics.DiskUsage)
+}
+
+func TestMetricsOperations(t *testing.T) {
+	metrics := monitoring.NewMetrics()
+	require.NotNil(t, metrics)
+
+	// Test gauge operations
+	metrics.ConsensusHeight.Set(1000)
+	metrics.TxPoolSize.Set(50)
+	metrics.NetworkPeers.Set(25)
+	metrics.ValidatorsActive.Set(10)
+	metrics.ValidatorsTotal.Set(15)
+	metrics.CPUUsage.Set(45.5)
+	metrics.MemoryUsage.Set(2048000000) // 2GB
+	metrics.DiskUsage.Set(1024000000)   // 1GB
+
+	// Test counter operations
+	metrics.TxProcessed.Inc()
+	metrics.TxFailed.Inc()
+	metrics.NetworkBytesSent.Add(1024)
+	metrics.NetworkBytesReceived.Add(2048)
+	metrics.ContractsDeployed.Inc()
+	metrics.ContractCalls.Add(5)
+	metrics.FeesCollected.Add(100.50)
+
+	// Test histogram operations
+	metrics.ConsensusLatency.Observe(0.5) // 500ms
+
+	// Verify values can be read (basic smoke test)
+	var m dto.Metric
+
+	err := metrics.ConsensusHeight.Write(&m)
+	require.NoError(t, err)
+	assert.Equal(t, float64(1000), m.GetGauge().GetValue())
+
+	err = metrics.TxProcessed.Write(&m)
+	require.NoError(t, err)
+	assert.Equal(t, float64(1), m.GetCounter().GetValue())
+}
+
+// Mock interfaces for testing MetricsCollector
+
+type MockConsensus struct {
+	height         uint64
+	activeVals     []string
+	allVals        []string
+}
+
+func (m *MockConsensus) GetLastBlockHeight() uint64 {
+	return m.height
+}
+
+// Keep original methods for compatibility
+func (m *MockConsensus) GetActiveValidatorsStrings() []string {
+	return m.activeVals
+}
+
+func (m *MockConsensus) GetValidatorsStrings() []string {
+	return m.allVals
+}
+
+// Additional consensus interface methods (mocked as no-ops)
+func (m *MockConsensus) Start() error { return nil }
+func (m *MockConsensus) Stop() error { return nil }
+func (m *MockConsensus) GetNetworkLoad() float64 { return 0.5 }
+func (m *MockConsensus) GetLachesis() types.Lachesis { return nil }
+func (m *MockConsensus) GetDPoS() types.DPoS { return nil }
+func (m *MockConsensus) GetPoH() types.PoH { return nil }
+func (m *MockConsensus) ProcessBlock(blockNumber uint64) error { return nil }
+func (m *MockConsensus) CreateEvent(creator [32]byte, parentIDs [][32]byte, data []byte) *types.Event { return nil }
+func (m *MockConsensus) FinalizeEvent(event *types.Event) (bool, error) { return true, nil }
+func (m *MockConsensus) SynchronizeState(targetState [32]byte, targetCount uint64) error { return nil }
+func (m *MockConsensus) GetValidators() []*types.Validator { return nil }
+func (m *MockConsensus) GetActiveValidators() []*types.Validator { return nil }
+func (m *MockConsensus) GetPendingEvents() []*types.Event { return nil }
+func (m *MockConsensus) GetFinalizedEvents(fromHeight, toHeight uint64) ([]*types.Event, error) { return nil, nil }
+func (m *MockConsensus) ProposeBlock(txs []types.TypedTransaction) error { return nil }
+func (m *MockConsensus) ProcessBlock(block interface{}) error { return nil }
+func (m *MockConsensus) GetCurrentState() interface{} { return nil }
+
+type MockNetwork struct {
+	peerCount int
+	peerList  []string
+}
+
+func (m *MockNetwork) GetNetworkHealth() (int, error) {
+	return m.peerCount, nil
+}
+
+func (m *MockNetwork) GetPeerList() ([]string, error) {
+	return m.peerList, nil
+}
+
+type MockLedger struct{}
+
+func (m *MockLedger) GetBalance(address string) (uint64, error) { return 0, nil }
+func (m *MockLedger) Transfer(from, to string, amount uint64) error { return nil }
+func (m *MockLedger) GetState() (interface{}, error) { return nil, nil }
+
+type MockTransactionManager struct {
+	poolSize int
+	stats    MockTransactionStats
+}
+
+type MockTransactionStats struct {
+	TotalProcessed int
+	TotalRejected  int
+}
+
+func (m *MockTransactionManager) GetPoolSize() int {
+	return m.poolSize
+}
+
+func (m *MockTransactionManager) GetStats() MockTransactionStats {
+	return m.stats
+}
+
+func TestNewMetricsCollector(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	consensus := &MockConsensus{
+		height:     1000,
+		activeVals: []string{"val1", "val2", "val3"},
+		allVals:    []string{"val1", "val2", "val3", "val4", "val5"},
+	}
+
+	network := &MockNetwork{
+		peerCount: 10,
+		peerList:  []string{"peer1", "peer2", "peer3"},
+	}
+
+	ledger := &MockLedger{}
+
+	txMgr := &MockTransactionManager{
+		poolSize: 25,
+		stats: MockTransactionStats{
+			TotalProcessed: 1000,
+			TotalRejected:  50,
+		},
+	}
+
+	collector := monitoring.NewMetricsCollector(
+		consensus,
+		network,
+		ledger,
+		txMgr,
+		1*time.Second,
+		logger,
+	)
+
+	require.NotNil(t, collector)
+}
+
+func TestMetricsStartStop(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	consensus := &MockConsensus{height: 100}
+	network := &MockNetwork{peerCount: 5}
+	ledger := &MockLedger{}
+	txMgr := &MockTransactionManager{poolSize: 10}
+
+	collector := monitoring.NewMetricsCollector(
+		consensus,
+		network,
+		ledger,
+		txMgr,
+		100*time.Millisecond, // Fast interval for testing
+		logger,
+	)
+
+	// Test start
+	collector.Start()
+
+	// Let it run briefly
+	time.Sleep(250 * time.Millisecond)
+
+	// Test stop
+	collector.Stop()
+
+	// Should complete without hanging
+}
+
+// Test the MetricsCollector with actual data collection
+
+func TestMetricsCollectorDataCollection(t *testing.T) {
+	// This test verifies that the metrics collector can gather data
+	// Note: The actual collection logic is in a private method, so we test indirectly
+
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	consensus := &MockConsensus{
+		height:     1000,
+		activeVals: []string{"val1", "val2", "val3"},
+		allVals:    []string{"val1", "val2", "val3", "val4", "val5"},
+	}
+
+	network := &MockNetwork{
+		peerCount: 10,
+		peerList:  []string{"peer1", "peer2", "peer3"},
+	}
+
+	ledger := &MockLedger{}
+
+	txMgr := &MockTransactionManager{
+		poolSize: 25,
+		stats: MockTransactionStats{
+			TotalProcessed: 1000,
+			TotalRejected:  50,
+		},
+	}
+
+	collector := monitoring.NewMetricsCollector(
+		consensus,
+		network,
+		ledger,
+		txMgr,
+		50*time.Millisecond,
+		logger,
+	)
+
+	require.NotNil(t, collector)
+
+	// Start collection
+	collector.Start()
+	defer collector.Stop()
+
+	// Wait for several collection cycles
+	time.Sleep(200 * time.Millisecond)
+
+	// The metrics should be updated in the background
+	// We can't directly verify without access to the internal metrics,
+	// but the test ensures no panics occur during collection
+}
+
+func TestMetricsCollectorNilDependencies(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	// Test with nil dependencies - should not crash
+	collector := monitoring.NewMetricsCollector(
+		nil, // nil consensus
+		nil, // nil network
+		nil, // nil ledger
+		nil, // nil txMgr
+		1*time.Second,
+		logger,
+	)
+
+	require.NotNil(t, collector)
+
+	// Should start and stop without crashing
+	collector.Start()
+	time.Sleep(100 * time.Millisecond)
+	collector.Stop()
+}
+
+func TestMetricsCollectorWithNilLogger(t *testing.T) {
+	consensus := &MockConsensus{height: 100}
+	network := &MockNetwork{peerCount: 5}
+	ledger := &MockLedger{}
+	txMgr := &MockTransactionManager{poolSize: 10}
+
+	// Test with nil logger - should create default logger
+	collector := monitoring.NewMetricsCollector(
+		consensus,
+		network,
+		ledger,
+		txMgr,
+		1*time.Second,
+		nil, // nil logger
+	)
+
+	require.NotNil(t, collector)
+}
+
+// Test the new typed metrics collector
+
+func TestNewTypedMetricsCollector(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &monitoring.MetricsConfig{
+		EnablePrometheus:  true,
+		EnableBusiness:    true,
+		EnablePerformance: true,
+		PrometheusPort:    9090,
+		CollectInterval:   30 * time.Second,
+	}
+
+	collector := monitoring.NewMetricsCollector(config, logger)
+	require.NotNil(t, collector)
+}
+
+func TestTypedMetricsCollectorStartStop(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &monitoring.MetricsConfig{
+		EnablePrometheus:  false, // Disable server for testing
+		EnableBusiness:    true,
+		EnablePerformance: true,
+		CollectInterval:   100 * time.Millisecond,
+	}
+
+	collector := monitoring.NewMetricsCollector(config, logger)
+	require.NotNil(t, collector)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	// Test start
+	err := collector.Start(ctx)
+	require.NoError(t, err)
+
+	// Test stop
+	err = collector.Stop()
+	require.NoError(t, err)
+}
+
+func TestTypedMetricsCollectorRecording(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &monitoring.MetricsConfig{
+		EnablePrometheus:  false,
+		EnableBusiness:    true,
+		EnablePerformance: true,
+		CollectInterval:   1 * time.Second,
+	}
+
+	collector := monitoring.NewMetricsCollector(config, logger)
+	require.NotNil(t, collector)
+
+	// Test transaction metrics recording
+	tx := &types.TypedTransaction{
+		Hash: "test-hash",
+		Type: "transfer",
+	}
+
+	collector.RecordTransactionMetrics(tx, "success", 100*time.Millisecond)
+
+	// Test block metrics recording
+	collector.RecordBlockMetrics(1000, 1024, 50*time.Millisecond, "success")
+
+	// Test consensus metrics recording
+	collector.RecordConsensusMetrics("success", 200*time.Millisecond, 10)
+
+	// Test counter operations
+	collector.IncrementCounter("test_counter", map[string]string{"component": "test"})
+
+	// Test gauge operations
+	collector.SetGauge("test_gauge", 42.0, map[string]string{"component": "test"})
+
+	// Test histogram operations
+	collector.ObserveHistogram("test_histogram", 1.5, map[string]string{"component": "test"})
+
+	// Should complete without panics
+}
+
+func TestTypedMetricsCollectorGetMetrics(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := &monitoring.MetricsConfig{
+		EnablePrometheus:  false,
+		EnableBusiness:    true,
+		EnablePerformance: true,
+		CollectInterval:   1 * time.Second,
+	}
+
+	collector := monitoring.NewMetricsCollector(config, logger)
+	require.NotNil(t, collector)
+
+	// Record some metrics
+	collector.IncrementCounter("test_counter", map[string]string{"test": "value"})
+	collector.SetGauge("test_gauge", 123.45, map[string]string{"test": "value"})
+
+	// Get metrics
+	metrics, err := collector.GetMetrics()
+	require.NoError(t, err)
+	require.NotNil(t, metrics)
+
+	// Should contain our metrics
+	assert.Contains(t, metrics, "counters")
+	assert.Contains(t, metrics, "gauges")
+	assert.Contains(t, metrics, "histograms")
+}
+
+// Benchmark tests
+
+func BenchmarkNewMetrics(b *testing.B) {
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		metrics := monitoring.NewMetrics()
+		_ = metrics
+	}
+}
+
+func BenchmarkMetricsOperations(b *testing.B) {
+	metrics := monitoring.NewMetrics()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		metrics.ConsensusHeight.Set(float64(i))
+		metrics.TxProcessed.Inc()
+		metrics.ConsensusLatency.Observe(0.1)
+	}
+}
+
+func BenchmarkMetricsCollectorCollection(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	consensus := &MockConsensus{height: 1000}
+	network := &MockNetwork{peerCount: 10}
+	ledger := &MockLedger{}
+	txMgr := &MockTransactionManager{poolSize: 25}
+
+	collector := monitoring.NewMetricsCollector(
+		consensus,
+		network,
+		ledger,
+		txMgr,
+		1*time.Second,
+		logger,
+	)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		// Simulate what the internal collect() method does
+		_ = consensus.GetLastBlockHeight()
+		_ = len(consensus.GetActiveValidators())
+		_ = len(consensus.GetValidators())
+		_ = txMgr.GetPoolSize()
+		_ = txMgr.GetStats()
+	}
+}
+
+func TestDefaultMetricsConfig(t *testing.T) {
+	config := monitoring.DefaultMetricsConfig()
+	require.NotNil(t, config)
+
+	assert.True(t, config.EnablePrometheus)
+	assert.True(t, config.EnableBusiness)
+	assert.True(t, config.EnablePerformance)
+	assert.Equal(t, 9090, config.PrometheusPort)
+	assert.Equal(t, 30*time.Second, config.CollectInterval)
+}

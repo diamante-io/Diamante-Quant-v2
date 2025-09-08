@@ -1,0 +1,106 @@
+# Prometheus configuration for Diamante blockchain monitoring
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: 'diamante-docker'
+    environment: 'testnet'
+
+# Alertmanager configuration
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+          # - alertmanager:9093
+
+# Load rules once and periodically evaluate them
+rule_files:
+  # - "first_rules.yml"
+  # - "second_rules.yml"
+
+# Scrape configurations
+scrape_configs:
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+        labels:
+          service: 'prometheus'
+
+  # Diamante validators
+  - job_name: 'diamante'
+    scrape_interval: 5s
+    metrics_path: '/metrics'
+    static_configs:
+      - targets:
+          - 'diamante-validator1:9090'
+          - 'diamante-validator2:9090'
+          - 'diamante-validator3:9090'
+        labels:
+          node_type: 'validator'
+
+  # Individual validator metrics (backward compatibility)
+  - job_name: 'validator-1'
+    static_configs:
+      - targets: ['diamante-validator1:9090']
+        labels:
+          node_id: 'validator-1'
+          node_type: 'validator'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Validator Node 2 metrics
+  - job_name: 'validator-2'
+    static_configs:
+      - targets: ['diamante-validator2:9090']
+        labels:
+          node_id: 'validator-2'
+          node_type: 'validator'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Validator Node 3 metrics
+  - job_name: 'validator-3'
+    static_configs:
+      - targets: ['diamante-validator3:9090']
+        labels:
+          node_id: 'validator-3'
+          node_type: 'validator'
+    metrics_path: '/metrics'
+    scrape_interval: 10s
+    scrape_timeout: 5s
+
+  # Nginx metrics
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx:80']
+        labels:
+          service: 'nginx'
+    metrics_path: '/nginx_status'
+    scrape_interval: 30s
+
+  # MongoDB exporter (if added)
+  - job_name: 'mongodb'
+    static_configs:
+      - targets: ['mongodb-exporter:9216']
+        labels:
+          service: 'mongodb'
+    scrape_interval: 30s
+
+  # Redis exporter (if added)
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis-exporter:9121']
+        labels:
+          service: 'redis'
+    scrape_interval: 30s
+
+# Remote write configuration (optional)
+# remote_write:
+#   - url: "http://remote-prometheus:9090/api/v1/write"
+
+# Remote read configuration (optional)
+# remote_read:
+#   - url: "http://remote-prometheus:9090/api/v1/read"

@@ -1,0 +1,557 @@
+package api_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"diamante/api"
+	"diamante/common"
+	"diamante/ledger/evm"
+	"diamante/types"
+
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+// Mock EVM runtime
+type mockEVMRuntime struct {
+	mock.Mock
+}
+
+func (m *mockEVMRuntime) DeployContract(code []byte, args []byte, gasLimit uint64) (string, error) {
+	mockArgs := m.Called(code, args, gasLimit)
+	return mockArgs.String(0), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) CallContract(address string, data []byte, gasLimit uint64) ([]byte, error) {
+	mockArgs := m.Called(address, data, gasLimit)
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Error(1)
+	}
+	return mockArgs.Get(0).([]byte), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetCode(address string) ([]byte, error) {
+	mockArgs := m.Called(address)
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Error(1)
+	}
+	return mockArgs.Get(0).([]byte), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetStorage(address string, key string) ([]byte, error) {
+	mockArgs := m.Called(address, key)
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Error(1)
+	}
+	return mockArgs.Get(0).([]byte), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) EstimateGas(from, to string, data []byte, value uint64) (uint64, error) {
+	mockArgs := m.Called(from, to, data, value)
+	return mockArgs.Get(0).(uint64), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetTransactionReceipt(hash string) (*ethtypes.Receipt, error) {
+	mockArgs := m.Called(hash)
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Error(1)
+	}
+	return mockArgs.Get(0).(*ethtypes.Receipt), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetBlockByNumber(number uint64) (*ethtypes.Block, error) {
+	mockArgs := m.Called(number)
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Error(1)
+	}
+	return mockArgs.Get(0).(*ethtypes.Block), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetLatestBlock() (*ethtypes.Block, error) {
+	mockArgs := m.Called()
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Error(1)
+	}
+	return mockArgs.Get(0).(*ethtypes.Block), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) SendTransaction(tx *ethtypes.Transaction) error {
+	mockArgs := m.Called(tx)
+	return mockArgs.Error(0)
+}
+
+func (m *mockEVMRuntime) GetBalance(address string) (uint64, error) {
+	mockArgs := m.Called(address)
+	return mockArgs.Get(0).(uint64), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetNonce(address string) (uint64, error) {
+	mockArgs := m.Called(address)
+	return mockArgs.Get(0).(uint64), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) GetGasPrice() (uint64, error) {
+	mockArgs := m.Called()
+	return mockArgs.Get(0).(uint64), mockArgs.Error(1)
+}
+
+func (m *mockEVMRuntime) CreateAccessList(from, to string, data []byte, gasLimit uint64) (*ethtypes.AccessList, uint64, error) {
+	mockArgs := m.Called(from, to, data, gasLimit)
+	if mockArgs.Get(0) == nil {
+		return nil, mockArgs.Get(1).(uint64), mockArgs.Error(2)
+	}
+	return mockArgs.Get(0).(*ethtypes.AccessList), mockArgs.Get(1).(uint64), mockArgs.Error(2)
+}
+
+// Test setup for EVM tests
+func setupTestAPIWithEVM(t *testing.T) (*api.API, *mockStorage, *mockConsensus, *mockLedger, *mockTransactionPool, *mockWalletManager, *mockEVMRuntime) {
+	apiServer, mockStore, mockCon, mockLed, mockTxPool, mockWM := setupTestAPI(t)
+	mockEVM := &mockEVMRuntime{}
+	
+	// Replace the EVM runtime in the API server
+	apiServer.SetEVMRuntime(mockEVM)
+	
+	return apiServer, mockStore, mockCon, mockLed, mockTxPool, mockWM, mockEVM
+}
+
+func TestEVM_HandleETHCall(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	testData := []byte{0x12, 0x34, 0x56, 0x78}
+	testResult := []byte{0xab, 0xcd, 0xef}
+
+	// Setup mock
+	mockEVM.On("CallContract", "0x1234567890abcdef", testData, uint64(1000000)).Return(testResult, nil)
+
+	// Create JSON-RPC request
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_call",
+		"params": []interface{}{
+			map[string]interface{}{
+				"to":   "0x1234567890abcdef",
+				"data": hexutil.Encode(testData),
+				"gas":  hexutil.EncodeUint64(1000000),
+			},
+			"latest",
+		},
+		"id": 1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "2.0", response["jsonrpc"])
+	assert.Equal(t, float64(1), response["id"])
+	assert.Equal(t, hexutil.Encode(testResult), response["result"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_HandleETHEstimateGas(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	testData := []byte{0x12, 0x34}
+	estimatedGas := uint64(21000)
+
+	// Setup mock
+	mockEVM.On("EstimateGas", "0xfrom", "0xto", testData, uint64(1000)).Return(estimatedGas, nil)
+
+	// Create JSON-RPC request
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_estimateGas",
+		"params": []interface{}{
+			map[string]interface{}{
+				"from":  "0xfrom",
+				"to":    "0xto",
+				"data":  hexutil.Encode(testData),
+				"value": hexutil.EncodeUint64(1000),
+			},
+		},
+		"id": 1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, hexutil.EncodeUint64(estimatedGas), response["result"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_HandleETHGetBalance(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	testAddress := "0x1234567890abcdef"
+	testBalance := uint64(1000000000000000000) // 1 ETH in wei
+
+	// Setup mock
+	mockEVM.On("GetBalance", testAddress).Return(testBalance, nil)
+
+	// Create JSON-RPC request
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_getBalance",
+		"params":  []interface{}{testAddress, "latest"},
+		"id":      1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, hexutil.EncodeUint64(testBalance), response["result"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_HandleETHGetCode(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	testAddress := "0xcontract"
+	testCode := []byte{0x60, 0x60, 0x60, 0x40} // Sample bytecode
+
+	// Setup mock
+	mockEVM.On("GetCode", testAddress).Return(testCode, nil)
+
+	// Create JSON-RPC request
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_getCode",
+		"params":  []interface{}{testAddress, "latest"},
+		"id":      1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, hexutil.Encode(testCode), response["result"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_HandleETHGasPrice(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	testGasPrice := uint64(20000000000) // 20 Gwei
+
+	// Setup mock
+	mockEVM.On("GetGasPrice").Return(testGasPrice, nil)
+
+	// Create JSON-RPC request
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_gasPrice",
+		"params":  []interface{}{},
+		"id":      1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, hexutil.EncodeUint64(testGasPrice), response["result"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_BatchRequests(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	// Setup mocks for batch requests
+	mockEVM.On("GetBalance", "0xaddr1").Return(uint64(1000), nil)
+	mockEVM.On("GetNonce", "0xaddr1").Return(uint64(5), nil)
+	mockEVM.On("GetGasPrice").Return(uint64(20000000000), nil)
+
+	// Create batch JSON-RPC request
+	batchReq := []map[string]interface{}{
+		{
+			"jsonrpc": "2.0",
+			"method":  "eth_getBalance",
+			"params":  []interface{}{"0xaddr1", "latest"},
+			"id":      1,
+		},
+		{
+			"jsonrpc": "2.0",
+			"method":  "eth_getTransactionCount",
+			"params":  []interface{}{"0xaddr1", "latest"},
+			"id":      2,
+		},
+		{
+			"jsonrpc": "2.0",
+			"method":  "eth_gasPrice",
+			"params":  []interface{}{},
+			"id":      3,
+		},
+	}
+	body, _ := json.Marshal(batchReq)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var responses []map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &responses)
+	require.NoError(t, err)
+
+	assert.Len(t, responses, 3)
+	assert.Equal(t, float64(1), responses[0]["id"])
+	assert.Equal(t, hexutil.EncodeUint64(1000), responses[0]["result"])
+	assert.Equal(t, float64(2), responses[1]["id"])
+	assert.Equal(t, hexutil.EncodeUint64(5), responses[1]["result"])
+	assert.Equal(t, float64(3), responses[2]["id"])
+	assert.Equal(t, hexutil.EncodeUint64(20000000000), responses[2]["result"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_ErrorHandling(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	// Setup mock to return error
+	mockEVM.On("GetBalance", "0xinvalid").Return(uint64(0), evm.ErrInvalidAddress)
+
+	// Create JSON-RPC request
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_getBalance",
+		"params":  []interface{}{"0xinvalid", "latest"},
+		"id":      1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code) // JSON-RPC errors still return 200
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "2.0", response["jsonrpc"])
+	assert.Equal(t, float64(1), response["id"])
+	assert.NotNil(t, response["error"])
+
+	errorObj := response["error"].(map[string]interface{})
+	assert.Equal(t, float64(-32602), errorObj["code"]) // Invalid params
+	assert.Contains(t, errorObj["message"], "invalid")
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}
+
+func TestEVM_InvalidMethod(t *testing.T) {
+	apiServer, _, _, _, _, _, _ := setupTestAPIWithEVM(t)
+
+	// Create JSON-RPC request with invalid method
+	reqBody := map[string]interface{}{
+		"jsonrpc": "2.0",
+		"method":  "eth_invalidMethod",
+		"params":  []interface{}{},
+		"id":      1,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/evm", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.NotNil(t, response["error"])
+	errorObj := response["error"].(map[string]interface{})
+	assert.Equal(t, float64(-32601), errorObj["code"]) // Method not found
+}
+
+func TestEVM_DeployContract(t *testing.T) {
+	apiServer, _, _, _, _, _, mockEVM := setupTestAPIWithEVM(t)
+
+	contractCode := []byte{0x60, 0x80, 0x60, 0x40} // Sample contract bytecode
+	contractAddress := "0xdeployed123"
+
+	// Setup mock
+	mockEVM.On("DeployContract", contractCode, []byte{}, uint64(3000000)).Return(contractAddress, nil)
+
+	// Create request
+	reqBody := map[string]interface{}{
+		"code":     hexutil.Encode(contractCode),
+		"gasLimit": 3000000,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	req, err := http.NewRequest("POST", "/evm/deploy", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusCreated, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, contractAddress, response["address"])
+	assert.Equal(t, "Contract deployed successfully", response["message"])
+
+	// Verify mock calls
+	mockEVM.AssertExpectations(t)
+}

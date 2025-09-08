@@ -1,0 +1,628 @@
+package ledger
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"diamante/apperrors"
+	"diamante/common"
+	"diamante/storage"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func setupTestLMDBLedger(t *testing.T) (*LMDBLedger, func()) {
+	// Create temporary directory for test database
+	tmpDir, err := os.MkdirTemp("", "lmdb_ledger_test_*")
+	require.NoError(t, err)
+
+	// Create LMDB config for testing
+	config := &storage.LMDBConfig{
+		Path:           filepath.Join(tmpDir, "test.db"),
+		MapSize:        1024 * 1024 * 100, // 100MB for testing
+		MaxReaders:     10,
+		MaxDBs:         8,
+		SyncWrites:     true,
+		ReadOnly:       false,
+		NoMetaSync:     false,
+		NoMemInit:      false,
+		DirectIO:       false,
+		AutoResize:     true,
+		ResizeFactor:   1.5,
+		BackupInterval: 0,
+		BackupPath:     "",
+		StatsInterval:  0,
+	}
+
+	// Create logger for testing
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	// Create storage adapter
+	adapter, err := storage.NewLMDBAdapter(config, logger, 100)
+	require.NoError(t, err)
+
+	err = adapter.Open()
+	require.NoError(t, err)
+
+	// Create ledger with test configuration
+	ledgerConfig := &LedgerConfig{
+		MaxTransactionSize: 1024,
+		MaxBlockSize:       10 * 1024,
+		TransactionTimeout: 5 * time.Second,
+		EnableValidation:   true,
+		EnableMetrics:      true,
+		EnableCache:        true,
+		SecurityLevel:      "strict",
+	}
+
+	ledger := NewLMDBLedgerWithConfig(adapter, ledgerConfig, logger)
+
+	cleanup := func() {
+		ledger.Close()
+		os.RemoveAll(tmpDir)
+	}
+
+	return ledger, cleanup
+}
+
+func createTestAccount(id string) *common.Account {
+	account, _ := common.NewAccount(id, []byte("test_public_key_"+id))
+	account.Balance = 1000.0
+	return account
+}
+
+func createTestTransaction(sender, receiver string, amount float64) common.Transaction {
+	return common.Transaction{
+		ID:        common.GenerateUniqueID(),
+		Sender:    sender,
+		Receiver:  receiver,
+		Amount:    amount,
+		Fee:       0.1,
+		Timestamp: common.GetCurrentTimestamp(),
+		Signature: []byte("test_signature"),
+		Nonce:     1,
+		Status:    "pending",
+	}
+}
+
+func createTestBlock(number int, txs []common.Transaction) common.Block {
+	block := common.Block{
+		Number:       number,
+		PreviousHash: "previous_hash",
+		Timestamp:    common.GetCurrentTimestamp(),
+		Validator:    "test_validator",
+		Transactions: txs,
+		Data:         []byte("test_block_data"),
+	}
+	block.Hash = common.ComputeBlockHash(block)
+	return block
+}
+
+// Test Account Operations
+func TestLMDBLedger_CreateAccount(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	tests := []struct {
+		name    string
+		account *common.Account
+		wantErr bool
+		errType apperrors.Code
+	}{
+		{
+			name:    "Valid account creation",
+			account: createTestAccount("test_account_1"),
+			wantErr: false,
+		},
+		{
+			name:    "Nil account",
+			account: nil,
+			wantErr: true,
+			errType: apperrors.CodeInvalid,
+		},
+		{
+			name: "Invalid account - empty ID",
+			account: &common.Account{
+				ID:        "",
+				PublicKey: []byte("test_key"),
+				Balance:   100.0,
+			},
+			wantErr: true,
+			errType: apperrors.CodeInvalid,
+		},
+		{
+			name: "Invalid account - negative balance",
+			account: &common.Account{
+				ID:        "test_negative",
+				PublicKey: []byte("test_key"),
+				Balance:   -100.0,
+			},
+			wantErr: true,
+			errType: apperrors.CodeInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ledger.CreateAccount(tt.account)
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errType != "" {
+					assert.True(t, apperrors.Is(err, tt.errType))
+				}
+			} else {
+				assert.NoError(t, err)
+
+				// Verify account was created
+				balance, err := ledger.GetBalance(tt.account.ID)
+				assert.NoError(t, err)
+				assert.Equal(t, tt.account.Balance, balance)
+			}
+		})
+	}
+}
+
+func TestLMDBLedger_UpdateAccount(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Create initial account
+	account := createTestAccount("test_update")
+	err := ledger.CreateAccount(account)
+	require.NoError(t, err)
+
+	// Update account
+	account.Balance = 2000.0
+	err = ledger.UpdateAccount(account)
+	assert.NoError(t, err)
+
+	// Verify update
+	balance, err := ledger.GetBalance(account.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, 2000.0, balance)
+}
+
+func TestLMDBLedger_GetBalance(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Test non-existent account
+	_, err := ledger.GetBalance("non_existent")
+	assert.Error(t, err)
+	assert.True(t, apperrors.Is(err, apperrors.CodeNotFound))
+
+	// Create and test existing account
+	account := createTestAccount("test_balance")
+	err = ledger.CreateAccount(account)
+	require.NoError(t, err)
+
+	balance, err := ledger.GetBalance(account.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, account.Balance, balance)
+
+	// Test invalid address
+	_, err = ledger.GetBalance("")
+	assert.Error(t, err)
+	assert.True(t, apperrors.Is(err, apperrors.CodeInvalid))
+}
+
+func TestLMDBLedger_UpdateAccountBalance(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Create test account
+	account := createTestAccount("test_balance_update")
+	err := ledger.CreateAccount(account)
+	require.NoError(t, err)
+
+	tests := []struct {
+		name            string
+		amount          float64
+		expectedBalance float64
+		wantErr         bool
+		errType         apperrors.Code
+	}{
+		{
+			name:            "Add positive amount",
+			amount:          500.0,
+			expectedBalance: 1500.0,
+			wantErr:         false,
+		},
+		{
+			name:            "Subtract valid amount",
+			amount:          -300.0,
+			expectedBalance: 1200.0,
+			wantErr:         false,
+		},
+		{
+			name:    "Insufficient funds",
+			amount:  -2000.0,
+			wantErr: true,
+			errType: apperrors.CodeConflict,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ledger.UpdateAccountBalance(account.ID, tt.amount)
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errType != "" {
+					assert.True(t, apperrors.Is(err, tt.errType))
+				}
+			} else {
+				assert.NoError(t, err)
+
+				balance, err := ledger.GetBalance(account.ID)
+				assert.NoError(t, err)
+				assert.Equal(t, tt.expectedBalance, balance)
+			}
+		})
+	}
+}
+
+// Test Transaction Operations
+func TestLMDBLedger_AddTransaction(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	tests := []struct {
+		name    string
+		tx      common.Transaction
+		wantErr bool
+		errType apperrors.Code
+	}{
+		{
+			name:    "Valid transaction",
+			tx:      createTestTransaction("sender1", "receiver1", 100.0),
+			wantErr: false,
+		},
+		{
+			name: "Invalid transaction - negative amount",
+			tx: common.Transaction{
+				ID:       "invalid_tx",
+				Sender:   "sender1",
+				Receiver: "receiver1",
+				Amount:   -100.0,
+				Fee:      0.1,
+			},
+			wantErr: true,
+			errType: apperrors.CodeInvalid,
+		},
+		{
+			name: "Invalid transaction - empty sender",
+			tx: common.Transaction{
+				ID:       "invalid_tx2",
+				Sender:   "",
+				Receiver: "receiver1",
+				Amount:   100.0,
+				Fee:      0.1,
+			},
+			wantErr: true,
+			errType: apperrors.CodeInvalid,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ledger.AddTransaction(tt.tx)
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errType != "" {
+					assert.True(t, apperrors.Is(err, tt.errType))
+				}
+			} else {
+				assert.NoError(t, err)
+
+				// Verify transaction was added
+				retrieved, err := ledger.GetTransaction(tt.tx.ID)
+				assert.NoError(t, err)
+				assert.Equal(t, tt.tx.ID, retrieved.ID)
+				assert.Equal(t, tt.tx.Amount, retrieved.Amount)
+			}
+		})
+	}
+}
+
+func TestLMDBLedger_GetTransaction(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Test non-existent transaction
+	_, err := ledger.GetTransaction("non_existent")
+	assert.Error(t, err)
+	assert.True(t, apperrors.Is(err, apperrors.CodeNotFound))
+
+	// Add and retrieve transaction
+	tx := createTestTransaction("sender1", "receiver1", 100.0)
+	err = ledger.AddTransaction(tx)
+	require.NoError(t, err)
+
+	retrieved, err := ledger.GetTransaction(tx.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, tx.ID, retrieved.ID)
+	assert.Equal(t, tx.Amount, retrieved.Amount)
+	assert.Equal(t, tx.Sender, retrieved.Sender)
+	assert.Equal(t, tx.Receiver, retrieved.Receiver)
+}
+
+func TestLMDBLedger_IsTransactionCommitted(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Test non-existent transaction
+	committed := ledger.IsTransactionCommitted("non_existent")
+	assert.False(t, committed)
+
+	// Add pending transaction
+	tx := createTestTransaction("sender1", "receiver1", 100.0)
+	err := ledger.AddTransaction(tx)
+	require.NoError(t, err)
+
+	// Should not be committed yet
+	committed = ledger.IsTransactionCommitted(tx.ID)
+	assert.False(t, committed)
+
+	// Commit transaction in a block
+	block := createTestBlock(1, []common.Transaction{tx})
+	err = ledger.CommitBlock(block)
+	require.NoError(t, err)
+
+	// Should now be committed
+	committed = ledger.IsTransactionCommitted(tx.ID)
+	assert.True(t, committed)
+}
+
+// Test Block Operations
+func TestLMDBLedger_CommitBlock(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Create test transactions
+	tx1 := createTestTransaction("sender1", "receiver1", 100.0)
+	tx2 := createTestTransaction("sender2", "receiver2", 200.0)
+
+	// Create and commit block
+	block := createTestBlock(1, []common.Transaction{tx1, tx2})
+	err := ledger.CommitBlock(block)
+	assert.NoError(t, err)
+
+	// Verify block was committed
+	retrievedBlock, found := ledger.GetBlockByNumber(1)
+	assert.True(t, found)
+	assert.Equal(t, block.Number, retrievedBlock.Number)
+	assert.Equal(t, block.Hash, retrievedBlock.Hash)
+	assert.Len(t, retrievedBlock.Transactions, 2)
+
+	// Verify transactions are committed
+	assert.True(t, ledger.IsTransactionCommitted(tx1.ID))
+	assert.True(t, ledger.IsTransactionCommitted(tx2.ID))
+}
+
+func TestLMDBLedger_GetBlockHeight(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Initially should be 0
+	height, err := ledger.GetBlockHeight()
+	assert.NoError(t, err)
+	assert.Equal(t, 0, height)
+
+	// Commit some blocks
+	for i := 1; i <= 3; i++ {
+		block := createTestBlock(i, []common.Transaction{})
+		err := ledger.CommitBlock(block)
+		require.NoError(t, err)
+	}
+
+	// Should now be 3
+	height, err = ledger.GetBlockHeight()
+	assert.NoError(t, err)
+	assert.Equal(t, 3, height)
+}
+
+func TestLMDBLedger_GetBlocksByRange(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Commit some blocks
+	for i := 1; i <= 5; i++ {
+		block := createTestBlock(i, []common.Transaction{})
+		err := ledger.CommitBlock(block)
+		require.NoError(t, err)
+	}
+
+	// Get range of blocks
+	blocks, err := ledger.GetBlocksByRange(2, 4)
+	assert.NoError(t, err)
+	assert.Len(t, blocks, 3)
+	assert.Equal(t, 2, blocks[0].Number)
+	assert.Equal(t, 3, blocks[1].Number)
+	assert.Equal(t, 4, blocks[2].Number)
+}
+
+// Test Smart Contract Operations
+func TestLMDBLedger_SmartContractOperations(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Create test contract
+	contract := &common.SmartContract{
+		ID:        "test_contract",
+		Code:      "test_code",
+		CodeHash:  common.HashData([]byte("test_code")),
+		Owner:     "test_owner",
+		Version:   "1.0",
+		Language:  "EVM",
+		State:     make(map[string]interface{}),
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	// Deploy contract
+	err := ledger.DeploySmartContract(contract)
+	assert.NoError(t, err)
+
+	// Test contract execution - set value
+	result, err := ledger.ExecuteSmartContract(
+		contract.ID,
+		"set",
+		"test_sender",
+		map[string]interface{}{
+			"key":   "test_key",
+			"value": "test_value",
+		},
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, true, result)
+
+	// Test contract execution - get value
+	result, err = ledger.ExecuteSmartContract(
+		contract.ID,
+		"get",
+		"test_sender",
+		map[string]interface{}{
+			"key": "test_key",
+		},
+	)
+	assert.NoError(t, err)
+	assert.Equal(t, "test_value", result)
+
+	// Update contract
+	err = ledger.UpdateSmartContract(contract.ID, "new_code", "2.0")
+	assert.NoError(t, err)
+
+	// Remove contract
+	err = ledger.RemoveSmartContract(contract.ID)
+	assert.NoError(t, err)
+}
+
+// Test Error Handling and Edge Cases
+func TestLMDBLedger_ErrorHandling(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Test operations on closed ledger
+	err := ledger.Close()
+	require.NoError(t, err)
+
+	err = ledger.CreateAccount(createTestAccount("test"))
+	assert.Error(t, err)
+	assert.True(t, apperrors.Is(err, apperrors.CodeUnavailable))
+
+	_, err = ledger.GetBalance("test")
+	assert.Error(t, err)
+	assert.True(t, apperrors.Is(err, apperrors.CodeUnavailable))
+
+	err = ledger.AddTransaction(createTestTransaction("s", "r", 100))
+	assert.Error(t, err)
+	assert.True(t, apperrors.Is(err, apperrors.CodeUnavailable))
+}
+
+// Test Concurrency Safety
+func TestLMDBLedger_ConcurrentOperations(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Create test account
+	account := createTestAccount("concurrent_test")
+	err := ledger.CreateAccount(account)
+	require.NoError(t, err)
+
+	// Perform concurrent balance updates
+	done := make(chan bool, 10)
+	for i := 0; i < 10; i++ {
+		go func(amount float64) {
+			defer func() { done <- true }()
+			err := ledger.UpdateAccountBalance(account.ID, amount)
+			assert.NoError(t, err)
+		}(10.0)
+	}
+
+	// Wait for all goroutines
+	for i := 0; i < 10; i++ {
+		<-done
+	}
+
+	// Check final balance
+	balance, err := ledger.GetBalance(account.ID)
+	assert.NoError(t, err)
+	assert.Equal(t, 1100.0, balance) // 1000 + (10 * 10)
+}
+
+// Test Health Check and Stats
+func TestLMDBLedger_HealthAndStats(t *testing.T) {
+	ledger, cleanup := setupTestLMDBLedger(t)
+	defer cleanup()
+
+	// Test health check
+	ctx := context.Background()
+	err := ledger.HealthCheck(ctx)
+	assert.NoError(t, err)
+
+	// Test integrity check
+	err = ledger.IntegrityCheck()
+	assert.NoError(t, err)
+
+	// Test stats
+	stats, err := ledger.GetStats()
+	assert.NoError(t, err)
+	assert.NotNil(t, stats)
+}
+
+// Benchmark Tests
+func BenchmarkLMDBLedger_CreateAccount(b *testing.B) {
+	ledger, cleanup := setupTestLMDBLedger(&testing.T{})
+	defer cleanup()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		account := createTestAccount(string(rune(i)))
+		ledger.CreateAccount(account)
+	}
+}
+
+func BenchmarkLMDBLedger_AddTransaction(b *testing.B) {
+	ledger, cleanup := setupTestLMDBLedger(&testing.T{})
+	defer cleanup()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tx := createTestTransaction("sender", "receiver", 100.0)
+		ledger.AddTransaction(tx)
+	}
+}
+
+func BenchmarkLMDBLedger_GetBalance(b *testing.B) {
+	ledger, cleanup := setupTestLMDBLedger(&testing.T{})
+	defer cleanup()
+
+	// Setup test account
+	account := createTestAccount("benchmark_account")
+	ledger.CreateAccount(account)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ledger.GetBalance(account.ID)
+	}
+}
+
+func BenchmarkLMDBLedger_UpdateAccountBalance(b *testing.B) {
+	ledger, cleanup := setupTestLMDBLedger(&testing.T{})
+	defer cleanup()
+
+	// Setup test account
+	account := createTestAccount("benchmark_balance")
+	ledger.CreateAccount(account)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ledger.UpdateAccountBalance(account.ID, 1.0)
+	}
+}

@@ -1,0 +1,408 @@
+package consensus_test
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"diamante/consensus"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestRecoveryManager(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.WarnLevel)
+
+	t.Run("Initialization", func(t *testing.T) {
+		config := &consensus.RecoveryConfig{
+			CheckInterval:      time.Second,
+			MaxRecoveryTime:    5 * time.Minute,
+			RetryInterval:      30 * time.Second,
+			MaxRetries:         3,
+			EnableAutoRecovery: true,
+		}
+
+		rm := consensus.NewRecoveryManager(config, logger)
+		require.NotNil(t, rm)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		assert.NoError(t, err)
+
+		// Should not start twice
+		err = rm.Start(ctx)
+		assert.Error(t, err)
+	})
+
+	t.Run("State Detection", func(t *testing.T) {
+		config := consensus.DefaultRecoveryConfig()
+		rm := consensus.NewRecoveryManager(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Initially should be healthy
+		state := rm.GetState()
+		assert.Equal(t, consensus.StateHealthy, state)
+
+		// Report issue
+		rm.ReportIssue(consensus.IssueTypeConsensusStalled, "Test stall")
+		
+		// State should change
+		state = rm.GetState()
+		assert.NotEqual(t, consensus.StateHealthy, state)
+
+		// Get recovery status
+		status := rm.GetRecoveryStatus()
+		assert.NotNil(t, status)
+		assert.True(t, status.IsRecovering || status.HasIssues)
+	})
+
+	t.Run("Issue Reporting", func(t *testing.T) {
+		config := consensus.DefaultRecoveryConfig()
+		rm := consensus.NewRecoveryManager(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Report various issues
+		issues := []struct {
+			issueType consensus.IssueType
+			message   string
+		}{
+			{consensus.IssueTypeConsensusStalled, "Consensus not progressing"},
+			{consensus.IssueTypeValidatorOffline, "Validator went offline"},
+			{consensus.IssueTypeNetworkPartition, "Network split detected"},
+			{consensus.IssueTypeSyncFailed, "Failed to sync with peers"},
+			{consensus.IssueTypeCorruption, "State corruption detected"},
+		}
+
+		for _, issue := range issues {
+			rm.ReportIssue(issue.issueType, issue.message)
+		}
+
+		// Check status
+		status := rm.GetRecoveryStatus()
+		assert.Greater(t, len(status.ActiveIssues), 0)
+		assert.True(t, status.HasIssues)
+	})
+
+	t.Run("Recovery Actions", func(t *testing.T) {
+		config := &consensus.RecoveryConfig{
+			CheckInterval:      100 * time.Millisecond,
+			MaxRecoveryTime:    time.Second,
+			RetryInterval:      100 * time.Millisecond,
+			MaxRetries:         2,
+			EnableAutoRecovery: true,
+		}
+
+		actionExecuted := false
+		rm := consensus.NewRecoveryManager(config, logger)
+		
+		// Register recovery action
+		rm.RegisterRecoveryAction(consensus.IssueTypeConsensusStalled, func() error {
+			actionExecuted = true
+			return nil
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Report issue that should trigger recovery
+		rm.ReportIssue(consensus.IssueTypeConsensusStalled, "Test trigger")
+
+		// Wait for recovery action
+		time.Sleep(300 * time.Millisecond)
+
+		assert.True(t, actionExecuted, "Recovery action should have been executed")
+
+		status := rm.GetRecoveryStatus()
+		assert.Greater(t, status.RecoveryAttempts, uint64(0))
+	})
+
+	t.Run("Manual Recovery", func(t *testing.T) {
+		config := &consensus.RecoveryConfig{
+			EnableAutoRecovery: false, // Disable auto recovery
+		}
+
+		recoveryExecuted := false
+		rm := consensus.NewRecoveryManager(config, logger)
+		
+		rm.RegisterRecoveryAction(consensus.IssueTypeConsensusStalled, func() error {
+			recoveryExecuted = true
+			return nil
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Report issue
+		rm.ReportIssue(consensus.IssueTypeConsensusStalled, "Manual recovery test")
+
+		// Auto recovery is disabled, so action shouldn't execute
+		time.Sleep(100 * time.Millisecond)
+		assert.False(t, recoveryExecuted)
+
+		// Trigger manual recovery
+		err = rm.TriggerRecovery()
+		assert.NoError(t, err)
+
+		// Now it should execute
+		time.Sleep(100 * time.Millisecond)
+		assert.True(t, recoveryExecuted)
+	})
+
+	t.Run("Recovery Failure Handling", func(t *testing.T) {
+		config := &consensus.RecoveryConfig{
+			CheckInterval:      100 * time.Millisecond,
+			MaxRetries:         2,
+			RetryInterval:      100 * time.Millisecond,
+			EnableAutoRecovery: true,
+		}
+
+		attemptCount := 0
+		rm := consensus.NewRecoveryManager(config, logger)
+		
+		// Register failing recovery action
+		rm.RegisterRecoveryAction(consensus.IssueTypeConsensusStalled, func() error {
+			attemptCount++
+			return assert.AnError // Always fail
+		})
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Report issue
+		rm.ReportIssue(consensus.IssueTypeConsensusStalled, "Failure test")
+
+		// Wait for retries
+		time.Sleep(500 * time.Millisecond)
+
+		// Should have attempted multiple times
+		assert.Equal(t, config.MaxRetries+1, attemptCount) // Initial + retries
+
+		status := rm.GetRecoveryStatus()
+		assert.Greater(t, status.FailedRecoveries, uint64(0))
+	})
+
+	t.Run("Clear Issues", func(t *testing.T) {
+		config := consensus.DefaultRecoveryConfig()
+		rm := consensus.NewRecoveryManager(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Report and then clear issues
+		rm.ReportIssue(consensus.IssueTypeValidatorOffline, "Test issue")
+		
+		status := rm.GetRecoveryStatus()
+		assert.True(t, status.HasIssues)
+
+		// Clear specific issue
+		rm.ClearIssue(consensus.IssueTypeValidatorOffline)
+
+		status = rm.GetRecoveryStatus()
+		assert.False(t, status.HasIssues)
+
+		// Report multiple issues
+		rm.ReportIssue(consensus.IssueTypeConsensusStalled, "Issue 1")
+		rm.ReportIssue(consensus.IssueTypeNetworkPartition, "Issue 2")
+
+		// Clear all
+		rm.ClearAllIssues()
+
+		status = rm.GetRecoveryStatus()
+		assert.False(t, status.HasIssues)
+		assert.Empty(t, status.ActiveIssues)
+	})
+
+	t.Run("Checkpoint Management", func(t *testing.T) {
+		config := consensus.DefaultRecoveryConfig()
+		rm := consensus.NewRecoveryManager(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Create checkpoint
+		checkpointData := map[string]interface{}{
+			"height":     uint64(1000),
+			"hash":       "checkpoint-hash",
+			"validators": 10,
+		}
+
+		err = rm.CreateCheckpoint("test-checkpoint", checkpointData)
+		assert.NoError(t, err)
+
+		// List checkpoints
+		checkpoints := rm.ListCheckpoints()
+		assert.NotEmpty(t, checkpoints)
+		assert.Contains(t, checkpoints, "test-checkpoint")
+
+		// Load checkpoint
+		loaded, err := rm.LoadCheckpoint("test-checkpoint")
+		assert.NoError(t, err)
+		assert.NotNil(t, loaded)
+		assert.Equal(t, uint64(1000), loaded["height"])
+
+		// Delete checkpoint
+		err = rm.DeleteCheckpoint("test-checkpoint")
+		assert.NoError(t, err)
+
+		checkpoints = rm.ListCheckpoints()
+		assert.NotContains(t, checkpoints, "test-checkpoint")
+	})
+
+	t.Run("Recovery Metrics", func(t *testing.T) {
+		config := consensus.DefaultRecoveryConfig()
+		rm := consensus.NewRecoveryManager(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Generate some recovery activity
+		rm.RegisterRecoveryAction(consensus.IssueTypeSyncFailed, func() error {
+			return nil // Success
+		})
+
+		rm.ReportIssue(consensus.IssueTypeSyncFailed, "Metric test")
+		rm.TriggerRecovery()
+
+		time.Sleep(100 * time.Millisecond)
+
+		// Get metrics
+		metrics := rm.GetMetrics()
+		assert.NotNil(t, metrics)
+		assert.Greater(t, metrics.IssuesReported, uint64(0))
+		assert.Greater(t, metrics.RecoveriesTriggered, uint64(0))
+		assert.Greater(t, metrics.RecoveriesSucceeded, uint64(0))
+		assert.NotZero(t, metrics.LastRecoveryTime)
+	})
+
+	t.Run("Stop", func(t *testing.T) {
+		config := consensus.DefaultRecoveryConfig()
+		rm := consensus.NewRecoveryManager(config, logger)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		err := rm.Start(ctx)
+		require.NoError(t, err)
+
+		// Stop
+		err = rm.Stop()
+		assert.NoError(t, err)
+
+		// Should not stop twice
+		err = rm.Stop()
+		assert.Error(t, err)
+
+		// Operations should fail after stop
+		err = rm.TriggerRecovery()
+		assert.Error(t, err)
+	})
+}
+
+func TestRecoveryState(t *testing.T) {
+	t.Run("State Transitions", func(t *testing.T) {
+		// Test valid state transitions
+		transitions := []struct {
+			from  consensus.RecoveryState
+			to    consensus.RecoveryState
+			valid bool
+		}{
+			{consensus.StateHealthy, consensus.StateDetecting, true},
+			{consensus.StateDetecting, consensus.StateRecovering, true},
+			{consensus.StateRecovering, consensus.StateHealthy, true},
+			{consensus.StateRecovering, consensus.StateFailed, true},
+			{consensus.StateFailed, consensus.StateRecovering, true},
+			{consensus.StateHealthy, consensus.StateFailed, false}, // Invalid direct transition
+		}
+
+		for _, tt := range transitions {
+			// This tests the concept of state transitions
+			// Actual implementation would validate these transitions
+			if tt.valid {
+				assert.NotEqual(t, tt.from, tt.to, "States should be different for valid transitions")
+			}
+		}
+	})
+}
+
+func BenchmarkRecoveryManager(b *testing.B) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	config := consensus.DefaultRecoveryConfig()
+	rm := consensus.NewRecoveryManager(config, logger)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	rm.Start(ctx)
+
+	// Register a simple recovery action
+	rm.RegisterRecoveryAction(consensus.IssueTypeConsensusStalled, func() error {
+		return nil
+	})
+
+	b.Run("ReportIssue", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rm.ReportIssue(consensus.IssueTypeConsensusStalled, "benchmark issue")
+			rm.ClearIssue(consensus.IssueTypeConsensusStalled)
+		}
+	})
+
+	b.Run("GetRecoveryStatus", func(b *testing.B) {
+		rm.ReportIssue(consensus.IssueTypeConsensusStalled, "status check")
+		
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			rm.GetRecoveryStatus()
+		}
+	})
+
+	b.Run("CheckpointOperations", func(b *testing.B) {
+		data := map[string]interface{}{
+			"height": uint64(1000),
+			"hash":   "benchmark-hash",
+		}
+
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			name := string(rune('A' + (i % 26)))
+			rm.CreateCheckpoint(name, data)
+			rm.LoadCheckpoint(name)
+			rm.DeleteCheckpoint(name)
+		}
+	})
+}

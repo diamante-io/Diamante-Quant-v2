@@ -1,6 +1,6 @@
-// consensus/diamantefinality/finality/dag.go
+// consensus/diamantefinality/dag.go
 
-package finality
+package diamantefinality
 
 import (
 	"crypto/sha256"
@@ -12,8 +12,8 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
+	"diamante/common"
 	"diamante/consensus/types"
 )
 
@@ -134,7 +134,7 @@ func (d *DAG) NewEvent(
 	// Construct the event.
 	event := &types.Event{
 		ParentIDs: parentIDs,
-		Timestamp: time.Now(),
+		Timestamp: common.ConsensusNow(),
 		Data:      data,
 		Creator:   creator,
 		Height:    height,

@@ -1,0 +1,120 @@
+//go:build windows
+// +build windows
+
+package storage
+
+import (
+	"errors"
+	"github.com/sirupsen/logrus"
+)
+
+// LMDBConfig placeholder for disabled builds
+type LMDBConfig struct {
+	Path           string
+	MapSize        int64
+	MaxReaders     uint
+	MaxDbs         uint
+	NoSync         bool
+	NoMetaSync     bool
+	ReadOnly       bool
+	WriteMap       bool
+	MapAsync       bool
+	NoTLS          bool
+	NoLock         bool
+	NoReadahead    bool
+	NoMemInit      bool
+	AutoResize     bool
+	ResizeFactor   float64
+	Debug          bool
+}
+
+// DefaultLMDBConfig returns default config with LMDB disabled
+func DefaultLMDBConfig() *LMDBConfig {
+	return &LMDBConfig{
+		Path:         "data/lmdb_disabled",
+		MapSize:      1024 * 1024 * 1024, // 1GB
+		MaxReaders:   126,
+		MaxDbs:       8,
+		AutoResize:   true,
+		ResizeFactor: 1.5,
+	}
+}
+
+// LMDBAdapter placeholder for disabled builds
+type LMDBAdapter struct {
+	logger *logrus.Logger
+}
+
+// NewLMDBAdapter returns an error on Windows
+func NewLMDBAdapter(config *LMDBConfig, logger *logrus.Logger, cacheSize int) (*LMDBAdapter, error) {
+	return nil, errors.New("LMDB is not supported on Windows builds - please use MongoDB or SQLite adapter instead")
+}
+
+// Placeholder methods that return errors
+func (la *LMDBAdapter) Close() error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) Put(key, value []byte) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) Get(key []byte) ([]byte, error) {
+	return nil, errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) Delete(key []byte) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) HasKey(key []byte) (bool, error) {
+	return false, errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) BatchPut(items []BatchItem) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) CreateSnapshot() (SnapshotReader, error) {
+	return nil, errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) PrefixScan(prefix []byte, callback ScanCallback) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) RangeScan(start, end []byte, callback ScanCallback) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) GetDBStats() (map[string]interface{}, error) {
+	return nil, errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) CompactDB() error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) EstimateSize(start, end []byte) (uint64, error) {
+	return 0, errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) GetProperty(property string) (string, error) {
+	return "", errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) NewIterator(startKey []byte) (Iterator, error) {
+	return nil, errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) Backup(path string) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) Restore(path string) error {
+	return errors.New("LMDB not available on Windows")
+}
+
+func (la *LMDBAdapter) GetVersion() string {
+	return "disabled"
+}

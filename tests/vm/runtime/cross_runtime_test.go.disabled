@@ -1,0 +1,625 @@
+// Package runtime_test provides cross-runtime integration tests
+package runtime_test
+
+import (
+	"context"
+	"diamante/common"
+	"diamante/storage"
+	"diamante/vm/runtime"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestCrossRuntimeEventPropagation tests event propagation between runtimes
+func TestCrossRuntimeEventPropagation(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	// Create runtime manager
+	ledgerAPI := &mockLedgerAPI{}
+	stateStore := &crossRuntimeMockStateStore{state: make(map[string][]byte)}
+	manager := runtime.NewRuntimeManager(ledgerAPI, stateStore, logger)
+	err := manager.Initialize()
+	require.NoError(t, err)
+
+	// Create event bus
+	eventBus := NewUnifiedEventBus(logger)
+	err = eventBus.Start()
+	require.NoError(t, err)
+	defer eventBus.Stop()
+
+	// Test event subscriber
+	received := make(chan ContractEvent, 10)
+	subscriber := &testEventSubscriber{
+		id: "test-subscriber",
+		handler: func(event ContractEvent) error {
+			received <- event
+			return nil
+		},
+	}
+
+	// Subscribe to cross-runtime events
+	err = eventBus.SubscribeCrossRuntime(subscriber)
+	require.NoError(t, err)
+
+	// Publish event from EVM runtime
+	evmEvent := ContractEvent{
+		ContractID: "0x1234567890abcdef1234567890abcdef12345678",
+		Name:       "TokenTransfer",
+		Parameters: map[string]interface{}{
+			"from":         "0xaaaa",
+			"to":           "0xbbbb",
+			"amount":       "1000",
+			"crossRuntime": true,
+		},
+		BlockNumber:     100,
+		TransactionHash: "0xdeadbeef",
+	}
+
+	err = eventBus.PublishEvent(evmEvent)
+	require.NoError(t, err)
+
+	// Wait for event delivery
+	select {
+	case receivedEvent := <-received:
+		assert.Equal(t, evmEvent.Name, receivedEvent.Name)
+		assert.Equal(t, evmEvent.ContractID, receivedEvent.ContractID)
+		assert.True(t, receivedEvent.Parameters["crossRuntime"].(bool))
+	case <-time.After(1 * time.Second):
+		t.Fatal("Event not received within timeout")
+	}
+
+	// Verify metrics
+	metrics := eventBus.GetMetrics()
+	assert.Equal(t, uint64(1), metrics.EventsReceived)
+	assert.Equal(t, uint64(1), metrics.EventsDelivered)
+	assert.Equal(t, uint64(0), metrics.EventsDropped)
+}
+
+// TestCrossRuntimeStateAccess tests state access across runtimes
+func TestCrossRuntimeStateAccess(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	// Create shared state store
+	stateStore := &crossRuntimeMockStateStore{
+		state: make(map[string][]byte),
+	}
+
+	// Create runtime manager
+	ledgerAPI := &mockLedgerAPI{}
+	manager := runtime.NewRuntimeManager(ledgerAPI, stateStore, logger)
+	err := manager.Initialize()
+	require.NoError(t, err)
+
+	// Create state manager
+	stateManager := NewDefaultStateManager(stateStore, logger)
+
+	// Set state from one runtime
+	contractID1 := "contract-evm"
+	key1 := []byte("shared-key")
+	value1 := []byte("value-from-evm")
+
+	err = stateManager.SetState(contractID1, key1, value1)
+	require.NoError(t, err)
+
+	// Read state from another runtime context
+	contractID2 := "contract-native"
+
+	// Verify isolation - different contracts can't access each other's state
+	value, err := stateManager.GetState(contractID2, key1)
+	require.NoError(t, err)
+	assert.Nil(t, value)
+
+	// But the original contract can read its own state
+	value, err = stateManager.GetState(contractID1, key1)
+	require.NoError(t, err)
+	assert.Equal(t, value1, value)
+
+	// Test cross-runtime state sharing with explicit permission
+	sharedKey := []byte("crossruntime:shared-data")
+	sharedValue := []byte(`{"source":"evm","data":"shared"}`)
+
+	// Write to a cross-runtime namespace
+	err = stateManager.SetState("crossruntime", sharedKey, sharedValue)
+	require.NoError(t, err)
+
+	// Both runtimes can read from cross-runtime namespace
+	value, err = stateManager.GetState("crossruntime", sharedKey)
+	require.NoError(t, err)
+	assert.Equal(t, sharedValue, value)
+}
+
+// TestRuntimeIsolation tests that runtimes are properly isolated
+func TestRuntimeIsolation(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	// Create runtime registry
+	registry := NewRuntimeRegistry(logger)
+
+	// Register mock runtimes
+	evmFactory := func() Runtime {
+		return &mockRuntime{runtimeType: RuntimeTypeEVM, healthy: true}
+	}
+	nativeFactory := func() Runtime {
+		return &mockRuntime{runtimeType: RuntimeTypeNative, healthy: true}
+	}
+
+	err := registry.RegisterRuntime(RuntimeTypeEVM, evmFactory)
+	require.NoError(t, err)
+
+	err = registry.RegisterRuntime(RuntimeTypeNative, nativeFactory)
+	require.NoError(t, err)
+
+	// Create separate runtime instances
+	evmRuntime, err := registry.CreateRuntime(RuntimeTypeEVM)
+	require.NoError(t, err)
+
+	nativeRuntime, err := registry.CreateRuntime(RuntimeTypeNative)
+	require.NoError(t, err)
+
+	// Verify they are different instances
+	assert.NotEqual(t, evmRuntime, nativeRuntime)
+	assert.Equal(t, RuntimeTypeEVM, evmRuntime.Type())
+	assert.Equal(t, RuntimeTypeNative, nativeRuntime.Type())
+
+	// Test concurrent execution
+	var wg sync.WaitGroup
+	errors := make(chan error, 10)
+
+	// Execute in EVM runtime
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx := context.Background()
+		result, err := evmRuntime.Execute(ctx, ContractCall{
+			ContractID: "evm-contract",
+			Function:   "test",
+			GasLimit:   100000,
+		})
+		if err != nil {
+			errors <- err
+			return
+		}
+		assert.True(t, result.Success)
+	}()
+
+	// Execute in Native runtime
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		ctx := context.Background()
+		result, err := nativeRuntime.Execute(ctx, ContractCall{
+			ContractID: "native-contract",
+			Function:   "test",
+			GasLimit:   100000,
+		})
+		if err != nil {
+			errors <- err
+			return
+		}
+		assert.True(t, result.Success)
+	}()
+
+	// Wait for completion
+	wg.Wait()
+	close(errors)
+
+	// Check for errors
+	for err := range errors {
+		t.Errorf("Execution error: %v", err)
+	}
+}
+
+// TestResourceLimitEnforcement tests resource limits are enforced
+func TestResourceLimitEnforcement(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	// Create resource manager with low limits
+	resourceManager := NewResourceManager(2, logger) // Max 2 concurrent
+
+	// Test resource acquisition
+	contract1 := "contract1"
+	contract2 := "contract2"
+	contract3 := "contract3"
+
+	// Acquire resources for first two contracts
+	err := resourceManager.AcquireResources(contract1, ResourceRequirements{
+		MemoryMB: 100,
+		CPUCores: 0.5,
+	})
+	require.NoError(t, err)
+
+	err = resourceManager.AcquireResources(contract2, ResourceRequirements{
+		MemoryMB: 100,
+		CPUCores: 0.5,
+	})
+	require.NoError(t, err)
+
+	// Third should timeout
+	err = resourceManager.AcquireResources(contract3, ResourceRequirements{
+		MemoryMB: 100,
+		CPUCores: 0.5,
+	})
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+
+	// Release one and try again
+	resourceManager.ReleaseResources(contract1)
+
+	err = resourceManager.AcquireResources(contract3, ResourceRequirements{
+		MemoryMB: 100,
+		CPUCores: 0.5,
+	})
+	assert.NoError(t, err)
+
+	// Verify metrics
+	metrics := resourceManager.GetMetrics()
+	assert.Equal(t, 2, metrics["active_contracts"])
+	assert.Equal(t, 2, metrics["max_concurrency"])
+
+	// Clean up
+	resourceManager.ReleaseResources(contract2)
+	resourceManager.ReleaseResources(contract3)
+}
+
+// TestFailoverScenarios tests failover between runtimes
+func TestFailoverScenarios(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.DebugLevel)
+
+	// Create runtime manager
+	ledgerAPI := &mockLedgerAPI{}
+	stateStore := &crossRuntimeMockStateStore{state: make(map[string][]byte)}
+	manager := runtime.NewRuntimeManager(ledgerAPI, stateStore, logger)
+	err := manager.Initialize()
+	require.NoError(t, err)
+
+	// Register a healthy runtime
+	healthyRuntime := &mockRuntime{
+		runtimeType: RuntimeTypeEVM,
+		healthy:     true,
+	}
+	manager.runtimes[RuntimeTypeEVM] = healthyRuntime
+
+	// Execute should succeed
+	ctx := context.Background()
+	call := ContractCall{
+		ContractID: "test-contract",
+		Function:   "test",
+		GasLimit:   100000,
+	}
+
+	result, err := manager.ExecuteContract(ctx, call)
+	require.NoError(t, err)
+	assert.True(t, result.Success)
+
+	// Make runtime unhealthy
+	healthyRuntime.healthy = false
+
+	// Execute should fail
+	_, err = manager.ExecuteContract(ctx, call)
+	assert.Error(t, err)
+
+	// Make runtime healthy again
+	healthyRuntime.healthy = true
+
+	// Execute should succeed after recovery
+	result, err = manager.ExecuteContract(ctx, call)
+	require.NoError(t, err)
+	assert.True(t, result.Success)
+}
+
+// TestEventDeliveryResilience tests event delivery under stress
+func TestEventDeliveryResilience(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel) // Reduce log noise
+
+	// Create event bus
+	eventBus := NewUnifiedEventBus(logger)
+	err := eventBus.Start()
+	require.NoError(t, err)
+	defer eventBus.Stop()
+
+	// Create subscribers with different behaviors
+	var receivedCount sync.Map
+
+	// Normal subscriber
+	normalSub := &testEventSubscriber{
+		id: "normal",
+		handler: func(event ContractEvent) error {
+			receivedCount.Store("normal", true)
+			return nil
+		},
+	}
+
+	// Panicking subscriber
+	panicSub := &testEventSubscriber{
+		id: "panic",
+		handler: func(event ContractEvent) error {
+			receivedCount.Store("panic", true)
+			panic("test panic")
+		},
+	}
+
+	// Slow subscriber
+	slowSub := &testEventSubscriber{
+		id: "slow",
+		handler: func(event ContractEvent) error {
+			time.Sleep(10 * time.Second) // Longer than timeout
+			receivedCount.Store("slow", true)
+			return nil
+		},
+	}
+
+	// Subscribe all
+	eventBus.Subscribe(RuntimeTypeEVM, normalSub)
+	eventBus.Subscribe(RuntimeTypeEVM, panicSub)
+	eventBus.Subscribe(RuntimeTypeEVM, slowSub)
+
+	// Publish event
+	event := ContractEvent{
+		ContractID: "0x1234567890abcdef1234567890abcdef12345678",
+		Name:       "Test",
+		Parameters: map[string]interface{}{
+			"__runtime": "evm",
+		},
+	}
+
+	err = eventBus.PublishEvent(event)
+	require.NoError(t, err)
+
+	// Wait for processing
+	time.Sleep(1 * time.Second)
+
+	// Verify normal subscriber received event
+	_, normalReceived := receivedCount.Load("normal")
+	assert.True(t, normalReceived, "Normal subscriber should receive event")
+
+	// Verify panic was handled (event bus still running)
+	err = eventBus.PublishEvent(event)
+	assert.NoError(t, err, "Event bus should still be operational after panic")
+
+	// Check metrics
+	metrics := eventBus.GetMetrics()
+	assert.Greater(t, metrics.DeliveryFailures, uint64(0), "Should have delivery failures")
+}
+
+// TestConcurrentRuntimeOperations tests concurrent operations across runtimes
+func TestConcurrentRuntimeOperations(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	// Create runtime manager
+	ledgerAPI := &mockLedgerAPI{}
+	stateStore := &crossRuntimeMockStateStore{state: make(map[string][]byte)}
+	manager := runtime.NewRuntimeManager(ledgerAPI, stateStore, logger)
+	err := manager.Initialize()
+	require.NoError(t, err)
+
+	// Register multiple runtime instances
+	for _, rt := range []RuntimeType{RuntimeTypeEVM, RuntimeTypeNative, RuntimeTypeChaincode} {
+		runtime := &mockRuntime{
+			runtimeType: rt,
+			healthy:     true,
+		}
+		manager.runtimes[rt] = runtime
+	}
+
+	// Concurrent operations
+	const goroutines = 100
+	const operationsPerGoroutine = 10
+
+	var wg sync.WaitGroup
+	errors := make(chan error, goroutines*operationsPerGoroutine)
+	successCount := new(int32)
+
+	for i := 0; i < goroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			// Random runtime
+			runtimes := []RuntimeType{RuntimeTypeEVM, RuntimeTypeNative, RuntimeTypeChaincode}
+			runtime := runtimes[id%len(runtimes)]
+
+			for j := 0; j < operationsPerGoroutine; j++ {
+				// Deploy
+				language := "native"
+				if runtime == RuntimeTypeEVM {
+					language = "solidity"
+				} else if runtime == RuntimeTypeChaincode {
+					language = "chaincode"
+				}
+
+				deployArgs := DeploymentArgs{
+					Deployer: fmt.Sprintf("deployer-%d", id),
+					GasLimit: 1000000,
+				}
+
+				metadata := map[string]interface{}{
+					"name": fmt.Sprintf("contract-%d-%d", id, j),
+				}
+
+				deployResult, err := manager.DeployContract(
+					context.Background(),
+					language,
+					[]byte("test-code"),
+					deployArgs,
+					metadata,
+				)
+				if err != nil {
+					errors <- fmt.Errorf("deploy error: %w", err)
+					continue
+				}
+
+				// Execute
+				call := ContractCall{
+					ContractID: deployResult.ContractID,
+					Function:   "test",
+					Args:       []interface{}{id, j},
+					Caller:     fmt.Sprintf("caller-%d", id),
+					GasLimit:   100000,
+				}
+
+				execResult, err := manager.ExecuteContract(context.Background(), call)
+				if err != nil {
+					errors <- fmt.Errorf("execute error: %w", err)
+					continue
+				}
+
+				if execResult.Success {
+					atomic.AddInt32(successCount, 1)
+				}
+			}
+		}(i)
+	}
+
+	// Wait for completion
+	wg.Wait()
+	close(errors)
+
+	// Check errors
+	errorCount := 0
+	for err := range errors {
+		errorCount++
+		if errorCount < 10 { // Log first 10 errors
+			t.Logf("Operation error: %v", err)
+		}
+	}
+
+	// Verify success rate
+	totalOps := goroutines * operationsPerGoroutine
+	successRate := float64(atomic.LoadInt32(successCount)) / float64(totalOps)
+	assert.Greater(t, successRate, 0.9, "Success rate should be > 90%")
+
+	t.Logf("Success rate: %.2f%% (%d/%d)", successRate*100, atomic.LoadInt32(successCount), totalOps)
+}
+
+// Test helpers
+
+type testEventSubscriber struct {
+	id      string
+	handler func(ContractEvent) error
+	filters []EventFilter
+}
+
+func (s *testEventSubscriber) HandleEvent(event runtime.ContractEvent) error {
+	if s.handler != nil {
+		return s.handler(event)
+	}
+	return nil
+}
+
+func (s *testEventSubscriber) ID() string {
+	return s.id
+}
+
+func (s *testEventSubscriber) Filters() []runtime.EventFilter {
+	return s.filters
+}
+
+// crossRuntimeMockStateStore with thread-safe map (renamed to avoid conflict with registry_test.go)
+type crossRuntimeMockStateStore struct {
+	mu    sync.RWMutex
+	state map[string][]byte
+}
+
+func (m *crossRuntimeMockStateStore) GetState(key []byte) ([]byte, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if m.state == nil {
+		m.state = make(map[string][]byte)
+	}
+
+	value, exists := m.state[string(key)]
+	if !exists {
+		return nil, nil
+	}
+	return value, nil
+}
+
+func (m *crossRuntimeMockStateStore) SetState(key, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.state == nil {
+		m.state = make(map[string][]byte)
+	}
+
+	m.state[string(key)] = value
+	return nil
+}
+
+func (m *crossRuntimeMockStateStore) DeleteState(key []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.state == nil {
+		return nil
+	}
+
+	delete(m.state, string(key))
+	return nil
+}
+
+// LedgerStore interface implementation
+func (m *crossRuntimeMockStateStore) SaveBlock(block *common.Block) error           { return nil }
+func (m *crossRuntimeMockStateStore) GetBlock(height uint64) (*common.Block, error) { return nil, nil }
+func (m *crossRuntimeMockStateStore) GetBlockByHash(hash string) (*common.Block, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) GetBlockRange(startHeight, endHeight uint64) ([]*common.Block, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) GetLatestBlock() (*common.Block, error) { return nil, nil }
+func (m *crossRuntimeMockStateStore) SaveTransaction(tx *common.Transaction, blockHeight int) error {
+	return nil
+}
+func (m *crossRuntimeMockStateStore) GetTransaction(txID string) (*common.Transaction, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) GetTransactionsByAddress(address string, limit, offset int) ([]*common.Transaction, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) GetTransactionsByBlock(blockHeight uint64) ([]*common.Transaction, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) SaveAccount(account *common.Account) error { return nil }
+func (m *crossRuntimeMockStateStore) GetAccount(accountID string) (*common.Account, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) UpdateAccount(account *common.Account) error       { return nil }
+func (m *crossRuntimeMockStateStore) SaveContract(contract *common.SmartContract) error { return nil }
+func (m *crossRuntimeMockStateStore) GetContract(contractID string) (*common.SmartContract, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) UpdateContract(contract *common.SmartContract) error { return nil }
+func (m *crossRuntimeMockStateStore) DeleteContract(contractID string) error              { return nil }
+func (m *crossRuntimeMockStateStore) SaveReceipt(receipt *storage.Receipt) error          { return nil }
+func (m *crossRuntimeMockStateStore) GetReceipt(txID string) (*storage.Receipt, error) {
+	return nil, nil
+}
+func (m *crossRuntimeMockStateStore) CreateSnapshot(height uint64) error             { return nil }
+func (m *crossRuntimeMockStateStore) RestoreSnapshot(height uint64) error            { return nil }
+func (m *crossRuntimeMockStateStore) ListSnapshots() ([]storage.SnapshotInfo, error) { return nil, nil }
+func (m *crossRuntimeMockStateStore) BatchWrite(batch *storage.WriteBatch) error     { return nil }
+func (m *crossRuntimeMockStateStore) Compact() error                                 { return nil }
+func (m *crossRuntimeMockStateStore) Backup(path string) error                       { return nil }
+func (m *crossRuntimeMockStateStore) Restore(path string) error                      { return nil }
+func (m *crossRuntimeMockStateStore) PruneData(olderThan time.Time) error            { return nil }
+func (m *crossRuntimeMockStateStore) Vacuum() error                                  { return nil }
+func (m *crossRuntimeMockStateStore) Open() error                                    { return nil }
+func (m *crossRuntimeMockStateStore) Close() error                                   { return nil }
+func (m *crossRuntimeMockStateStore) HealthCheck(ctx context.Context) error          { return nil }
+func (m *crossRuntimeMockStateStore) GetStats() (map[string]interface{}, error)      { return nil, nil }

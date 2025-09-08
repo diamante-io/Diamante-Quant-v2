@@ -1,0 +1,480 @@
+package api_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"diamante/api"
+	"diamante/types"
+
+	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestAPI_HandleSubmitTransaction(t *testing.T) {
+	apiServer, mockStore, _, mockLed, mockTxPool, _ := setupTestAPI(t)
+
+	testTx := types.Transaction{
+		Hash:      "0xtx123",
+		From:      "0xfrom",
+		To:        "0xto",
+		Amount:    1000,
+		Fee:       10,
+		Nonce:     1,
+		Timestamp: time.Now().Unix(),
+		Signature: "0xsig",
+	}
+
+	// Setup mocks
+	mockTxPool.On("ValidateTransaction", testTx).Return(nil)
+	mockTxPool.On("AddTransaction", testTx).Return(nil)
+	mockLed.On("GetAccount", "0xfrom").Return(ledger.Account{
+		Address: "0xfrom",
+		Balance: 2000,
+		Nonce:   0,
+	}, nil)
+
+	// Create request body
+	body, _ := json.Marshal(testTx)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/transactions", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusCreated, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "Transaction submitted successfully", response["message"])
+	assert.Equal(t, testTx.Hash, response["hash"])
+
+	// Verify mock calls
+	mockTxPool.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetTransaction(t *testing.T) {
+	apiServer, mockStore, _, _, mockTxPool, _ := setupTestAPI(t)
+
+	testTx := types.Transaction{
+		Hash:      "0xtx123",
+		From:      "0xfrom",
+		To:        "0xto",
+		Amount:    1000,
+		Fee:       10,
+		Nonce:     1,
+		Timestamp: time.Now().Unix(),
+		Status:    "pending",
+	}
+
+	// Test getting transaction from pool
+	mockTxPool.On("GetTransaction", "0xtx123").Return(testTx, true)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/transactions/0xtx123", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response types.Transaction
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, testTx.Hash, response.Hash)
+	assert.Equal(t, testTx.From, response.From)
+	assert.Equal(t, testTx.To, response.To)
+	assert.Equal(t, testTx.Amount, response.Amount)
+
+	// Test getting transaction from storage
+	mockTxPool.On("GetTransaction", "0xtx456").Return(types.Transaction{}, false)
+	mockStore.On("GetTransaction", "0xtx456").Return(types.Transaction{
+		Hash:   "0xtx456",
+		Status: "confirmed",
+	}, nil)
+
+	req2, err := http.NewRequest("GET", "/transactions/0xtx456", nil)
+	require.NoError(t, err)
+	req2.Header.Set("Authorization", "Bearer test-token")
+
+	rr2 := httptest.NewRecorder()
+	router.ServeHTTP(rr2, req2)
+
+	assert.Equal(t, http.StatusOK, rr2.Code)
+
+	var response2 types.Transaction
+	err = json.Unmarshal(rr2.Body.Bytes(), &response2)
+	require.NoError(t, err)
+	assert.Equal(t, "confirmed", response2.Status)
+
+	// Verify mock calls
+	mockTxPool.AssertExpectations(t)
+	mockStore.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetPendingTransactions(t *testing.T) {
+	apiServer, _, _, _, mockTxPool, _ := setupTestAPI(t)
+
+	pendingTxs := []types.Transaction{
+		{
+			Hash:   "0xtx1",
+			From:   "0xaddr1",
+			To:     "0xaddr2",
+			Amount: 100,
+			Status: "pending",
+		},
+		{
+			Hash:   "0xtx2",
+			From:   "0xaddr3",
+			To:     "0xaddr4",
+			Amount: 200,
+			Status: "pending",
+		},
+	}
+
+	// Setup mock
+	mockTxPool.On("GetPendingTransactions").Return(pendingTxs)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/transactions/pending", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response struct {
+		Count        int                 `json:"count"`
+		Transactions []types.Transaction `json:"transactions"`
+	}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, response.Count)
+	assert.Len(t, response.Transactions, 2)
+	assert.Equal(t, "0xtx1", response.Transactions[0].Hash)
+	assert.Equal(t, "0xtx2", response.Transactions[1].Hash)
+
+	// Verify mock calls
+	mockTxPool.AssertExpectations(t)
+}
+
+func TestAPI_HandleBatchTransactions(t *testing.T) {
+	apiServer, _, _, mockLed, mockTxPool, _ := setupTestAPI(t)
+
+	batchTxs := []types.Transaction{
+		{
+			Hash:   "0xbatch1",
+			From:   "0xfrom1",
+			To:     "0xto1",
+			Amount: 100,
+			Fee:    1,
+			Nonce:  1,
+		},
+		{
+			Hash:   "0xbatch2",
+			From:   "0xfrom1",
+			To:     "0xto2",
+			Amount: 200,
+			Fee:    2,
+			Nonce:  2,
+		},
+	}
+
+	// Setup mocks
+	for _, tx := range batchTxs {
+		mockTxPool.On("ValidateTransaction", tx).Return(nil)
+		mockTxPool.On("AddTransaction", tx).Return(nil)
+	}
+	mockLed.On("GetAccount", "0xfrom1").Return(ledger.Account{
+		Address: "0xfrom1",
+		Balance: 1000,
+		Nonce:   0,
+	}, nil)
+
+	// Create request body
+	reqBody := map[string]interface{}{
+		"transactions": batchTxs,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/transactions/batch", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, float64(2), response["submitted"])
+	assert.Equal(t, float64(0), response["failed"])
+	
+	results := response["results"].([]interface{})
+	assert.Len(t, results, 2)
+
+	// Verify mock calls
+	mockTxPool.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+}
+
+func TestAPI_TransactionValidation(t *testing.T) {
+	apiServer, _, _, mockLed, mockTxPool, _ := setupTestAPI(t)
+
+	testCases := []struct {
+		name           string
+		tx             types.Transaction
+		expectedStatus int
+		expectedError  string
+		setupMocks     func()
+	}{
+		{
+			name: "Invalid signature",
+			tx: types.Transaction{
+				Hash:      "0xinvalid",
+				From:      "0xfrom",
+				To:        "0xto",
+				Amount:    100,
+				Signature: "",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "signature",
+			setupMocks:     func() {},
+		},
+		{
+			name: "Insufficient balance",
+			tx: types.Transaction{
+				Hash:      "0xinsufficient",
+				From:      "0xpoor",
+				To:        "0xrich",
+				Amount:    1000000,
+				Fee:       10,
+				Signature: "0xsig",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "insufficient",
+			setupMocks: func() {
+				mockLed.On("GetAccount", "0xpoor").Return(ledger.Account{
+					Address: "0xpoor",
+					Balance: 100,
+					Nonce:   0,
+				}, nil)
+				mockTxPool.On("ValidateTransaction", mock.Anything).Return(
+					fmt.Errorf("insufficient balance"),
+				)
+			},
+		},
+		{
+			name: "Invalid nonce",
+			tx: types.Transaction{
+				Hash:      "0xbadnonce",
+				From:      "0xfrom",
+				To:        "0xto",
+				Amount:    100,
+				Fee:       1,
+				Nonce:     10, // Wrong nonce
+				Signature: "0xsig",
+			},
+			expectedStatus: http.StatusBadRequest,
+			expectedError:  "nonce",
+			setupMocks: func() {
+				mockLed.On("GetAccount", "0xfrom").Return(ledger.Account{
+					Address: "0xfrom",
+					Balance: 1000,
+					Nonce:   5,
+				}, nil)
+				mockTxPool.On("ValidateTransaction", mock.Anything).Return(
+					fmt.Errorf("invalid nonce"),
+				)
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.setupMocks()
+
+			body, _ := json.Marshal(tc.tx)
+			req, err := http.NewRequest("POST", "/transactions", bytes.NewBuffer(body))
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.Header.Set("Content-Type", "application/json")
+
+			rr := httptest.NewRecorder()
+			router := mux.NewRouter()
+			apiServer.SetupRoutes(router)
+			router.ServeHTTP(rr, req)
+
+			assert.Equal(t, tc.expectedStatus, rr.Code)
+
+			var response map[string]interface{}
+			err = json.Unmarshal(rr.Body.Bytes(), &response)
+			require.NoError(t, err)
+			assert.Contains(t, response["error"], tc.expectedError)
+		})
+	}
+
+	// Verify mock calls
+	mockTxPool.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetTransactionsByAddress(t *testing.T) {
+	apiServer, mockStore, _, _, mockTxPool, _ := setupTestAPI(t)
+
+	testAddress := "0xuser123"
+	
+	// Transactions in pool
+	poolTxs := []types.Transaction{
+		{
+			Hash:   "0xpool1",
+			From:   testAddress,
+			To:     "0xother",
+			Amount: 100,
+			Status: "pending",
+		},
+	}
+
+	// Transactions in storage
+	storageTxs := []types.Transaction{
+		{
+			Hash:   "0xstorage1",
+			From:   "0xother",
+			To:     testAddress,
+			Amount: 200,
+			Status: "confirmed",
+		},
+		{
+			Hash:   "0xstorage2",
+			From:   testAddress,
+			To:     "0xanother",
+			Amount: 300,
+			Status: "confirmed",
+		},
+	}
+
+	// Setup mocks
+	mockTxPool.On("GetTransactionsByAddress", testAddress).Return(poolTxs)
+	// Mock storage to return transactions for specific blocks
+	mockStore.On("GetTransactionsByBlock", mock.Anything).Return(storageTxs, nil).Maybe()
+
+	// Create request
+	req, err := http.NewRequest("GET", fmt.Sprintf("/accounts/%s/transactions", testAddress), nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response struct {
+		Address      string              `json:"address"`
+		Transactions []types.Transaction `json:"transactions"`
+		Count        int                 `json:"count"`
+	}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, testAddress, response.Address)
+	assert.True(t, response.Count >= 1) // At least the pool transaction
+
+	// Verify mock calls
+	mockTxPool.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetTransactionReceipt(t *testing.T) {
+	apiServer, mockStore, _, _, _, _ := setupTestAPI(t)
+
+	testTx := types.Transaction{
+		Hash:        "0xtx123",
+		BlockHeight: 100,
+		Status:      "confirmed",
+		GasUsed:     21000,
+	}
+
+	// Setup mock
+	mockStore.On("GetTransaction", "0xtx123").Return(testTx, nil)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/transactions/0xtx123/receipt", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "0xtx123", response["transactionHash"])
+	assert.Equal(t, float64(100), response["blockNumber"])
+	assert.Equal(t, "confirmed", response["status"])
+	assert.Equal(t, float64(21000), response["gasUsed"])
+
+	// Verify mock calls
+	mockStore.AssertExpectations(t)
+}

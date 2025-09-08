@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	consensus "diamante/consensus"
 	"diamante/consensus/types"
 
 	"github.com/sirupsen/logrus"
@@ -76,10 +77,23 @@ func NewHybridConsensusRecoveryAdapter(
 		option(adapter)
 	}
 
+	// Create checkpoint manager first if not provided
+	if adapter.checkpointManager == nil {
+		cm, err := NewCheckpointManager(
+			WithCheckpointLogger(logger),
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create checkpoint manager: %w", err)
+		}
+		adapter.checkpointManager = cm
+	}
+
 	// Create recovery manager if not provided
 	if adapter.recoveryManager == nil {
 		adapter.recoveryManager = NewRecoveryManager(
 			WithLogger(logger),
+			WithRecoveryConsensus(consensus),
+			WithRecoveryCheckpointManager(adapter.checkpointManager),
 			WithOnRecoveryStart(func(component string, err error) error {
 				adapter.logger.WithFields(logrus.Fields{
 					"component": component,
@@ -95,17 +109,6 @@ func NewHybridConsensusRecoveryAdapter(
 				return nil
 			}),
 		)
-	}
-
-	// Create checkpoint manager if not provided
-	if adapter.checkpointManager == nil {
-		cm, err := NewCheckpointManager(
-			WithCheckpointLogger(logger),
-		)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create checkpoint manager: %w", err)
-		}
-		adapter.checkpointManager = cm
 	}
 
 	// Register components with the checkpoint manager
@@ -146,6 +149,24 @@ func (hcra *HybridConsensusRecoveryAdapter) registerComponents() {
 		consensus: hcra.consensus,
 	})
 
+	// Register validator manager component
+	hcra.checkpointManager.RegisterComponent(&consensusComponentAdapter{
+		name:      "validators",
+		consensus: hcra.consensus,
+		getState: func(c types.Consensus) ([]byte, error) {
+			if hc, ok := c.(*consensus.HybridConsensus); ok {
+				return hc.GetValidatorManager().GetState()
+			}
+			return nil, errors.New("unsupported consensus type")
+		},
+		restoreState: func(c types.Consensus, state []byte) error {
+			if hc, ok := c.(*consensus.HybridConsensus); ok {
+				return hc.GetValidatorManager().RestoreState(state)
+			}
+			return errors.New("unsupported consensus type")
+		},
+	})
+
 	// Register main consensus component
 	hcra.checkpointManager.RegisterComponent(&consensusComponentAdapter{
 		name:      "consensus",
@@ -168,7 +189,7 @@ func (hcra *HybridConsensusRecoveryAdapter) registerComponents() {
 			}{
 				LastBlockHeight: hc.GetLastBlockHeight(),
 				LastBlockHash:   hc.GetLastBlockHash(),
-				Timestamp:       time.Now(),
+				Timestamp:       consensus.ConsensusNow(),
 			}
 			return json.Marshal(state)
 		},
@@ -406,7 +427,7 @@ func (hcra *HybridConsensusRecoveryAdapter) PerformHealthCheck(ctx context.Conte
 		"recoveryCount":    recoveryStats["recoveryCount"],
 		"lastRecovery":     recoveryStats["lastRecovery"],
 		"activeValidators": len(hcra.consensus.GetActiveValidators()),
-		"timestamp":        time.Now(),
+		"timestamp":        consensus.ConsensusNow(),
 	}
 
 	// Check for PoH/block height inconsistency

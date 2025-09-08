@@ -1,0 +1,8 @@
+{
+  "title": "Diamante Validator Dashboard",
+  "panels": [
+    {"type": "graph", "title": "Block Height", "targets": [{"expr": "diamante_block_height"}]},
+    {"type": "graph", "title": "Network Load", "targets": [{"expr": "diamante_network_load"}]},
+    {"type": "graph", "title": "Ledger Height", "targets": [{"expr": "diamante_ledger_height"}]}
+  ]
+}

@@ -4,12 +4,18 @@ package recovery
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
+
+	"diamante/consensus"
+	"diamante/consensus/types"
 )
 
 // RecoveryState represents the current state of the recovery process
@@ -136,6 +142,10 @@ type RecoveryManager struct {
 	checkpointEnabled bool
 	autoRecovery      bool
 
+	// External dependencies
+	checkpointManager *CheckpointManager
+	consensus         types.Consensus
+
 	// State
 	mu            sync.RWMutex
 	state         RecoveryState
@@ -196,6 +206,20 @@ func WithLogger(logger *logrus.Logger) RecoveryOption {
 		if logger != nil {
 			rm.logger = logger
 		}
+	}
+}
+
+// WithRecoveryCheckpointManager sets the checkpoint manager used for rollback and resync
+func WithRecoveryCheckpointManager(cm *CheckpointManager) RecoveryOption {
+	return func(rm *RecoveryManager) {
+		rm.checkpointManager = cm
+	}
+}
+
+// WithRecoveryConsensus sets the consensus instance used for resync and restart
+func WithRecoveryConsensus(cons types.Consensus) RecoveryOption {
+	return func(rm *RecoveryManager) {
+		rm.consensus = cons
 	}
 }
 
@@ -266,7 +290,7 @@ func (rm *RecoveryManager) RecoverFromError(component string, err error, severit
 		Severity:    severity,
 		Component:   component,
 		Description: err.Error(),
-		Timestamp:   time.Now(),
+		Timestamp:   consensus.ConsensusNow(),
 		Context:     make(map[string]interface{}),
 	}
 
@@ -286,7 +310,7 @@ func (rm *RecoveryManager) RecoverFromError(component string, err error, severit
 	rm.state = Recovering
 	rm.lastError = recoveryErr
 	rm.recoveryCount[component]++
-	rm.lastRecovery = time.Now()
+	rm.lastRecovery = consensus.ConsensusNow()
 
 	// Log the error
 	rm.logger.WithFields(logrus.Fields{
@@ -349,7 +373,9 @@ func (rm *RecoveryManager) RecoverFromError(component string, err error, severit
 
 		// Call the onRecoveryComplete callback if set
 		if rm.onRecoveryComplete != nil {
-			_ = rm.onRecoveryComplete(component, false)
+			if callbackErr := rm.onRecoveryComplete(component, false); callbackErr != nil {
+				rm.logger.WithError(callbackErr).Warn("Recovery completion callback failed")
+			}
 		}
 
 		return fmt.Errorf("recovery failed: %w", recoveryErr2)
@@ -377,51 +403,94 @@ func (rm *RecoveryManager) RecoverFromError(component string, err error, severit
 
 // performStateRollback implements state rollback recovery
 func (rm *RecoveryManager) performStateRollback(component string) error {
-	// This is a placeholder implementation
-	// In a real implementation, this would:
-	// 1. Find the latest valid checkpoint
-	// 2. Roll back the state to that checkpoint
-	// 3. Verify the state is valid
+	if rm.checkpointManager == nil {
+		return errors.New("checkpoint manager not configured")
+	}
 
-	rm.logger.WithField("component", component).Info(
-		"Performing state rollback recovery")
+	cp, err := rm.checkpointManager.GetLatestCheckpoint()
+	if err != nil {
+		return fmt.Errorf("failed to get latest checkpoint: %w", err)
+	}
 
-	// Simulate recovery delay
-	time.Sleep(rm.retryDelay)
+	rm.logger.WithFields(logrus.Fields{
+		"component": component,
+		"height":    cp.Metadata.Height,
+	}).Info("Performing state rollback recovery")
+
+	if err := rm.checkpointManager.RestoreFromCheckpoint(cp.Metadata.Height); err != nil {
+		return fmt.Errorf("failed to restore from checkpoint: %w", err)
+	}
 
 	return nil
 }
 
 // performStateResync implements state resync recovery
 func (rm *RecoveryManager) performStateResync(component string) error {
-	// This is a placeholder implementation
-	// In a real implementation, this would:
-	// 1. Request state from peers
-	// 2. Verify the state is valid
-	// 3. Apply the state
+	if rm.checkpointManager == nil {
+		return errors.New("checkpoint manager not configured")
+	}
+	if rm.consensus == nil {
+		return errors.New("consensus not configured")
+	}
 
-	rm.logger.WithField("component", component).Info(
-		"Performing state resync recovery")
+	cp, err := rm.checkpointManager.GetLatestCheckpoint()
+	if err != nil {
+		return fmt.Errorf("failed to get latest checkpoint: %w", err)
+	}
 
-	// Simulate recovery delay
-	time.Sleep(rm.retryDelay)
+	// Load PoH state from checkpoint
+	data, ok := cp.ComponentStates["poh"]
+	if !ok {
+		stateFile := filepath.Join(cp.Path, "poh.state")
+		data, err = os.ReadFile(stateFile)
+		if err != nil {
+			return fmt.Errorf("failed to read PoH state: %w", err)
+		}
+	}
+
+	var pohState struct {
+		State [32]byte `json:"state"`
+		Count uint64   `json:"count"`
+	}
+	if err := json.Unmarshal(data, &pohState); err != nil {
+		return fmt.Errorf("failed to decode PoH state: %w", err)
+	}
+
+	rm.logger.WithFields(logrus.Fields{
+		"component": component,
+		"height":    cp.Metadata.Height,
+	}).Info("Performing state resync recovery")
+
+	if err := rm.consensus.SynchronizeState(pohState.State, pohState.Count); err != nil {
+		return fmt.Errorf("synchronize state failed: %w", err)
+	}
 
 	return nil
 }
 
 // performRestart implements restart recovery
 func (rm *RecoveryManager) performRestart(component string) error {
-	// This is a placeholder implementation
-	// In a real implementation, this would:
-	// 1. Stop the component
-	// 2. Reset the component's state
-	// 3. Restart the component
+	if rm.consensus == nil {
+		return errors.New("consensus not configured")
+	}
 
-	rm.logger.WithField("component", component).Info(
-		"Performing restart recovery")
+	rm.logger.WithField("component", component).Info("Performing restart recovery")
 
-	// Simulate recovery delay
-	time.Sleep(rm.retryDelay)
+	if err := rm.consensus.Stop(); err != nil {
+		return fmt.Errorf("failed to stop component: %w", err)
+	}
+
+	// Use context-aware timer instead of time.Sleep
+	select {
+	case <-rm.ctx.Done():
+		return fmt.Errorf("context cancelled during restart delay")
+	case <-time.After(rm.retryDelay):
+		// Continue with restart
+	}
+
+	if err := rm.consensus.Start(); err != nil {
+		return fmt.Errorf("failed to start component: %w", err)
+	}
 
 	return nil
 }

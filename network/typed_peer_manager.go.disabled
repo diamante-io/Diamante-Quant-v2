@@ -1,0 +1,477 @@
+// Package network provides typed peer management
+package network
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"diamante/common"
+	"diamante/types"
+	"github.com/sirupsen/logrus"
+)
+
+// TypedPeerManager manages multiple peer connections
+type TypedPeerManager struct {
+	peers           map[string]*TypedPeer
+	peersByAddress  map[string]*TypedPeer
+	
+	// Configuration
+	maxPeers        int
+	minPeers        int
+	tlsConfig       *tls.Config
+	messageHandler  *TypedMessageHandler
+	
+	// Discovery
+	bootstrapNodes  []string
+	bannedPeers     map[string]time.Time
+	
+	// Metrics
+	totalPeers      atomic.Uint64
+	activePeers     atomic.Uint64
+	inboundPeers    atomic.Uint64
+	outboundPeers   atomic.Uint64
+	
+	// Control
+	ctx             context.Context
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
+	
+	logger          *logrus.Logger
+	mu              sync.RWMutex
+}
+
+// PeerManagerConfig contains configuration for peer manager
+type PeerManagerConfig struct {
+	MaxPeers        int
+	MinPeers        int
+	BootstrapNodes  []string
+	TLSConfig       *tls.Config
+	MessageHandler  *TypedMessageHandler
+	Logger          *logrus.Logger
+}
+
+// PeerManagerStats contains peer manager statistics
+type PeerManagerStats struct {
+	TotalPeers      uint64            `json:"total_peers"`
+	ActivePeers     uint64            `json:"active_peers"`
+	InboundPeers    uint64            `json:"inbound_peers"`
+	OutboundPeers   uint64            `json:"outbound_peers"`
+	BannedPeers     int               `json:"banned_peers"`
+	PeerStates      map[PeerState]int `json:"peer_states"`
+	TotalMessages   uint64            `json:"total_messages"`
+	TotalBytes      uint64            `json:"total_bytes"`
+}
+
+// NewTypedPeerManager creates a new peer manager
+func NewTypedPeerManager(config *PeerManagerConfig) *TypedPeerManager {
+	if config.Logger == nil {
+		config.Logger = logrus.New()
+	}
+	
+	if config.MaxPeers == 0 {
+		config.MaxPeers = 50
+	}
+	
+	if config.MinPeers == 0 {
+		config.MinPeers = 5
+	}
+	
+	ctx, cancel := context.WithCancel(context.Background())
+	
+	pm := &TypedPeerManager{
+		peers:          make(map[string]*TypedPeer),
+		peersByAddress: make(map[string]*TypedPeer),
+		maxPeers:       config.MaxPeers,
+		minPeers:       config.MinPeers,
+		tlsConfig:      config.TLSConfig,
+		messageHandler: config.MessageHandler,
+		bootstrapNodes: config.BootstrapNodes,
+		bannedPeers:    make(map[string]time.Time),
+		ctx:            ctx,
+		cancel:         cancel,
+		logger:         config.Logger,
+	}
+	
+	// Start maintenance routines
+	pm.wg.Add(2)
+	go pm.maintainPeers()
+	go pm.cleanupBannedPeers()
+	
+	return pm
+}
+
+// AddPeer adds a new peer connection
+func (pm *TypedPeerManager) AddPeer(peer *TypedPeer, inbound bool) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	
+	// Check if already connected
+	if _, exists := pm.peers[peer.ID()]; exists {
+		return fmt.Errorf("peer %s already connected", peer.ID())
+	}
+	
+	// Check if address is banned
+	if banTime, banned := pm.bannedPeers[peer.Address()]; banned {
+		if time.Since(banTime) < 24*time.Hour {
+			return fmt.Errorf("peer %s is banned", peer.Address())
+		}
+		delete(pm.bannedPeers, peer.Address())
+	}
+	
+	// Check max peers limit
+	if len(pm.peers) >= pm.maxPeers {
+		return fmt.Errorf("max peers limit reached: %d", pm.maxPeers)
+	}
+	
+	// Add peer
+	pm.peers[peer.ID()] = peer
+	pm.peersByAddress[peer.Address()] = peer
+	
+	pm.totalPeers.Add(1)
+	pm.activePeers.Add(1)
+	
+	if inbound {
+		pm.inboundPeers.Add(1)
+	} else {
+		pm.outboundPeers.Add(1)
+	}
+	
+	// Start message handler for this peer
+	pm.wg.Add(1)
+	go pm.handlePeerMessages(peer, inbound)
+	
+	pm.logger.WithFields(logrus.Fields{
+		"peer":    peer.ID(),
+		"address": peer.Address(),
+		"inbound": inbound,
+	}).Info("Peer added")
+	
+	return nil
+}
+
+// RemovePeer removes a peer connection
+func (pm *TypedPeerManager) RemovePeer(peerID string) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	
+	peer, exists := pm.peers[peerID]
+	if !exists {
+		return fmt.Errorf("peer %s not found", peerID)
+	}
+	
+	// Remove from maps
+	delete(pm.peers, peerID)
+	delete(pm.peersByAddress, peer.Address())
+	
+	// Update metrics
+	pm.activePeers.Add(^uint64(0)) // Decrement
+	
+	// Close peer connection
+	peer.Close()
+	
+	pm.logger.WithField("peer", peerID).Info("Peer removed")
+	
+	return nil
+}
+
+// GetPeer retrieves a peer by ID
+func (pm *TypedPeerManager) GetPeer(peerID string) (*TypedPeer, error) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	
+	peer, exists := pm.peers[peerID]
+	if !exists {
+		return nil, fmt.Errorf("peer %s not found", peerID)
+	}
+	
+	return peer, nil
+}
+
+// GetPeers returns all connected peers
+func (pm *TypedPeerManager) GetPeers() []*TypedPeer {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	
+	peers := make([]*TypedPeer, 0, len(pm.peers))
+	for _, peer := range pm.peers {
+		peers = append(peers, peer)
+	}
+	
+	return peers
+}
+
+// GetActivePeers returns only active (connected) peers
+func (pm *TypedPeerManager) GetActivePeers() []*TypedPeer {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	
+	peers := make([]*TypedPeer, 0, len(pm.peers))
+	for _, peer := range pm.peers {
+		if peer.IsActive() {
+			peers = append(peers, peer)
+		}
+	}
+	
+	return peers
+}
+
+// BroadcastMessage broadcasts a message to all active peers
+func (pm *TypedPeerManager) BroadcastMessage(msg *TypedMessage) error {
+	peers := pm.GetActivePeers()
+	
+	if len(peers) == 0 {
+		return fmt.Errorf("no active peers")
+	}
+	
+	return pm.messageHandler.BroadcastMessage(msg, peers)
+}
+
+// SendMessage sends a message to a specific peer
+func (pm *TypedPeerManager) SendMessage(peerID string, msg *TypedMessage) error {
+	peer, err := pm.GetPeer(peerID)
+	if err != nil {
+		return err
+	}
+	
+	return pm.messageHandler.SendMessage(msg, peer)
+}
+
+// ConnectToPeer connects to a new peer
+func (pm *TypedPeerManager) ConnectToPeer(address string) error {
+	// Check if already connected
+	pm.mu.RLock()
+	if _, exists := pm.peersByAddress[address]; exists {
+		pm.mu.RUnlock()
+		return fmt.Errorf("already connected to %s", address)
+	}
+	pm.mu.RUnlock()
+	
+	// Create peer config
+	peerConfig := &PeerConfig{
+		Address:   address,
+		TLSConfig: pm.tlsConfig,
+		Logger:    pm.logger,
+	}
+	
+	// Dial peer
+	ctx, cancel := context.WithTimeout(pm.ctx, 10*time.Second)
+	defer cancel()
+	
+	peer, err := DialTypedPeer(ctx, peerConfig)
+	if err != nil {
+		return fmt.Errorf("failed to connect to peer: %w", err)
+	}
+	
+	// Perform handshake
+	if err := pm.performHandshake(peer); err != nil {
+		peer.Close()
+		return fmt.Errorf("handshake failed: %w", err)
+	}
+	
+	// Add peer
+	return pm.AddPeer(peer, false)
+}
+
+// performHandshake performs the handshake protocol
+func (pm *TypedPeerManager) performHandshake(peer *TypedPeer) error {
+	peer.SetState(PeerStateHandshaking)
+	
+	// Send our handshake
+	handshakeMsg := NewHandshakeMessage(
+		"node-123", // TODO: Get actual node ID
+		"diamante-mainnet",
+		100, // TODO: Get actual height
+		"1.0.0",
+	)
+	
+	if err := pm.messageHandler.SendMessage(handshakeMsg, peer); err != nil {
+		return fmt.Errorf("failed to send handshake: %w", err)
+	}
+	
+	// Receive peer handshake
+	data, err := peer.Receive()
+	if err != nil {
+		return fmt.Errorf("failed to receive handshake: %w", err)
+	}
+	
+	// Process handshake
+	if err := pm.messageHandler.HandleMessage(data, peer); err != nil {
+		return fmt.Errorf("failed to process handshake: %w", err)
+	}
+	
+	peer.SetState(PeerStateConnected)
+	return nil
+}
+
+// handlePeerMessages handles messages from a peer
+func (pm *TypedPeerManager) handlePeerMessages(peer *TypedPeer, inbound bool) {
+	defer pm.wg.Done()
+	defer func() {
+		pm.RemovePeer(peer.ID())
+		if inbound {
+			pm.inboundPeers.Add(^uint64(0)) // Decrement
+		} else {
+			pm.outboundPeers.Add(^uint64(0)) // Decrement
+		}
+	}()
+	
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		default:
+			// Receive message
+			data, err := peer.Receive()
+			if err != nil {
+				pm.logger.WithError(err).WithField("peer", peer.ID()).Debug("Failed to receive message")
+				return
+			}
+			
+			// Handle message
+			if err := pm.messageHandler.HandleMessage(data, peer); err != nil {
+				pm.logger.WithError(err).WithField("peer", peer.ID()).Error("Failed to handle message")
+				// Don't disconnect on message handling errors
+			}
+		}
+	}
+}
+
+// maintainPeers maintains the minimum number of peer connections
+func (pm *TypedPeerManager) maintainPeers() {
+	defer pm.wg.Done()
+	
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-ticker.C:
+			activePeers := len(pm.GetActivePeers())
+			
+			if activePeers < pm.minPeers {
+				needed := pm.minPeers - activePeers
+				pm.logger.WithFields(logrus.Fields{
+					"active": activePeers,
+					"min":    pm.minPeers,
+					"needed": needed,
+				}).Info("Connecting to more peers")
+				
+				// Try to connect to bootstrap nodes
+				for _, node := range pm.bootstrapNodes {
+					if needed == 0 {
+						break
+					}
+					
+					if err := pm.ConnectToPeer(node); err != nil {
+						pm.logger.WithError(err).WithField("node", node).Warn("Failed to connect to bootstrap node")
+					} else {
+						needed--
+					}
+				}
+			}
+			
+			// Check for inactive peers
+			for _, peer := range pm.GetPeers() {
+				if peer.TimeSinceLastActivity() > 5*time.Minute {
+					pm.logger.WithField("peer", peer.ID()).Warn("Peer inactive, disconnecting")
+					pm.RemovePeer(peer.ID())
+				}
+			}
+		}
+	}
+}
+
+// cleanupBannedPeers removes expired bans
+func (pm *TypedPeerManager) cleanupBannedPeers() {
+	defer pm.wg.Done()
+	
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-pm.ctx.Done():
+			return
+		case <-ticker.C:
+			pm.mu.Lock()
+			for addr, banTime := range pm.bannedPeers {
+				if time.Since(banTime) > 24*time.Hour {
+					delete(pm.bannedPeers, addr)
+					pm.logger.WithField("address", addr).Debug("Ban expired")
+				}
+			}
+			pm.mu.Unlock()
+		}
+	}
+}
+
+// BanPeer bans a peer by ID
+func (pm *TypedPeerManager) BanPeer(peerID string, reason string) error {
+	peer, err := pm.GetPeer(peerID)
+	if err != nil {
+		return err
+	}
+	
+	pm.mu.Lock()
+	pm.bannedPeers[peer.Address()] = common.ConsensusNow()
+	pm.mu.Unlock()
+	
+	peer.Ban(reason)
+	pm.RemovePeer(peerID)
+	
+	return nil
+}
+
+// GetStats returns peer manager statistics
+func (pm *TypedPeerManager) GetStats() *PeerManagerStats {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	
+	stats := &PeerManagerStats{
+		TotalPeers:    pm.totalPeers.Load(),
+		ActivePeers:   pm.activePeers.Load(),
+		InboundPeers:  pm.inboundPeers.Load(),
+		OutboundPeers: pm.outboundPeers.Load(),
+		BannedPeers:   len(pm.bannedPeers),
+		PeerStates:    make(map[PeerState]int),
+	}
+	
+	// Count peer states
+	for _, peer := range pm.peers {
+		state := peer.State()
+		stats.PeerStates[state]++
+		
+		info := peer.GetInfo()
+		stats.TotalMessages += info.MessagesSent + info.MessagesRecv
+		stats.TotalBytes += info.BytesSent + info.BytesRecv
+	}
+	
+	return stats
+}
+
+// Shutdown gracefully shuts down the peer manager
+func (pm *TypedPeerManager) Shutdown() error {
+	pm.logger.Info("Shutting down peer manager")
+	
+	// Cancel context
+	pm.cancel()
+	
+	// Close all peers
+	pm.mu.Lock()
+	for _, peer := range pm.peers {
+		peer.Close()
+	}
+	pm.mu.Unlock()
+	
+	// Wait for goroutines
+	pm.wg.Wait()
+	
+	pm.logger.Info("Peer manager shut down")
+	return nil
+}

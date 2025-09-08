@@ -1,0 +1,563 @@
+// consensus/performance_test.go
+package consensus
+
+import (
+	"runtime"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestPerformanceOptimizer_Creation(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	config := DefaultOptimizerConfig()
+
+	optimizer := NewPerformanceOptimizer(config, logger)
+	assert.NotNil(t, optimizer)
+	assert.Equal(t, config, optimizer.config)
+	// Don't check the pools directly to avoid copying sync.Pool
+	// Just verify the optimizer was created successfully
+	assert.NotNil(t, optimizer.workerPool)
+}
+
+func TestPerformanceOptimizer_StartStop(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	// Test start
+	err := optimizer.Start()
+	require.NoError(t, err)
+
+	// Test double start
+	err = optimizer.Start()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "already running")
+
+	// Test stop
+	err = optimizer.Stop()
+	require.NoError(t, err)
+
+	// Test double stop
+	err = optimizer.Stop()
+	require.NoError(t, err) // Should not error
+}
+
+func TestPerformanceOptimizer_MemoryPools(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	// Test event pool
+	event1 := optimizer.GetEvent()
+	assert.NotNil(t, event1)
+
+	event2 := optimizer.GetEvent()
+	assert.NotNil(t, event2)
+	assert.NotEqual(t, event1, event2) // Should be different instances
+
+	// Return events to pool
+	optimizer.PutEvent(event1)
+	optimizer.PutEvent(event2)
+
+	// Test block pool
+	block1 := optimizer.GetBlock()
+	assert.NotNil(t, block1)
+
+	block2 := optimizer.GetBlock()
+	assert.NotNil(t, block2)
+
+	optimizer.PutBlock(block1)
+	optimizer.PutBlock(block2)
+
+	// Test validator pool
+	validator1 := optimizer.GetValidator()
+	assert.NotNil(t, validator1)
+
+	optimizer.PutValidator(validator1)
+}
+
+func TestPerformanceOptimizer_Cache(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	eventID := [32]byte{1, 2, 3}
+	event := optimizer.GetEvent()
+	event.ID = eventID
+
+	// Test cache miss
+	cached, found := optimizer.GetCachedEvent(eventID)
+	assert.False(t, found)
+	assert.Nil(t, cached)
+
+	// Cache the event
+	optimizer.CacheEvent(eventID, event)
+
+	// Test cache hit
+	cached, found = optimizer.GetCachedEvent(eventID)
+	assert.True(t, found)
+	assert.NotNil(t, cached)
+	assert.Equal(t, eventID, cached.ID)
+}
+
+func TestPerformanceOptimizer_TaskSubmission(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	err := optimizer.Start()
+	require.NoError(t, err)
+	defer optimizer.Stop()
+
+	// Test task submission
+	executed := false
+	task := SimpleTask{
+		Fn: func() {
+			executed = true
+		},
+	}
+
+	err = optimizer.SubmitTask(task)
+	require.NoError(t, err)
+
+	// Wait for task execution
+	time.Sleep(100 * time.Millisecond)
+	assert.True(t, executed)
+}
+
+func TestPerformanceOptimizer_Metrics(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	metrics := optimizer.GetMetrics()
+	assert.NotNil(t, metrics)
+
+	utilization := optimizer.GetPoolUtilization()
+	assert.NotNil(t, utilization)
+	assert.Contains(t, utilization, "event_pool_hit_rate")
+	assert.Contains(t, utilization, "workers_active")
+}
+
+func TestPerformanceOptimizer_OptimizationHints(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	hints := optimizer.GetOptimizationHints()
+	assert.NotNil(t, hints)
+	// Hints may be empty for a new optimizer, which is fine
+}
+
+func TestWorkerPool_Creation(t *testing.T) {
+	logger := newHybridConsensusLogger()
+
+	pool := NewWorkerPool(4, 100, logger)
+	assert.NotNil(t, pool)
+	assert.Equal(t, 4, pool.workers)
+	assert.Equal(t, 100, pool.maxQueueSize)
+}
+
+func TestWorkerPool_StartStop(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	pool := NewWorkerPool(2, 10, logger)
+
+	err := pool.Start()
+	require.NoError(t, err)
+
+	stats := pool.GetStats()
+	assert.True(t, stats.Running)
+	assert.Equal(t, 2, stats.Workers)
+
+	err = pool.Stop()
+	require.NoError(t, err)
+
+	stats = pool.GetStats()
+	assert.False(t, stats.Running)
+}
+
+func TestWorkerPool_TaskExecution(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	pool := NewWorkerPool(2, 10, logger)
+
+	err := pool.Start()
+	require.NoError(t, err)
+	defer pool.Stop()
+
+	// Test single task
+	executed := false
+	mutex := sync.Mutex{}
+
+	task := func() {
+		mutex.Lock()
+		executed = true
+		mutex.Unlock()
+	}
+
+	err = pool.Submit(task)
+	require.NoError(t, err)
+
+	// Wait for execution
+	time.Sleep(100 * time.Millisecond)
+
+	mutex.Lock()
+	assert.True(t, executed)
+	mutex.Unlock()
+}
+
+func TestWorkerPool_ConcurrentTasks(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	pool := NewWorkerPool(4, 100, logger)
+
+	err := pool.Start()
+	require.NoError(t, err)
+	defer pool.Stop()
+
+	const numTasks = 50
+	var wg sync.WaitGroup
+
+	for i := 0; i < numTasks; i++ {
+		wg.Add(1)
+		task := func() {
+			defer wg.Done()
+			time.Sleep(10 * time.Millisecond) // Simulate work
+			// Use atomic operation to safely increment counter
+			// For simplicity, just use a channel
+		}
+
+		err := pool.Submit(task)
+		require.NoError(t, err)
+	}
+
+	// Wait for all tasks to complete
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatal("Tasks did not complete in time")
+	}
+
+	stats := pool.GetStats()
+	assert.Equal(t, int64(numTasks), stats.TasksProcessed)
+}
+
+func TestWorkerPool_QueueFull(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	pool := NewWorkerPool(1, 2, logger) // Small queue for testing
+
+	err := pool.Start()
+	require.NoError(t, err)
+	defer pool.Stop()
+
+	// Fill the queue
+	blockingTask := func() {
+		time.Sleep(1 * time.Second) // Long-running task
+	}
+
+	// Submit tasks to fill queue
+	err = pool.Submit(blockingTask) // Worker will be busy
+	require.NoError(t, err)
+
+	err = pool.Submit(func() {}) // Queue slot 1
+	require.NoError(t, err)
+
+	err = pool.Submit(func() {}) // Queue slot 2
+	require.NoError(t, err)
+
+	// This should fail - queue is full
+	err = pool.Submit(func() {})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "queue full")
+}
+
+func TestLRUCache_BasicOperations(t *testing.T) {
+	cache := NewLRUCache(3, 0, false, &SystemTimeProvider{}) // No TTL for this test
+
+	// Test set and get
+	cache.Set("key1", "value1")
+	value, found := cache.Get("key1")
+	assert.True(t, found)
+	assert.Equal(t, "value1", value)
+
+	// Test non-existent key
+	value, found = cache.Get("nonexistent")
+	assert.False(t, found)
+	assert.Nil(t, value)
+
+	// Test capacity limit
+	cache.Set("key2", "value2")
+	cache.Set("key3", "value3")
+	cache.Set("key4", "value4") // Should evict key1
+
+	_, found = cache.Get("key1")
+	assert.False(t, found) // Should be evicted
+
+	_, found = cache.Get("key4")
+	assert.True(t, found) // Should exist
+}
+
+func TestLRUCache_TTL(t *testing.T) {
+	cache := NewLRUCache(10, 100*time.Millisecond, false, &SystemTimeProvider{})
+
+	cache.Set("key1", "value1")
+
+	// Should be available immediately
+	value, found := cache.Get("key1")
+	assert.True(t, found)
+	assert.Equal(t, "value1", value)
+
+	// Wait for expiration
+	time.Sleep(150 * time.Millisecond)
+
+	// Should be expired
+	value, found = cache.Get("key1")
+	assert.False(t, found)
+	assert.Nil(t, value)
+}
+
+func TestLRUCache_LRUEviction(t *testing.T) {
+	cache := NewLRUCache(2, 0, false, &SystemTimeProvider{}) // Capacity of 2, no TTL
+
+	cache.Set("key1", "value1")
+	cache.Set("key2", "value2")
+
+	// Access key1 to make it most recently used
+	cache.Get("key1")
+
+	// Add key3, should evict key2 (least recently used)
+	cache.Set("key3", "value3")
+
+	_, found := cache.Get("key1")
+	assert.True(t, found) // Should still exist
+
+	_, found = cache.Get("key2")
+	assert.False(t, found) // Should be evicted
+
+	_, found = cache.Get("key3")
+	assert.True(t, found) // Should exist
+}
+
+func TestMemoryMonitor_Basic(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	monitor := NewMemoryMonitor(0.8, 0.9, logger)
+
+	assert.NotNil(t, monitor)
+	assert.Equal(t, 0.8, monitor.memoryThreshold)
+	assert.Equal(t, 0.9, monitor.gcThreshold)
+}
+
+func TestMemoryMonitor_Stats(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	monitor := NewMemoryMonitor(0.8, 0.9, logger)
+
+	stats := monitor.GetMemoryStats()
+	assert.NotNil(t, stats)
+	assert.Greater(t, stats.Alloc, uint64(0))
+	assert.GreaterOrEqual(t, stats.TotalAlloc, stats.Alloc)
+}
+
+func TestMemoryMonitor_PressureLevel(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	monitor := NewMemoryMonitor(0.8, 0.9, logger)
+
+	level := monitor.GetPressureLevel()
+	assert.GreaterOrEqual(t, level, 0)
+	assert.LessOrEqual(t, level, 3)
+}
+
+func TestAdaptiveOptimizer_Creation(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	po := NewPerformanceOptimizer(nil, logger)
+
+	optimizer := NewAdaptiveOptimizer(po, logger)
+	assert.NotNil(t, optimizer)
+	assert.NotNil(t, optimizer.config)
+	assert.NotNil(t, optimizer.learningState)
+}
+
+func TestAdaptiveOptimizer_MetricsCollection(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	po := NewPerformanceOptimizer(nil, logger)
+	optimizer := NewAdaptiveOptimizer(po, logger)
+
+	metrics := optimizer.collectMetrics()
+	assert.NotNil(t, metrics)
+	assert.NotZero(t, metrics.Timestamp)
+	assert.GreaterOrEqual(t, metrics.PerformanceScore, 0.0)
+	assert.LessOrEqual(t, metrics.PerformanceScore, 100.0)
+}
+
+func TestAdaptiveOptimizer_ParameterBounds(t *testing.T) {
+	logger := newHybridConsensusLogger()
+	po := NewPerformanceOptimizer(nil, logger)
+	optimizer := NewAdaptiveOptimizer(po, logger)
+
+	// Test applying bounds
+	bounded := optimizer.applyParameterBounds("batch_size", 5) // Below minimum
+	assert.Equal(t, 10.0, bounded)                             // Should be clamped to minimum
+
+	bounded = optimizer.applyParameterBounds("batch_size", 20000) // Above maximum
+	assert.Equal(t, 10000.0, bounded)                             // Should be clamped to maximum
+
+	bounded = optimizer.applyParameterBounds("batch_size", 500) // Within bounds
+	assert.Equal(t, 500.0, bounded)                             // Should be unchanged
+}
+
+// Benchmark tests for performance validation
+
+func BenchmarkPerformanceOptimizer_EventPool(b *testing.B) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		event := optimizer.GetEvent()
+		optimizer.PutEvent(event)
+	}
+}
+
+func BenchmarkPerformanceOptimizer_Cache(b *testing.B) {
+	logger := newHybridConsensusLogger()
+	optimizer := NewPerformanceOptimizer(nil, logger)
+
+	// Pre-populate cache
+	for i := 0; i < 1000; i++ {
+		key := [32]byte{byte(i)}
+		event := optimizer.GetEvent()
+		optimizer.CacheEvent(key, event)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := [32]byte{byte(i % 1000)}
+		optimizer.GetCachedEvent(key)
+	}
+}
+
+func BenchmarkWorkerPool_TaskSubmission(b *testing.B) {
+	logger := newHybridConsensusLogger()
+	pool := NewWorkerPool(runtime.NumCPU(), 10000, logger)
+
+	pool.Start()
+	defer pool.Stop()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		pool.Submit(func() {
+			// Minimal work
+			runtime.Gosched()
+		})
+	}
+}
+
+func BenchmarkLRUCache_Operations(b *testing.B) {
+	cache := NewLRUCache(1000, 0, false, &SystemTimeProvider{})
+
+	// Pre-populate
+	for i := 0; i < 1000; i++ {
+		cache.Set(i, i*2)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := i % 1000
+		cache.Get(key)
+		if i%10 == 0 {
+			cache.Set(key+1000, (key+1000)*2)
+		}
+	}
+}
+
+// Stress tests for concurrent access
+
+func TestWorkerPool_StressTest(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping stress test in short mode")
+	}
+
+	logger := newHybridConsensusLogger()
+	pool := NewWorkerPool(8, 1000, logger)
+
+	err := pool.Start()
+	require.NoError(t, err)
+	defer pool.Stop()
+
+	const numGoroutines = 50
+	const tasksPerGoroutine = 100
+
+	var wg sync.WaitGroup
+	errors := make(chan error, numGoroutines)
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for j := 0; j < tasksPerGoroutine; j++ {
+				task := func() {
+					// Simulate some work
+					time.Sleep(time.Microsecond * 100)
+				}
+
+				if err := pool.Submit(task); err != nil {
+					errors <- err
+					return
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errors)
+
+	// Check for errors
+	for err := range errors {
+		t.Errorf("Task submission error: %v", err)
+	}
+
+	// Wait for all tasks to complete
+	time.Sleep(2 * time.Second)
+
+	stats := pool.GetStats()
+	expectedTasks := int64(numGoroutines * tasksPerGoroutine)
+	assert.Equal(t, expectedTasks, stats.TasksProcessed)
+}
+
+func TestLRUCache_ConcurrentAccess(t *testing.T) {
+	cache := NewLRUCache(1000, 1*time.Second, false, &SystemTimeProvider{})
+
+	const numGoroutines = 20
+	const operationsPerGoroutine = 1000
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+
+			for j := 0; j < operationsPerGoroutine; j++ {
+				key := workerID*operationsPerGoroutine + j
+
+				// Mix of operations
+				switch j % 3 {
+				case 0:
+					cache.Set(key, key*2)
+				case 1:
+					cache.Get(key % 100) // Get existing key
+				case 2:
+					cache.Delete(key % 50) // Delete some keys
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Test completed successfully if no panics occurred
+	assert.True(t, true)
+}

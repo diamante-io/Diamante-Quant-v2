@@ -1,0 +1,503 @@
+package api_test
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"diamante/common"
+	"diamante/wallet"
+
+	"github.com/gorilla/mux"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestWallet_HandleCreateWallet(t *testing.T) {
+	apiServer, _, _, _, _, mockWM := setupTestAPI(t)
+
+	testCases := []struct {
+		name           string
+		requestBody    map[string]interface{}
+		expectedStatus int
+		setupMocks     func()
+		checkResponse  func(t *testing.T, response map[string]interface{})
+	}{
+		{
+			name: "Create with password",
+			requestBody: map[string]interface{}{
+				"password": "secure-password-123",
+			},
+			expectedStatus: http.StatusCreated,
+			setupMocks: func() {
+				mockWM.On("CreateWallet", "secure-password-123").Return(&wallet.Wallet{
+					ID:       "wallet-123",
+					Address:  "0xnewwallet",
+					Mnemonic: "test mnemonic phrase",
+				}, nil)
+			},
+			checkResponse: func(t *testing.T, response map[string]interface{}) {
+				assert.Equal(t, "wallet-123", response["id"])
+				assert.Equal(t, "0xnewwallet", response["address"])
+				assert.NotEmpty(t, response["mnemonic"])
+			},
+		},
+		{
+			name: "Import with mnemonic",
+			requestBody: map[string]interface{}{
+				"password": "password123",
+				"mnemonic": "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+			},
+			expectedStatus: http.StatusCreated,
+			setupMocks: func() {
+				mockWM.On("ImportWallet", 
+					"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+					"password123",
+				).Return(&wallet.Wallet{
+					ID:      "imported-wallet",
+					Address: "0ximported",
+				}, nil)
+			},
+			checkResponse: func(t *testing.T, response map[string]interface{}) {
+				assert.Equal(t, "imported-wallet", response["id"])
+				assert.Equal(t, "0ximported", response["address"])
+			},
+		},
+		{
+			name: "Missing password",
+			requestBody: map[string]interface{}{},
+			expectedStatus: http.StatusBadRequest,
+			setupMocks: func() {},
+			checkResponse: func(t *testing.T, response map[string]interface{}) {
+				assert.Contains(t, response["error"], "password")
+			},
+		},
+		{
+			name: "Invalid mnemonic",
+			requestBody: map[string]interface{}{
+				"password": "password123",
+				"mnemonic": "invalid mnemonic phrase",
+			},
+			expectedStatus: http.StatusBadRequest,
+			setupMocks: func() {
+				mockWM.On("ImportWallet", "invalid mnemonic phrase", "password123").
+					Return(nil, wallet.ErrInvalidMnemonic)
+			},
+			checkResponse: func(t *testing.T, response map[string]interface{}) {
+				assert.Contains(t, response["error"], "mnemonic")
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.setupMocks()
+
+			body, _ := json.Marshal(tc.requestBody)
+			req, err := http.NewRequest("POST", "/wallets", bytes.NewBuffer(body))
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer test-token")
+			req.Header.Set("Content-Type", "application/json")
+
+			rr := httptest.NewRecorder()
+			router := mux.NewRouter()
+			apiServer.SetupRoutes(router)
+			router.ServeHTTP(rr, req)
+
+			assert.Equal(t, tc.expectedStatus, rr.Code)
+
+			var response map[string]interface{}
+			err = json.Unmarshal(rr.Body.Bytes(), &response)
+			require.NoError(t, err)
+
+			tc.checkResponse(t, response)
+		})
+	}
+
+	mockWM.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetWallet(t *testing.T) {
+	apiServer, _, _, _, _, mockWM := setupTestAPI(t)
+
+	testWallet := &wallet.Wallet{
+		ID:        "wallet-123",
+		Address:   "0xwallet123",
+		PublicKey: "0xpubkey",
+		CreatedAt: 1234567890,
+	}
+
+	// Setup mock
+	mockWM.On("GetWallet", "wallet-123").Return(testWallet, nil)
+	mockWM.On("GetWallet", "nonexistent").Return(nil, wallet.ErrWalletNotFound)
+
+	// Test successful get
+	req, err := http.NewRequest("GET", "/wallets/wallet-123", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "wallet-123", response["id"])
+	assert.Equal(t, "0xwallet123", response["address"])
+	assert.Equal(t, "0xpubkey", response["publicKey"])
+
+	// Test wallet not found
+	req2, err := http.NewRequest("GET", "/wallets/nonexistent", nil)
+	require.NoError(t, err)
+	req2.Header.Set("Authorization", "Bearer test-token")
+
+	rr2 := httptest.NewRecorder()
+	router.ServeHTTP(rr2, req2)
+
+	assert.Equal(t, http.StatusNotFound, rr2.Code)
+
+	mockWM.AssertExpectations(t)
+}
+
+func TestAPI_HandleListWallets(t *testing.T) {
+	apiServer, _, _, _, _, mockWM := setupTestAPI(t)
+
+	testWallets := []*wallet.Wallet{
+		{
+			ID:      "wallet-1",
+			Address: "0xwallet1",
+		},
+		{
+			ID:      "wallet-2",
+			Address: "0xwallet2",
+		},
+		{
+			ID:      "wallet-3",
+			Address: "0xwallet3",
+		},
+	}
+
+	// Setup mock
+	mockWM.On("ListWallets").Return(testWallets, nil)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/wallets", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response struct {
+		Wallets []map[string]interface{} `json:"wallets"`
+		Count   int                      `json:"count"`
+	}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, response.Count)
+	assert.Len(t, response.Wallets, 3)
+	assert.Equal(t, "wallet-1", response.Wallets[0]["id"])
+	assert.Equal(t, "wallet-2", response.Wallets[1]["id"])
+	assert.Equal(t, "wallet-3", response.Wallets[2]["id"])
+
+	mockWM.AssertExpectations(t)
+}
+
+func TestAPI_HandleDeleteWallet(t *testing.T) {
+	apiServer, _, _, _, _, mockWM := setupTestAPI(t)
+
+	// Setup mocks
+	mockWM.On("DeleteWallet", "wallet-123").Return(nil)
+	mockWM.On("DeleteWallet", "nonexistent").Return(wallet.ErrWalletNotFound)
+
+	// Test successful deletion
+	req, err := http.NewRequest("DELETE", "/wallets/wallet-123", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+	assert.Equal(t, "Wallet deleted successfully", response["message"])
+
+	// Test wallet not found
+	req2, err := http.NewRequest("DELETE", "/wallets/nonexistent", nil)
+	require.NoError(t, err)
+	req2.Header.Set("Authorization", "Bearer test-token")
+
+	rr2 := httptest.NewRecorder()
+	router.ServeHTTP(rr2, req2)
+
+	assert.Equal(t, http.StatusNotFound, rr2.Code)
+
+	mockWM.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetWalletBalance(t *testing.T) {
+	apiServer, _, _, mockLed, _, mockWM := setupTestAPI(t)
+
+	testWallet := &wallet.Wallet{
+		ID:      "wallet-123",
+		Address: "0xwallet123",
+	}
+
+	// Setup mocks
+	mockWM.On("GetWallet", "wallet-123").Return(testWallet, nil)
+	mockLed.On("GetBalance", "0xwallet123").Return(uint64(1000000), nil)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/wallets/wallet-123/balance", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "wallet-123", response["walletId"])
+	assert.Equal(t, "0xwallet123", response["address"])
+	assert.Equal(t, float64(1000000), response["balance"])
+
+	mockWM.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+}
+
+func TestAPI_HandleTransferFunds(t *testing.T) {
+	apiServer, _, _, mockLed, mockTxPool, mockWM := setupTestAPI(t)
+
+	fromWallet := &wallet.Wallet{
+		ID:         "wallet-123",
+		Address:    "0xfrom",
+		PrivateKey: "0xprivkey",
+	}
+
+	// Setup mocks
+	mockWM.On("GetWallet", "wallet-123").Return(fromWallet, nil)
+	mockLed.On("GetAccount", "0xfrom").Return(common.Account{
+		ID:      "0xfrom",
+		Balance: 2000000,
+		Nonce:   5,
+	}, nil)
+	mockLed.On("Transfer", "0xfrom", "0xto", uint64(100000)).Return(nil)
+	mockTxPool.On("AddTransaction", mock.Anything).Return(nil)
+	mockTxPool.On("ValidateTransaction", mock.Anything).Return(nil)
+
+	// Create request body
+	reqBody := map[string]interface{}{
+		"to":       "0xto",
+		"amount":   100000,
+		"password": "wallet-password",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/wallets/wallet-123/transfer", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "Transfer initiated successfully", response["message"])
+	assert.NotEmpty(t, response["transactionHash"])
+
+	mockWM.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+	mockTxPool.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetWalletTransactions(t *testing.T) {
+	apiServer, mockStore, _, _, mockTxPool, mockWM := setupTestAPI(t)
+
+	testWallet := &wallet.Wallet{
+		ID:      "wallet-123",
+		Address: "0xwallet123",
+	}
+
+	walletTxs := []types.Transaction{
+		{
+			Hash:   "0xtx1",
+			From:   "0xwallet123",
+			To:     "0xother",
+			Amount: 100,
+		},
+		{
+			Hash:   "0xtx2",
+			From:   "0xother",
+			To:     "0xwallet123",
+			Amount: 200,
+		},
+	}
+
+	// Setup mocks
+	mockWM.On("GetWallet", "wallet-123").Return(testWallet, nil)
+	mockTxPool.On("GetTransactionsByAddress", "0xwallet123").Return(walletTxs)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/wallets/wallet-123/transactions", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response struct {
+		WalletID     string              `json:"walletId"`
+		Address      string              `json:"address"`
+		Transactions []types.Transaction `json:"transactions"`
+		Count        int                 `json:"count"`
+	}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "wallet-123", response.WalletID)
+	assert.Equal(t, "0xwallet123", response.Address)
+	assert.Len(t, response.Transactions, 2)
+	assert.Equal(t, 2, response.Count)
+
+	mockWM.AssertExpectations(t)
+	mockTxPool.AssertExpectations(t)
+}
+
+func TestAPI_HandleFundWallet(t *testing.T) {
+	apiServer, _, _, mockLed, _, mockWM := setupTestAPI(t)
+
+	testWallet := &wallet.Wallet{
+		ID:      "wallet-123",
+		Address: "0xwallet123",
+	}
+
+	// Setup mocks
+	mockWM.On("GetWallet", "wallet-123").Return(testWallet, nil)
+	mockLed.On("CreateAccount", "0xwallet123", uint64(1000000)).Return(nil)
+
+	// Create request body
+	reqBody := map[string]interface{}{
+		"amount": 1000000,
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/wallets/wallet-123/fund", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "Wallet funded successfully", response["message"])
+	assert.Equal(t, float64(1000000), response["amount"])
+
+	mockWM.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+}
+
+func TestAPI_WalletSecurity(t *testing.T) {
+	apiServer, _, _, _, _, mockWM := setupTestAPI(t)
+
+	// Test that sensitive data is not exposed
+	sensitiveWallet := &wallet.Wallet{
+		ID:         "wallet-sec",
+		Address:    "0xsecure",
+		PrivateKey: "0xPRIVATE_KEY_SHOULD_NOT_BE_EXPOSED",
+		Mnemonic:   "secret mnemonic phrase should not be exposed",
+		PublicKey:  "0xpubkey",
+	}
+
+	mockWM.On("GetWallet", "wallet-sec").Return(sensitiveWallet, nil)
+
+	req, err := http.NewRequest("GET", "/wallets/wallet-sec", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	// Verify sensitive data is not exposed
+	assert.NotContains(t, response, "privateKey")
+	assert.NotContains(t, response, "mnemonic")
+	
+	// Verify public data is present
+	assert.Equal(t, "wallet-sec", response["id"])
+	assert.Equal(t, "0xsecure", response["address"])
+	assert.Equal(t, "0xpubkey", response["publicKey"])
+
+	mockWM.AssertExpectations(t)
+}

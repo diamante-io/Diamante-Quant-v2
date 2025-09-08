@@ -5,6 +5,8 @@ package consensus
 import (
 	"fmt"
 	"time"
+
+	dtypes "diamante/types"
 )
 
 // ErrorCategory defines the general category of a consensus error
@@ -215,7 +217,7 @@ type ConsensusError struct {
 	RecoveryAction string
 
 	// Additional context
-	Context map[string]interface{}
+	Context map[string]*dtypes.Value
 }
 
 // Error implements the error interface
@@ -249,9 +251,30 @@ func (e *ConsensusError) Unwrap() error {
 // WithContext adds context information to the error
 func (e *ConsensusError) WithContext(key string, value interface{}) *ConsensusError {
 	if e.Context == nil {
-		e.Context = make(map[string]interface{})
+		e.Context = make(map[string]*dtypes.Value)
 	}
-	e.Context[key] = value
+	// Convert the value to a typed Value
+	var typedValue *dtypes.Value
+	switch v := value.(type) {
+	case string:
+		typedValue = dtypes.NewValue(dtypes.ValueTypeString, []byte(v))
+	case int, int32, int64, uint, uint32, uint64:
+		typedValue = dtypes.NewValue(dtypes.ValueTypeUint64, []byte(fmt.Sprintf("%d", v)))
+	case bool:
+		if v {
+			typedValue = dtypes.NewValue(dtypes.ValueTypeBool, []byte{1})
+		} else {
+			typedValue = dtypes.NewValue(dtypes.ValueTypeBool, []byte{0})
+		}
+	case time.Time:
+		typedValue = dtypes.NewValue(dtypes.ValueTypeTimestamp, []byte(v.Format(time.RFC3339)))
+	case []byte:
+		typedValue = dtypes.NewValue(dtypes.ValueTypeBytes, v)
+	default:
+		// For other types, convert to string
+		typedValue = dtypes.NewValue(dtypes.ValueTypeString, []byte(fmt.Sprintf("%v", value)))
+	}
+	e.Context[key] = typedValue
 	return e
 }
 
@@ -292,8 +315,8 @@ func NewConsensusError(code ConsensusErrorCode, category ErrorCategory, message 
 		Code:      code,
 		Category:  category,
 		Message:   message,
-		Timestamp: time.Now(),
-		Context:   make(map[string]interface{}),
+		Timestamp: ConsensusNow(),
+		Context:   make(map[string]*dtypes.Value),
 	}
 }
 
@@ -304,8 +327,8 @@ func WrapError(err error, code ConsensusErrorCode, category ErrorCategory, messa
 		Category:  category,
 		Message:   message,
 		Cause:     err,
-		Timestamp: time.Now(),
-		Context:   make(map[string]interface{}),
+		Timestamp: ConsensusNow(),
+		Context:   make(map[string]*dtypes.Value),
 	}
 }
 
@@ -390,7 +413,7 @@ func ShouldRetry(err error) (bool, time.Duration) {
 }
 
 // GetErrorContext returns the context map of a ConsensusError, or nil if not a ConsensusError
-func GetErrorContext(err error) map[string]interface{} {
+func GetErrorContext(err error) map[string]*dtypes.Value {
 	if cerr, ok := err.(*ConsensusError); ok {
 		return cerr.Context
 	}

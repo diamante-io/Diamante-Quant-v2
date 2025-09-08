@@ -1,0 +1,730 @@
+package api_test
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+
+	"diamante/api"
+	"diamante/common"
+	"diamante/config"
+	consensustypes "diamante/consensus/types"
+	"diamante/consensus/governance"
+	"diamante/storage"
+	"diamante/transaction"
+	"diamante/wallet"
+
+	"github.com/gorilla/mux"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+)
+
+// Mock dependencies
+type mockStorage struct {
+	mock.Mock
+}
+
+func (m *mockStorage) OpenDB() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockStorage) CloseDB() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockStorage) CheckHealth() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockStorage) SaveBlock(block common.Block) error {
+	args := m.Called(block)
+	return args.Error(0)
+}
+
+func (m *mockStorage) GetBlock(height uint64) (common.Block, error) {
+	args := m.Called(height)
+	return args.Get(0).(common.Block), args.Error(1)
+}
+
+func (m *mockStorage) GetLatestBlock() (common.Block, error) {
+	args := m.Called()
+	return args.Get(0).(common.Block), args.Error(1)
+}
+
+func (m *mockStorage) GetBlocksByRange(start, end uint64) ([]*common.Block, error) {
+	args := m.Called(start, end)
+	return args.Get(0).([]*common.Block), args.Error(1)
+}
+
+func (m *mockStorage) SaveTransaction(tx common.Transaction) error {
+	args := m.Called(tx)
+	return args.Error(0)
+}
+
+func (m *mockStorage) GetTransaction(hash string) (common.Transaction, error) {
+	args := m.Called(hash)
+	return args.Get(0).(common.Transaction), args.Error(1)
+}
+
+func (m *mockStorage) GetTransactionsByBlock(blockHeight uint64) ([]common.Transaction, error) {
+	args := m.Called(blockHeight)
+	return args.Get(0).([]common.Transaction), args.Error(1)
+}
+
+func (m *mockStorage) SaveState(key, value string) error {
+	args := m.Called(key, value)
+	return args.Error(0)
+}
+
+func (m *mockStorage) GetState(key string) (string, error) {
+	args := m.Called(key)
+	return args.Get(0).(string), args.Error(1)
+}
+
+func (m *mockStorage) DeleteState(key string) error {
+	args := m.Called(key)
+	return args.Error(0)
+}
+
+func (m *mockStorage) SaveValidatorSet(validators []*consensustypes.Validator) error {
+	args := m.Called(validators)
+	return args.Error(0)
+}
+
+func (m *mockStorage) GetValidatorSet() ([]*consensustypes.Validator, error) {
+	args := m.Called()
+	return args.Get(0).([]*consensustypes.Validator), args.Error(1)
+}
+
+func (m *mockStorage) CreateSnapshot(height uint64) (string, error) {
+	args := m.Called(height)
+	return args.Get(0).(string), args.Error(1)
+}
+
+func (m *mockStorage) RestoreSnapshot(snapshotID string) error {
+	args := m.Called(snapshotID)
+	return args.Error(0)
+}
+
+func (m *mockStorage) CreateBackup(backupPath string) error {
+	args := m.Called(backupPath)
+	return args.Error(0)
+}
+
+func (m *mockStorage) RestoreBackup(backupPath string) error {
+	args := m.Called(backupPath)
+	return args.Error(0)
+}
+
+func (m *mockStorage) Prune(beforeHeight uint64) error {
+	args := m.Called(beforeHeight)
+	return args.Error(0)
+}
+
+func (m *mockStorage) GetAccount(address string) (common.Account, error) {
+	args := m.Called(address)
+	return args.Get(0).(common.Account), args.Error(1)
+}
+
+func (m *mockStorage) SaveAccount(account common.Account) error {
+	args := m.Called(account)
+	return args.Error(0)
+}
+
+func (m *mockStorage) BeginBatch() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockStorage) CommitBatch() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockStorage) RollbackBatch() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockStorage) GetStorageStats() (storage.StorageStats, error) {
+	args := m.Called()
+	return args.Get(0).(storage.StorageStats), args.Error(1)
+}
+
+type mockConsensus struct {
+	mock.Mock
+}
+
+func (m *mockConsensus) Start(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *mockConsensus) Stop() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+func (m *mockConsensus) IsValidator(address string) bool {
+	args := m.Called(address)
+	return args.Bool(0)
+}
+
+func (m *mockConsensus) GetValidators() []*consensustypes.Validator {
+	args := m.Called()
+	return args.Get(0).([]*consensustypes.Validator)
+}
+
+func (m *mockConsensus) ProposeBlock(block *common.Block) error {
+	args := m.Called(block)
+	return args.Error(0)
+}
+
+func (m *mockConsensus) ValidateBlock(block *common.Block) error {
+	args := m.Called(block)
+	return args.Error(0)
+}
+
+// Remove GetConsensusState - not in interface
+
+func (m *mockConsensus) GetCurrentHeight() uint64 {
+	args := m.Called()
+	return args.Get(0).(uint64)
+}
+
+// Remove GetConsensusParams - not in interface
+
+func (m *mockConsensus) UpdateValidatorSet(validators []*consensustypes.Validator) error {
+	args := m.Called(validators)
+	return args.Error(0)
+}
+
+type mockLedger struct {
+	mock.Mock
+}
+
+func (m *mockLedger) GetBalance(address string) (uint64, error) {
+	args := m.Called(address)
+	return args.Get(0).(uint64), args.Error(1)
+}
+
+func (m *mockLedger) Transfer(from, to string, amount uint64) error {
+	args := m.Called(from, to, amount)
+	return args.Error(0)
+}
+
+func (m *mockLedger) GetAccount(address string) (common.Account, error) {
+	args := m.Called(address)
+	return args.Get(0).(common.Account), args.Error(1)
+}
+
+func (m *mockLedger) CreateAccount(address string, initialBalance uint64) error {
+	args := m.Called(address, initialBalance)
+	return args.Error(0)
+}
+
+func (m *mockLedger) UpdateAccount(account common.Account) error {
+	args := m.Called(account)
+	return args.Error(0)
+}
+
+func (m *mockLedger) ApplyTransaction(tx *common.Transaction) error {
+	args := m.Called(tx)
+	return args.Error(0)
+}
+
+func (m *mockLedger) GetStateRoot() (string, error) {
+	args := m.Called()
+	return args.Get(0).(string), args.Error(1)
+}
+
+func (m *mockLedger) CreateSnapshot(height uint64) (string, error) {
+	args := m.Called(height)
+	return args.Get(0).(string), args.Error(1)
+}
+
+func (m *mockLedger) RestoreSnapshot(snapshotID string) error {
+	args := m.Called(snapshotID)
+	return args.Error(0)
+}
+
+func (m *mockLedger) GetTotalSupply() (uint64, error) {
+	args := m.Called()
+	return args.Get(0).(uint64), args.Error(1)
+}
+
+func (m *mockLedger) GetCirculatingSupply() (uint64, error) {
+	args := m.Called()
+	return args.Get(0).(uint64), args.Error(1)
+}
+
+type mockTransactionPool struct {
+	mock.Mock
+}
+
+func (m *mockTransactionPool) AddTransaction(tx *common.Transaction) error {
+	args := m.Called(tx)
+	return args.Error(0)
+}
+
+func (m *mockTransactionPool) GetTransaction(hash string) (*common.Transaction, bool) {
+	args := m.Called(hash)
+	return args.Get(0).(*common.Transaction), args.Bool(1)
+}
+
+func (m *mockTransactionPool) GetPendingTransactions() []*common.Transaction {
+	args := m.Called()
+	return args.Get(0).([]*common.Transaction)
+}
+
+func (m *mockTransactionPool) RemoveTransaction(hash string) bool {
+	args := m.Called(hash)
+	return args.Bool(0)
+}
+
+func (m *mockTransactionPool) Clear() {
+	m.Called()
+}
+
+func (m *mockTransactionPool) Size() int {
+	args := m.Called()
+	return args.Int(0)
+}
+
+func (m *mockTransactionPool) ValidateTransaction(tx *common.Transaction) error {
+	args := m.Called(tx)
+	return args.Error(0)
+}
+
+func (m *mockTransactionPool) GetTransactionsByAddress(address string) []*common.Transaction {
+	args := m.Called(address)
+	return args.Get(0).([]*common.Transaction)
+}
+
+func (m *mockTransactionPool) GetPoolStats() transaction.PoolStats {
+	args := m.Called()
+	return args.Get(0).(transaction.PoolStats)
+}
+
+func (m *mockTransactionPool) SetMaxSize(size int) {
+	m.Called(size)
+}
+
+func (m *mockTransactionPool) GetMaxSize() int {
+	args := m.Called()
+	return args.Int(0)
+}
+
+func (m *mockTransactionPool) SetGasPrice(price uint64) {
+	m.Called(price)
+}
+
+func (m *mockTransactionPool) GetMinGasPrice() uint64 {
+	args := m.Called()
+	return args.Get(0).(uint64)
+}
+
+func (m *mockTransactionPool) Start(ctx context.Context) error {
+	args := m.Called(ctx)
+	return args.Error(0)
+}
+
+func (m *mockTransactionPool) Stop() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+type mockWalletManager struct {
+	mock.Mock
+}
+
+func (m *mockWalletManager) CreateWallet(password string) (*wallet.Wallet, error) {
+	args := m.Called(password)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*wallet.Wallet), args.Error(1)
+}
+
+func (m *mockWalletManager) ImportWallet(mnemonic, password string) (*wallet.Wallet, error) {
+	args := m.Called(mnemonic, password)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*wallet.Wallet), args.Error(1)
+}
+
+func (m *mockWalletManager) GetWallet(id string) (*wallet.Wallet, error) {
+	args := m.Called(id)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*wallet.Wallet), args.Error(1)
+}
+
+func (m *mockWalletManager) ListWallets() ([]*wallet.Wallet, error) {
+	args := m.Called()
+	return args.Get(0).([]*wallet.Wallet), args.Error(1)
+}
+
+func (m *mockWalletManager) DeleteWallet(id string) error {
+	args := m.Called(id)
+	return args.Error(0)
+}
+
+func (m *mockWalletManager) SaveWallet(w *wallet.Wallet) error {
+	args := m.Called(w)
+	return args.Error(0)
+}
+
+func (m *mockWalletManager) LoadWallets() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+// Test setup helper
+func setupTestAPI(t *testing.T) (*api.API, *mockStorage, *mockConsensus, *mockLedger, *mockTransactionPool, *mockWalletManager) {
+	mockStore := &mockStorage{}
+	mockCon := &mockConsensus{}
+	mockLed := &mockLedger{}
+	mockTxPool := &mockTransactionPool{}
+	mockWM := &mockWalletManager{}
+
+	// Create test config and logger
+	logger := logrus.New()
+	testConfig := &config.Config{}
+	mockGov := (*governance.Governance)(nil) // Nil governance for test
+	healthFn := func() int { return 1 } // Simple health function
+
+	// Create API with correct signature
+	apiServer := api.NewAPI(
+		mockLed,        // LedgerAPI
+		mockCon,        // Consensus
+		nil,            // TransactionManager (nil for now)
+		mockStore,      // LedgerStore
+		mockGov,        // Governance
+		logger,         // Logger
+		testConfig,     // Config
+		healthFn,       // Health function
+	)
+
+	return apiServer, mockStore, mockCon, mockLed, mockTxPool, mockWM
+}
+
+// Test cases
+
+func TestAPI_HandleStatus(t *testing.T) {
+	apiServer, mockStore, mockCon, _, mockTxPool, _ := setupTestAPI(t)
+
+	// Setup mocks
+	mockStore.On("CheckHealth").Return(nil)
+	mockCon.On("GetCurrentHeight").Return(uint64(100))
+	// mockCon.On("GetConsensusState").Return(consensus.StateRunning) - removed, not in interface
+	mockTxPool.On("Size").Return(50)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/status", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "ok", response["status"])
+	assert.Equal(t, float64(100), response["height"])
+	assert.Equal(t, float64(50), response["pending_transactions"])
+
+	// Verify mock calls
+	mockStore.AssertExpectations(t)
+	mockCon.AssertExpectations(t)
+	mockTxPool.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetAccount(t *testing.T) {
+	apiServer, mockStore, _, mockLed, _, _ := setupTestAPI(t)
+
+	testAddress := "0x1234567890abcdef"
+	testAccount := common.Account{
+		ID:      testAddress,
+		Balance: 1000000,
+		Nonce:   5,
+	}
+
+	// Setup mocks
+	mockStore.On("GetAccount", testAddress).Return(testAccount, nil)
+	mockLed.On("GetAccount", testAddress).Return(common.Account{
+		ID:      testAddress,
+		Balance: 1000000,
+		Nonce:   5,
+	}, nil)
+
+	// Create request
+	req, err := http.NewRequest("GET", fmt.Sprintf("/accounts/%s", testAddress), nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, testAddress, response["address"])
+	assert.Equal(t, float64(1000000), response["balance"])
+	assert.Equal(t, float64(5), response["nonce"])
+
+	// Verify mock calls
+	mockStore.AssertExpectations(t)
+	mockLed.AssertExpectations(t)
+}
+
+func TestAPI_HandleGetBlock(t *testing.T) {
+	apiServer, mockStore, _, _, _, _ := setupTestAPI(t)
+
+	testBlock := common.Block{
+		Number:    100,
+		Hash:      "0xabcdef",
+		Timestamp: time.Now().Unix(),
+		Transactions: []common.Transaction{
+			{
+				ID:       "0x123",
+				Sender:   "0xaaa",
+				Receiver: "0xbbb",
+				Amount:   100,
+			},
+		},
+	}
+
+	// Setup mocks
+	mockStore.On("GetBlock", uint64(100)).Return(testBlock, nil)
+
+	// Create request
+	req, err := http.NewRequest("GET", "/blocks/100", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusOK, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, float64(100), response["height"])
+	assert.Equal(t, "0xabcdef", response["hash"])
+	assert.NotNil(t, response["transactions"])
+
+	// Verify mock calls
+	mockStore.AssertExpectations(t)
+}
+
+func TestAPI_HandleCreateWallet(t *testing.T) {
+	apiServer, _, _, _, _, mockWM := setupTestAPI(t)
+
+	testWallet := &wallet.Wallet{
+		ID: "wallet-123",
+	}
+
+	// Setup mocks
+	mockWM.On("CreateWallet", "test-password").Return(testWallet, nil)
+
+	// Create request body
+	reqBody := map[string]string{
+		"password": "test-password",
+	}
+	body, _ := json.Marshal(reqBody)
+
+	// Create request
+	req, err := http.NewRequest("POST", "/wallets", bytes.NewBuffer(body))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+	req.Header.Set("Content-Type", "application/json")
+
+	// Create response recorder
+	rr := httptest.NewRecorder()
+
+	// Create router and handle request
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	// Check response
+	assert.Equal(t, http.StatusCreated, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+
+	assert.Equal(t, "wallet-123", response["id"])
+	assert.Equal(t, "0xwallet123", response["address"])
+
+	// Verify mock calls
+	mockWM.AssertExpectations(t)
+}
+
+func TestAPI_RateLimiting(t *testing.T) {
+	apiServer, mockStore, mockCon, _, mockTxPool, _ := setupTestAPI(t)
+
+	// Setup mocks for multiple calls
+	mockStore.On("CheckHealth").Return(nil)
+	mockCon.On("GetCurrentHeight").Return(uint64(100))
+	// mockCon.On("GetConsensusState").Return(consensus.StateRunning) - removed, not in interface
+	mockTxPool.On("Size").Return(50)
+
+	// Create router
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+
+	// Make requests up to rate limit
+	for i := 0; i < 100; i++ {
+		req, err := http.NewRequest("GET", "/status", nil)
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer test-token")
+
+		rr := httptest.NewRecorder()
+		router.ServeHTTP(rr, req)
+
+		assert.Equal(t, http.StatusOK, rr.Code)
+	}
+
+	// Next request should be rate limited
+	req, err := http.NewRequest("GET", "/status", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	rr := httptest.NewRecorder()
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusTooManyRequests, rr.Code)
+}
+
+func TestAPI_Authentication(t *testing.T) {
+	apiServer, _, _, _, _, _ := setupTestAPI(t)
+
+	testCases := []struct {
+		name           string
+		authHeader     string
+		expectedStatus int
+	}{
+		{
+			name:           "Valid Bearer Token",
+			authHeader:     "Bearer test-token",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "Valid API Key",
+			authHeader:     "test-api-key",
+			expectedStatus: http.StatusOK,
+		},
+		{
+			name:           "Invalid Token",
+			authHeader:     "Bearer invalid-token",
+			expectedStatus: http.StatusUnauthorized,
+		},
+		{
+			name:           "No Auth Header",
+			authHeader:     "",
+			expectedStatus: http.StatusUnauthorized,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", "/health", nil)
+			require.NoError(t, err)
+
+			if tc.authHeader != "" {
+				req.Header.Set("Authorization", tc.authHeader)
+			}
+
+			rr := httptest.NewRecorder()
+			router := mux.NewRouter()
+			apiServer.SetupRoutes(router)
+			router.ServeHTTP(rr, req)
+
+			assert.Equal(t, tc.expectedStatus, rr.Code)
+		})
+	}
+}
+
+func TestAPI_ErrorHandling(t *testing.T) {
+	apiServer, mockStore, _, _, _, _ := setupTestAPI(t)
+
+	// Test storage error
+	mockStore.On("GetBlock", uint64(999)).Return(common.Block{}, fmt.Errorf("block not found"))
+
+	req, err := http.NewRequest("GET", "/blocks/999", nil)
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer test-token")
+
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusNotFound, rr.Code)
+
+	var response map[string]interface{}
+	err = json.Unmarshal(rr.Body.Bytes(), &response)
+	require.NoError(t, err)
+	assert.Contains(t, response["error"], "not found")
+
+	mockStore.AssertExpectations(t)
+}
+
+func TestAPI_CORS(t *testing.T) {
+	apiServer, _, _, _, _, _ := setupTestAPI(t)
+
+	req, err := http.NewRequest("OPTIONS", "/status", nil)
+	require.NoError(t, err)
+	req.Header.Set("Origin", "http://localhost:3000")
+	req.Header.Set("Access-Control-Request-Method", "GET")
+
+	rr := httptest.NewRecorder()
+	router := mux.NewRouter()
+	apiServer.SetupRoutes(router)
+	router.ServeHTTP(rr, req)
+
+	assert.Equal(t, http.StatusOK, rr.Code)
+	assert.Equal(t, "*", rr.Header().Get("Access-Control-Allow-Origin"))
+	assert.Contains(t, rr.Header().Get("Access-Control-Allow-Methods"), "GET")
+}

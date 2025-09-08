@@ -1,0 +1,446 @@
+// Package network provides typed peer management
+package network
+
+import (
+	"context"
+	"crypto/tls"
+	"fmt"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"diamante/common"
+	"diamante/types"
+	"github.com/sirupsen/logrus"
+)
+
+// PeerState represents the state of a peer connection
+type PeerState uint8
+
+const (
+	PeerStateUnknown PeerState = iota
+	PeerStateConnecting
+	PeerStateHandshaking
+	PeerStateConnected
+	PeerStateDisconnecting
+	PeerStateDisconnected
+	PeerStateBanned
+)
+
+// TypedPeer represents a typed network peer
+type TypedPeer struct {
+	id              string
+	address         string
+	conn            net.Conn
+	state           atomic.Value // PeerState
+	version         string
+	chainID         string
+	height          atomic.Uint64
+	capabilities    []string
+	metadata        *types.TypedMap
+	
+	// Communication channels
+	sendChan        chan []byte
+	recvChan        chan []byte
+	closeChan       chan struct{}
+	
+	// Stats
+	messagesSent    atomic.Uint64
+	messagesRecv    atomic.Uint64
+	bytesSent       atomic.Uint64
+	bytesRecv       atomic.Uint64
+	lastActivity    atomic.Value // time.Time
+	connectTime     time.Time
+	
+	// Configuration
+	sendTimeout     time.Duration
+	recvTimeout     time.Duration
+	maxMessageSize  uint64
+	
+	logger          *logrus.Logger
+	mu              sync.RWMutex
+}
+
+// PeerConfig contains configuration for a peer
+type PeerConfig struct {
+	Address         string
+	TLSConfig       *tls.Config
+	SendTimeout     time.Duration
+	RecvTimeout     time.Duration
+	MaxMessageSize  uint64
+	BufferSize      int
+	Logger          *logrus.Logger
+}
+
+// PeerInfo contains information about a peer
+type PeerInfo struct {
+	ID              string            `json:"id"`
+	Address         string            `json:"address"`
+	State           PeerState         `json:"state"`
+	Version         string            `json:"version"`
+	ChainID         string            `json:"chain_id"`
+	Height          uint64            `json:"height"`
+	Capabilities    []string          `json:"capabilities"`
+	ConnectTime     time.Time         `json:"connect_time"`
+	LastActivity    time.Time         `json:"last_activity"`
+	MessagesSent    uint64            `json:"messages_sent"`
+	MessagesRecv    uint64            `json:"messages_recv"`
+	BytesSent       uint64            `json:"bytes_sent"`
+	BytesRecv       uint64            `json:"bytes_recv"`
+	Metadata        map[string]*types.Value `json:"metadata"`
+}
+
+// NewTypedPeer creates a new typed peer from an existing connection
+func NewTypedPeer(conn net.Conn, config *PeerConfig) *TypedPeer {
+	if config.Logger == nil {
+		config.Logger = logrus.New()
+	}
+	
+	if config.SendTimeout == 0 {
+		config.SendTimeout = 30 * time.Second
+	}
+	
+	if config.RecvTimeout == 0 {
+		config.RecvTimeout = 30 * time.Second
+	}
+	
+	if config.MaxMessageSize == 0 {
+		config.MaxMessageSize = 10 * 1024 * 1024 // 10MB
+	}
+	
+	if config.BufferSize == 0 {
+		config.BufferSize = 100
+	}
+	
+	peer := &TypedPeer{
+		address:        conn.RemoteAddr().String(),
+		conn:           conn,
+		sendChan:       make(chan []byte, config.BufferSize),
+		recvChan:       make(chan []byte, config.BufferSize),
+		closeChan:      make(chan struct{}),
+		sendTimeout:    config.SendTimeout,
+		recvTimeout:    config.RecvTimeout,
+		maxMessageSize: config.MaxMessageSize,
+		connectTime:    common.ConsensusNow(),
+		logger:         config.Logger,
+		metadata:       types.NewTypedMap(),
+	}
+	
+	peer.state.Store(PeerStateConnecting)
+	peer.lastActivity.Store(common.ConsensusNow())
+	
+	// Start communication goroutines
+	go peer.sendLoop()
+	go peer.recvLoop()
+	
+	return peer
+}
+
+// DialTypedPeer creates a new peer by dialing an address
+func DialTypedPeer(ctx context.Context, config *PeerConfig) (*TypedPeer, error) {
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second,
+	}
+	
+	conn, err := dialer.DialContext(ctx, "tcp", config.Address)
+	if err != nil {
+		return nil, fmt.Errorf("failed to dial peer: %w", err)
+	}
+	
+	// Upgrade to TLS if configured
+	if config.TLSConfig != nil {
+		tlsConn := tls.Client(conn, config.TLSConfig)
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("TLS handshake failed: %w", err)
+		}
+		conn = tlsConn
+	}
+	
+	return NewTypedPeer(conn, config), nil
+}
+
+// ID returns the peer ID
+func (p *TypedPeer) ID() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.id
+}
+
+// SetID sets the peer ID (usually after handshake)
+func (p *TypedPeer) SetID(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.id = id
+}
+
+// Address returns the peer address
+func (p *TypedPeer) Address() string {
+	return p.address
+}
+
+// State returns the current peer state
+func (p *TypedPeer) State() PeerState {
+	return p.state.Load().(PeerState)
+}
+
+// SetState updates the peer state
+func (p *TypedPeer) SetState(state PeerState) {
+	oldState := p.state.Load().(PeerState)
+	p.state.Store(state)
+	
+	p.logger.WithFields(logrus.Fields{
+		"peer":      p.id,
+		"old_state": oldState,
+		"new_state": state,
+	}).Debug("Peer state changed")
+}
+
+// Send sends a message to the peer
+func (p *TypedPeer) Send(data []byte) error {
+	if p.State() != PeerStateConnected {
+		return fmt.Errorf("peer not connected")
+	}
+	
+	if uint64(len(data)) > p.maxMessageSize {
+		return fmt.Errorf("message too large: %d > %d", len(data), p.maxMessageSize)
+	}
+	
+	select {
+	case p.sendChan <- data:
+		return nil
+	case <-p.closeChan:
+		return fmt.Errorf("peer closed")
+	case <-time.After(p.sendTimeout):
+		return fmt.Errorf("send timeout")
+	}
+}
+
+// Receive receives a message from the peer
+func (p *TypedPeer) Receive() ([]byte, error) {
+	select {
+	case data := <-p.recvChan:
+		return data, nil
+	case <-p.closeChan:
+		return nil, fmt.Errorf("peer closed")
+	case <-time.After(p.recvTimeout):
+		return nil, fmt.Errorf("receive timeout")
+	}
+}
+
+// Close closes the peer connection
+func (p *TypedPeer) Close() error {
+	p.SetState(PeerStateDisconnecting)
+	
+	// Close channels
+	select {
+	case <-p.closeChan:
+		// Already closed
+	default:
+		close(p.closeChan)
+	}
+	
+	// Close connection
+	err := p.conn.Close()
+	
+	p.SetState(PeerStateDisconnected)
+	
+	p.logger.WithFields(logrus.Fields{
+		"peer":          p.id,
+		"messages_sent": p.messagesSent.Load(),
+		"messages_recv": p.messagesRecv.Load(),
+		"bytes_sent":    p.bytesSent.Load(),
+		"bytes_recv":    p.bytesRecv.Load(),
+		"duration":      time.Since(p.connectTime),
+	}).Info("Peer disconnected")
+	
+	return err
+}
+
+// sendLoop handles outgoing messages
+func (p *TypedPeer) sendLoop() {
+	for {
+		select {
+		case data := <-p.sendChan:
+			// Write message length prefix (4 bytes)
+			lengthBuf := make([]byte, 4)
+			length := uint32(len(data))
+			lengthBuf[0] = byte(length >> 24)
+			lengthBuf[1] = byte(length >> 16)
+			lengthBuf[2] = byte(length >> 8)
+			lengthBuf[3] = byte(length)
+			
+			p.conn.SetWriteDeadline(common.ConsensusNow().Add(p.sendTimeout))
+			
+			// Write length
+			if _, err := p.conn.Write(lengthBuf); err != nil {
+				p.logger.WithError(err).Error("Failed to write message length")
+				p.Close()
+				return
+			}
+			
+			// Write data
+			if _, err := p.conn.Write(data); err != nil {
+				p.logger.WithError(err).Error("Failed to write message data")
+				p.Close()
+				return
+			}
+			
+			p.messagesSent.Add(1)
+			p.bytesSent.Add(uint64(len(data) + 4))
+			p.lastActivity.Store(common.ConsensusNow())
+			
+		case <-p.closeChan:
+			return
+		}
+	}
+}
+
+// recvLoop handles incoming messages
+func (p *TypedPeer) recvLoop() {
+	for {
+		select {
+		case <-p.closeChan:
+			return
+		default:
+			// Read message length prefix (4 bytes)
+			lengthBuf := make([]byte, 4)
+			p.conn.SetReadDeadline(common.ConsensusNow().Add(p.recvTimeout))
+			
+			if _, err := io.ReadFull(p.conn, lengthBuf); err != nil {
+				if err != io.EOF {
+					p.logger.WithError(err).Error("Failed to read message length")
+				}
+				p.Close()
+				return
+			}
+			
+			// Parse length
+			length := uint32(lengthBuf[0])<<24 | uint32(lengthBuf[1])<<16 | 
+					 uint32(lengthBuf[2])<<8 | uint32(lengthBuf[3])
+			
+			if uint64(length) > p.maxMessageSize {
+				p.logger.Errorf("Message too large: %d > %d", length, p.maxMessageSize)
+				p.Close()
+				return
+			}
+			
+			// Read message data
+			data := make([]byte, length)
+			if _, err := io.ReadFull(p.conn, data); err != nil {
+				p.logger.WithError(err).Error("Failed to read message data")
+				p.Close()
+				return
+			}
+			
+			p.messagesRecv.Add(1)
+			p.bytesRecv.Add(uint64(length + 4))
+			p.lastActivity.Store(common.ConsensusNow())
+			
+			// Send to receive channel
+			select {
+			case p.recvChan <- data:
+			case <-p.closeChan:
+				return
+			}
+		}
+	}
+}
+
+// UpdateHandshake updates peer info from handshake
+func (p *TypedPeer) UpdateHandshake(handshake *HandshakeData) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	
+	p.id = handshake.NodeID
+	p.version = handshake.Version
+	p.chainID = handshake.ChainID
+	p.height.Store(handshake.Height)
+	p.capabilities = handshake.Capabilities
+	
+	// Update metadata
+	for k, v := range handshake.Metadata {
+		p.metadata.Set(k, v)
+	}
+}
+
+// GetInfo returns peer information
+func (p *TypedPeer) GetInfo() *PeerInfo {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	
+	metadata := make(map[string]*types.Value)
+	p.metadata.Range(func(key string, value *types.Value) bool {
+		metadata[key] = value
+		return true
+	})
+	
+	return &PeerInfo{
+		ID:           p.id,
+		Address:      p.address,
+		State:        p.State(),
+		Version:      p.version,
+		ChainID:      p.chainID,
+		Height:       p.height.Load(),
+		Capabilities: p.capabilities,
+		ConnectTime:  p.connectTime,
+		LastActivity: p.lastActivity.Load().(time.Time),
+		MessagesSent: p.messagesSent.Load(),
+		MessagesRecv: p.messagesRecv.Load(),
+		BytesSent:    p.bytesSent.Load(),
+		BytesRecv:    p.bytesRecv.Load(),
+		Metadata:     metadata,
+	}
+}
+
+// IsActive checks if the peer is active
+func (p *TypedPeer) IsActive() bool {
+	state := p.State()
+	return state == PeerStateConnected || state == PeerStateHandshaking
+}
+
+// TimeSinceLastActivity returns time since last activity
+func (p *TypedPeer) TimeSinceLastActivity() time.Duration {
+	lastActivity := p.lastActivity.Load().(time.Time)
+	return time.Since(lastActivity)
+}
+
+// Ban marks the peer as banned
+func (p *TypedPeer) Ban(reason string) {
+	p.logger.WithFields(logrus.Fields{
+		"peer":   p.id,
+		"reason": reason,
+	}).Warn("Banning peer")
+	
+	p.SetState(PeerStateBanned)
+	p.Close()
+}
+
+// String returns string representation of the peer
+func (p *TypedPeer) String() string {
+	return fmt.Sprintf("Peer{id=%s, addr=%s, state=%v}", p.id, p.address, p.State())
+}
+
+// PeerStateString returns string representation of peer state
+func (s PeerState) String() string {
+	switch s {
+	case PeerStateUnknown:
+		return "unknown"
+	case PeerStateConnecting:
+		return "connecting"
+	case PeerStateHandshaking:
+		return "handshaking"
+	case PeerStateConnected:
+		return "connected"
+	case PeerStateDisconnecting:
+		return "disconnecting"
+	case PeerStateDisconnected:
+		return "disconnected"
+	case PeerStateBanned:
+		return "banned"
+	default:
+		return fmt.Sprintf("PeerState(%d)", s)
+	}
+}

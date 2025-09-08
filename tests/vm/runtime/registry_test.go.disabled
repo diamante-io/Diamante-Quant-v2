@@ -1,0 +1,653 @@
+// Package runtime_test provides tests for the runtime registration system
+package runtime_test
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+	"time"
+
+	"diamante/common"
+	"diamante/storage"
+	"diamante/vm/runtime"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+)
+
+// Mock runtime for testing
+type mockRuntime struct {
+	runtimeType runtime.RuntimeType
+	initialized bool
+	started     bool
+	healthy     bool
+}
+
+func (m *mockRuntime) Type() runtime.RuntimeType                     { return m.runtimeType }
+func (m *mockRuntime) Initialize(config runtime.RuntimeConfig) error { m.initialized = true; return nil }
+func (m *mockRuntime) Start() error                          { m.started = true; return nil }
+func (m *mockRuntime) Stop() error                           { m.started = false; return nil }
+func (m *mockRuntime) Compile(code []byte, metadata map[string]interface{}) (*CompiledContract, error) {
+	return &CompiledContract{
+		Runtime:    m.runtimeType,
+		Code:       code,
+		SourceHash: "test-hash",
+	}, nil
+}
+func (m *mockRuntime) Deploy(ctx context.Context, contract *CompiledContract, args DeploymentArgs) (*DeploymentResult, error) {
+	return &DeploymentResult{
+		ContractID: "test-contract",
+		GasUsed:    1000,
+		Timestamp:  time.Now(),
+	}, nil
+}
+func (m *mockRuntime) Execute(ctx context.Context, call ContractCall) (*ExecutionResult, error) {
+	return &ExecutionResult{
+		Success: true,
+		GasUsed: 100,
+	}, nil
+}
+func (m *mockRuntime) Upgrade(ctx context.Context, contractID string, newCode []byte, args UpgradeArgs) error {
+	return nil
+}
+func (m *mockRuntime) GetContractInfo(contractID string) (*ContractInfo, error) {
+	return &ContractInfo{
+		ContractID: contractID,
+		Runtime:    m.runtimeType,
+		Active:     true,
+	}, nil
+}
+func (m *mockRuntime) HealthCheck() error {
+	if !m.healthy {
+		return errors.New("unhealthy")
+	}
+	return nil
+}
+
+// Test runtime registration
+func TestRuntimeRegistration(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	t.Run("basic registration", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		// Create factory
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test", healthy: true}
+		}
+
+		// Register runtime
+		err := registry.RegisterRuntime("test", factory)
+		assert.NoError(t, err)
+
+		// Verify registration
+		registeredTypes := registry.ListRegisteredRuntimes()
+		assert.Equal(t, 1, len(registeredTypes))
+		assert.Equal(t, RuntimeType("test"), registeredTypes[0])
+
+		// Get factory back
+		retrievedFactory, err := registry.GetRuntimeFactory("test")
+		assert.NoError(t, err)
+		assert.NotNil(t, retrievedFactory)
+
+		// Create runtime instance
+		runtime := retrievedFactory()
+		assert.NotNil(t, runtime)
+		assert.Equal(t, RuntimeType("test"), runtime.Type())
+	})
+
+	t.Run("duplicate registration", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "test", healthy: true}
+		}
+
+		// First registration should succeed
+		err := registry.RegisterRuntime("test", factory)
+		assert.NoError(t, err)
+
+		// Second registration should fail
+		err = registry.RegisterRuntime("test", factory)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "already registered")
+	})
+
+	t.Run("nil factory", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		err := registry.RegisterRuntime("test", nil)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "factory cannot be nil")
+	})
+
+	t.Run("factory returns nil", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		factory := func() Runtime {
+			return nil
+		}
+
+		err := registry.RegisterRuntime("test", factory)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "returned nil")
+	})
+
+	t.Run("type mismatch", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		factory := func() Runtime {
+			return &mockRuntime{runtimeType: "wrong", healthy: true}
+		}
+
+		err := registry.RegisterRuntime("test", factory)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "type mismatch")
+	})
+}
+
+// Test metadata registration
+func TestMetadataRegistration(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	t.Run("valid metadata", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		metadata := RuntimeMetadata{
+			Name:        "Test Runtime",
+			Version:     "1.0.0",
+			Description: "A test runtime",
+			Author:      "Test Author",
+			License:     "MIT",
+			Repository:  "https://github.com/test/test",
+			Capabilities: []RuntimeCapability{
+				CapabilitySmartContracts,
+				CapabilityStateManagement,
+			},
+		}
+
+		err := registry.RegisterMetadata("test", metadata)
+		assert.NoError(t, err)
+
+		// Retrieve metadata
+		retrieved, exists := registry.GetRuntimeMetadata("test")
+		assert.True(t, exists)
+		assert.Equal(t, metadata.Name, retrieved.Name)
+		assert.Equal(t, metadata.Version, retrieved.Version)
+		assert.NotZero(t, retrieved.CreatedAt)
+		assert.NotZero(t, retrieved.UpdatedAt)
+
+		// Check capabilities
+		assert.True(t, registry.HasCapability("test", CapabilitySmartContracts))
+		assert.True(t, registry.HasCapability("test", CapabilityStateManagement))
+		assert.False(t, registry.HasCapability("test", CapabilityAsyncExecution))
+	})
+
+	t.Run("empty name", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		metadata := RuntimeMetadata{
+			Name:    "",
+			Version: "1.0.0",
+		}
+
+		err := registry.RegisterMetadata("test", metadata)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "name cannot be empty")
+	})
+
+	t.Run("empty version", func(t *testing.T) {
+		registry := NewRuntimeRegistry(logger)
+
+		metadata := RuntimeMetadata{
+			Name:    "Test",
+			Version: "",
+		}
+
+		err := registry.RegisterMetadata("test", metadata)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "version cannot be empty")
+	})
+}
+
+// Test capability queries
+func TestCapabilityQueries(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	registry := NewRuntimeRegistry(logger)
+
+	// Register EVM runtime with capabilities
+	evmMetadata := RuntimeMetadata{
+		Name:    "EVM Runtime",
+		Version: "1.0.0",
+		Capabilities: []RuntimeCapability{
+			CapabilitySmartContracts,
+			CapabilityStateManagement,
+			CapabilityDeterministic,
+		},
+	}
+	registry.RegisterMetadata(RuntimeTypeEVM, evmMetadata)
+
+	// Register Chaincode runtime with capabilities
+	chaincodeMetadata := RuntimeMetadata{
+		Name:    "Chaincode Runtime",
+		Version: "1.0.0",
+		Capabilities: []RuntimeCapability{
+			CapabilitySmartContracts,
+			CapabilityUpgradeable,
+			CapabilityEventEmission,
+		},
+	}
+	registry.RegisterMetadata(RuntimeTypeChaincode, chaincodeMetadata)
+
+	// Test HasCapability
+	assert.True(t, registry.HasCapability(RuntimeTypeEVM, CapabilitySmartContracts))
+	assert.True(t, registry.HasCapability(RuntimeTypeEVM, CapabilityDeterministic))
+	assert.False(t, registry.HasCapability(RuntimeTypeEVM, CapabilityUpgradeable))
+
+	// Test ListRuntimesWithCapability
+	smartContractRuntimes := registry.ListRuntimesWithCapability(CapabilitySmartContracts)
+	assert.Equal(t, 2, len(smartContractRuntimes))
+
+	deterministicRuntimes := registry.ListRuntimesWithCapability(CapabilityDeterministic)
+	assert.Equal(t, 1, len(deterministicRuntimes))
+	assert.Equal(t, RuntimeTypeEVM, deterministicRuntimes[0])
+
+	upgradeableRuntimes := registry.ListRuntimesWithCapability(CapabilityUpgradeable)
+	assert.Equal(t, 1, len(upgradeableRuntimes))
+	assert.Equal(t, RuntimeTypeChaincode, upgradeableRuntimes[0])
+}
+
+// Test validation rules
+func TestValidationRules(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	registry := NewRuntimeRegistry(logger)
+
+	// Register runtime
+	factory := func() Runtime {
+		return &mockRuntime{runtimeType: "test", healthy: true}
+	}
+	registry.RegisterRuntime("test", factory)
+
+	// Register validation rule
+	validationRule := func(config RuntimeConfig) error {
+		if config.ChainID != "test-chain" {
+			return errors.New("invalid chain ID")
+		}
+		return nil
+	}
+
+	err := registry.RegisterValidationRule("test", validationRule)
+	assert.NoError(t, err)
+
+	// Test validation with valid config
+	validConfig := RuntimeConfig{
+		ChainID:    "test-chain",
+		LedgerAPI:  &mockLedgerAPI{},
+		StateStore: &mockStateStore{},
+	}
+	err = registry.ValidateConfig("test", validConfig)
+	assert.NoError(t, err)
+
+	// Test validation with invalid config
+	invalidConfig := RuntimeConfig{
+		ChainID:    "wrong-chain",
+		LedgerAPI:  &mockLedgerAPI{},
+		StateStore: &mockStateStore{},
+	}
+	err = registry.ValidateConfig("test", invalidConfig)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid chain ID")
+}
+
+// Test health checks
+func TestHealthChecks(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	registry := NewRuntimeRegistry(logger)
+
+	// Register runtime
+	factory := func() Runtime {
+		return &mockRuntime{runtimeType: "test", healthy: true}
+	}
+	registry.RegisterRuntime("test", factory)
+
+	// Create runtime instance
+	runtime, _ := registry.CreateRuntime("test")
+
+	// Register health check
+	healthCheck := func(r Runtime) error {
+		// Custom health check logic
+		if r.Type() != "test" {
+			return errors.New("wrong runtime type")
+		}
+		return nil
+	}
+
+	err := registry.RegisterHealthCheck("test", healthCheck)
+	assert.NoError(t, err)
+
+	// Test health check
+	err = registry.HealthCheck("test", runtime)
+	assert.NoError(t, err)
+
+	// Test with unhealthy runtime
+	unhealthyRuntime := &mockRuntime{runtimeType: "test", healthy: false}
+	err = registry.HealthCheck("test", unhealthyRuntime)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "unhealthy")
+}
+
+// Test concurrent access
+func TestConcurrentAccess(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	registry := NewRuntimeRegistry(logger)
+
+	// Number of goroutines
+	numGoroutines := 100
+	var wg sync.WaitGroup
+
+	// Register some initial runtimes
+	for i := 0; i < 10; i++ {
+		runtimeType := RuntimeType(fmt.Sprintf("test%d", i))
+		factory := func(rt RuntimeType) func() Runtime {
+			return func() Runtime {
+				return &mockRuntime{runtimeType: rt, healthy: true}
+			}
+		}(runtimeType)
+
+		registry.RegisterRuntime(runtimeType, factory)
+	}
+
+	// Concurrent reads
+	wg.Add(numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+
+			// List runtimes
+			runtimes := registry.ListRegisteredRuntimes()
+			assert.GreaterOrEqual(t, len(runtimes), 10)
+
+			// Get factory
+			runtimeType := RuntimeType(fmt.Sprintf("test%d", id%10))
+			factory, err := registry.GetRuntimeFactory(runtimeType)
+			assert.NoError(t, err)
+			assert.NotNil(t, factory)
+
+			// Create runtime
+			runtime := factory()
+			assert.NotNil(t, runtime)
+			assert.Equal(t, runtimeType, runtime.Type())
+		}(i)
+	}
+
+	// Concurrent metadata operations
+	wg.Add(numGoroutines)
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+
+			runtimeType := RuntimeType(fmt.Sprintf("test%d", id%10))
+
+			// Register metadata
+			metadata := RuntimeMetadata{
+				Name:    fmt.Sprintf("Test Runtime %d", id),
+				Version: "1.0.0",
+				Capabilities: []RuntimeCapability{
+					CapabilitySmartContracts,
+				},
+			}
+			registry.RegisterMetadata(runtimeType, metadata)
+
+			// Read metadata
+			retrieved, exists := registry.GetRuntimeMetadata(runtimeType)
+			assert.True(t, exists)
+			assert.NotEmpty(t, retrieved.Name)
+
+			// Check capability
+			assert.True(t, registry.HasCapability(runtimeType, CapabilitySmartContracts))
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// Test global registry
+func TestGlobalRegistry(t *testing.T) {
+	// Reset global registry for testing
+	globalRegistry = nil
+	globalRegistryOnce = sync.Once{}
+
+	// Test AutoRegisterRuntime
+	factory := func() Runtime {
+		return &mockRuntime{runtimeType: "global-test", healthy: true}
+	}
+
+	// Should not panic
+	AutoRegisterRuntime("global-test", factory)
+
+	// Test RegisterRuntimeMetadata
+	metadata := RuntimeMetadata{
+		Name:    "Global Test Runtime",
+		Version: "1.0.0",
+	}
+	RegisterRuntimeMetadata("global-test", metadata)
+
+	// Verify registration
+	registry := GetGlobalRegistry()
+	assert.NotNil(t, registry)
+
+	// Check runtime is registered
+	retrievedFactory, err := GetRuntimeFactory("global-test")
+	assert.NoError(t, err)
+	assert.NotNil(t, retrievedFactory)
+
+	// Check metadata is registered
+	retrievedMetadata, exists := GetRuntimeMetadata("global-test")
+	assert.True(t, exists)
+	assert.Equal(t, metadata.Name, retrievedMetadata.Name)
+
+	// Test global helper functions
+	runtimes := ListRegisteredRuntimes()
+	assert.Contains(t, runtimes, RuntimeType("global-test"))
+}
+
+// Test unregister runtime
+func TestUnregisterRuntime(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	registry := NewRuntimeRegistry(logger)
+
+	// Register runtime with all features
+	factory := func() Runtime {
+		return &mockRuntime{runtimeType: "test", healthy: true}
+	}
+	registry.RegisterRuntime("test", factory)
+
+	metadata := RuntimeMetadata{
+		Name:         "Test Runtime",
+		Version:      "1.0.0",
+		Capabilities: []RuntimeCapability{CapabilitySmartContracts},
+	}
+	registry.RegisterMetadata("test", metadata)
+
+	registry.RegisterValidationRule("test", func(config RuntimeConfig) error {
+		return nil
+	})
+
+	registry.RegisterHealthCheck("test", func(r Runtime) error {
+		return nil
+	})
+
+	// Verify runtime is registered
+	assert.True(t, len(registry.ListRegisteredRuntimes()) > 0)
+
+	// Unregister runtime
+	err := registry.UnregisterRuntime("test")
+	assert.NoError(t, err)
+
+	// Verify runtime is removed
+	_, err = registry.GetRuntimeFactory("test")
+	assert.Error(t, err)
+
+	_, exists := registry.GetRuntimeMetadata("test")
+	assert.False(t, exists)
+
+	assert.False(t, registry.HasCapability("test", CapabilitySmartContracts))
+
+	// Try to unregister non-existent runtime
+	err = registry.UnregisterRuntime("non-existent")
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "not registered")
+}
+
+// Test registry statistics
+func TestRegistryStats(t *testing.T) {
+	logger := logrus.New()
+	logger.SetLevel(logrus.ErrorLevel)
+
+	registry := NewRuntimeRegistry(logger)
+
+	// Register multiple runtimes
+	for i := 0; i < 3; i++ {
+		runtimeType := RuntimeType(fmt.Sprintf("test%d", i))
+
+		factory := func(rt RuntimeType) func() Runtime {
+			return func() Runtime {
+				return &mockRuntime{runtimeType: rt, healthy: true}
+			}
+		}(runtimeType)
+
+		registry.RegisterRuntime(runtimeType, factory)
+
+		metadata := RuntimeMetadata{
+			Name:         fmt.Sprintf("Test Runtime %d", i),
+			Version:      "1.0.0",
+			Capabilities: []RuntimeCapability{CapabilitySmartContracts},
+		}
+		registry.RegisterMetadata(runtimeType, metadata)
+
+		if i == 0 {
+			registry.RegisterValidationRule(runtimeType, func(config RuntimeConfig) error {
+				return nil
+			})
+		}
+
+		if i == 1 {
+			registry.RegisterHealthCheck(runtimeType, func(r Runtime) error {
+				return nil
+			})
+		}
+	}
+
+	// Get stats
+	stats := registry.GetRegistryStats()
+
+	assert.Equal(t, 3, stats["total_runtimes"])
+	assert.Equal(t, 3, stats["total_metadata"])
+	assert.Equal(t, 3, stats["total_capabilities"])
+
+	details := stats["runtime_details"].(map[string]interface{})
+	assert.Equal(t, 3, len(details))
+
+	// Check specific runtime details
+	test0Details := details["test0"].(map[string]interface{})
+	assert.True(t, test0Details["has_metadata"].(bool))
+	assert.True(t, test0Details["has_validation"].(bool))
+	assert.False(t, test0Details["has_health_check"].(bool))
+
+	test1Details := details["test1"].(map[string]interface{})
+	assert.True(t, test1Details["has_metadata"].(bool))
+	assert.False(t, test1Details["has_validation"].(bool))
+	assert.True(t, test1Details["has_health_check"].(bool))
+}
+
+// Mock implementations for testing
+
+type mockLedgerAPI struct{}
+
+func (m *mockLedgerAPI) GetBalance(address string) (float64, error)               { return 0, nil }
+func (m *mockLedgerAPI) UpdateAccountBalance(address string, delta float64) error { return nil }
+func (m *mockLedgerAPI) TransferBalance(from, to string, amount float64) error    { return nil }
+func (m *mockLedgerAPI) GetAccountState(address string) (*common.Account, error)  { return nil, nil }
+func (m *mockLedgerAPI) UpdateAccountState(account *common.Account) error         { return nil }
+func (m *mockLedgerAPI) UpdateAccount(account *common.Account) error              { return nil }
+func (m *mockLedgerAPI) AddTransaction(tx common.Transaction) error               { return nil }
+func (m *mockLedgerAPI) GetTransaction(txID string) (*common.Transaction, error)  { return nil, nil }
+func (m *mockLedgerAPI) GetSmartContract(contractID string) (*common.SmartContract, error) {
+	return nil, nil
+}
+func (m *mockLedgerAPI) DeploySmartContract(contract *common.SmartContract) error   { return nil }
+func (m *mockLedgerAPI) UpdateSmartContract(contractID, code, version string) error { return nil }
+func (m *mockLedgerAPI) RemoveSmartContract(contractID string) error                { return nil }
+func (m *mockLedgerAPI) ExecuteSmartContract(contractID, function, sender string, params *common.SmartContractParams) (*common.SmartContractResult, error) {
+	return &common.SmartContractResult{
+		Success: true,
+		GasUsed: 100000,
+	}, nil
+}
+func (m *mockLedgerAPI) GetAccountHistory(address string) ([]common.Transaction, error) {
+	return nil, nil
+}
+func (m *mockLedgerAPI) GetAccountTransactions(address string, offset, limit int) ([]common.Transaction, error) {
+	return nil, nil
+}
+func (m *mockLedgerAPI) GetBlockCount() (int, error)                     { return 0, nil }
+func (m *mockLedgerAPI) GetBlock(blockNumber int) (*common.Block, error) { return nil, nil }
+func (m *mockLedgerAPI) GetBlockByNumber(number int) (common.Block, bool) {
+	return common.Block{}, false
+}
+func (m *mockLedgerAPI) GetBlockHeight() (int, error)                            { return 0, nil }
+func (m *mockLedgerAPI) GetLatestBlock() (*common.Block, error)                  { return nil, nil }
+func (m *mockLedgerAPI) GetLastBlockHash() (string, error)                       { return "", nil }
+func (m *mockLedgerAPI) GetBlocksByRange(start, end int) ([]common.Block, error) { return nil, nil }
+func (m *mockLedgerAPI) GetTransactionsByBlockNumber(blockNumber int) ([]common.Transaction, error) {
+	return nil, nil
+}
+func (m *mockLedgerAPI) CreateAccount(account *common.Account) error { return nil }
+func (m *mockLedgerAPI) CreateSnapshot(snapshotID int) error         { return nil }
+func (m *mockLedgerAPI) RestoreSnapshot(snapshotID int) error        { return nil }
+func (m *mockLedgerAPI) CommitBlock(block common.Block) error        { return nil }
+func (m *mockLedgerAPI) GetStats() (map[string]interface{}, error)   { return nil, nil }
+func (m *mockLedgerAPI) HealthCheck(ctx context.Context) error       { return nil }
+func (m *mockLedgerAPI) IntegrityCheck() error                       { return nil }
+func (m *mockLedgerAPI) IsTransactionCommitted(txID string) bool     { return false }
+func (m *mockLedgerAPI) Close() error                                { return nil }
+
+type mockStateStore struct{}
+
+func (m *mockStateStore) SaveBlock(block *common.Block) error                        { return nil }
+func (m *mockStateStore) GetBlockByNumber(blockNumber uint64) (*common.Block, error) { return nil, nil }
+func (m *mockStateStore) GetBlockByHash(blockHash string) (*common.Block, error)     { return nil, nil }
+func (m *mockStateStore) GetLatestBlock() (*common.Block, error)                     { return nil, nil }
+func (m *mockStateStore) GetBlockCount() (uint64, error)                             { return 0, nil }
+func (m *mockStateStore) SaveTransaction(tx common.Transaction) error                { return nil }
+func (m *mockStateStore) GetTransaction(txID string) (*common.Transaction, error)    { return nil, nil }
+func (m *mockStateStore) GetTransactionsByAccount(accountID string) ([]common.Transaction, error) {
+	return nil, nil
+}
+func (m *mockStateStore) SaveAccount(account *common.Account) error            { return nil }
+func (m *mockStateStore) GetAccount(accountID string) (*common.Account, error) { return nil, nil }
+func (m *mockStateStore) GetSmartContract(contractID string) (*common.SmartContract, error) {
+	return nil, nil
+}
+func (m *mockStateStore) SaveSmartContract(contract *common.SmartContract) error    { return nil }
+func (m *mockStateStore) GetState(key []byte) ([]byte, error)                       { return nil, nil }
+func (m *mockStateStore) SetState(key, value []byte) error                          { return nil }
+func (m *mockStateStore) DeleteState(key []byte) error                              { return nil }
+func (m *mockStateStore) GetStateByPrefix(prefix []byte) (map[string][]byte, error) { return nil, nil }
+func (m *mockStateStore) SaveReceipt(receipt *storage.Receipt) error                { return nil }
+func (m *mockStateStore) GetReceipt(txID string) (*storage.Receipt, error)          { return nil, nil }
+func (m *mockStateStore) Close() error                                              { return nil }

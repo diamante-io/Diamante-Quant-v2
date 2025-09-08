@@ -50,6 +50,8 @@ type DPoS interface {
 	SetSetSize(size int)
 	GetEpochDuration() uint64
 	SetEpochDuration(duration uint64)
+	GetMinStake() uint64
+	SetMinStake(stake uint64)
 	GetNextValidator(blockNumber uint64, lastBlockHash [32]byte) *Validator // Updated signature
 	ProcessEpoch(blockNumber uint64) error
 	RewardValidator(id [32]byte)
@@ -73,7 +75,12 @@ type PoH interface {
 	VerifyProof(startState [32]byte, data []byte, proof [32]byte, startCount, iterations uint64) (bool, error)
 	EstimateTimeToCount(targetCount uint64) time.Duration
 	VerifyHashRange(startState [32]byte, startCount uint64, hashes [][32]byte) bool
-	// Removed Start() and Stop() methods if they are not implemented
+	// Transaction ordering methods for high TPS
+	RecordTransaction(tx interface{}) (interface{}, error)
+	BatchRecordTransactions(txs []interface{}) (interface{}, error)
+	VerifyTransactionEntry(entry interface{}, prevState [32]byte) (bool, error)
+	VerifyTransactionBatch(batch interface{}) (bool, error)
+	EstimateTPSCapacity() uint64
 }
 
 type Validator struct {
